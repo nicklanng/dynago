@@ -22,6 +22,8 @@ dynamodb-up:
 		docker run -d --name $(DYNAMODB_CONTAINER) -p 127.0.0.1:$(DYNAMODB_PORT):8000 \
 			amazon/dynamodb-local:3.3.1 -jar DynamoDBLocal.jar -inMemory -sharedDb >/dev/null
 	@docker start $(DYNAMODB_CONTAINER) >/dev/null
+	@for i in $$(seq 60); do curl -s -o /dev/null http://127.0.0.1:$(DYNAMODB_PORT) && exit 0; sleep 0.5; done; \
+		echo "DynamoDB Local did not start on port $(DYNAMODB_PORT)" >&2; exit 1
 
 ## dynamodb-down: remove the DynamoDB Local container
 dynamodb-down:
