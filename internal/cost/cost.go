@@ -115,6 +115,7 @@ func Analyze(m *schema.Model, p Prices) *Report {
 	r.Assumptions = append(r.Assumptions,
 		"Sizes use each field's declared size (p50/p99); undeclared sizes use type defaults (string 20/64 B, time 30/35 B, int 8/11 B).",
 		"Every declared field is assumed present; empty fields are not stored, so real items are usually smaller.",
+		fmt.Sprintf("A unique string set makes one claim per element; the number of elements is estimated from the set's declared size at %d B per element.", setElementBytes),
 		"Capacity follows DynamoDB rules: 1 WRU per started 1 KB written, 1 RRU per started 4 KB read strongly (half for eventually consistent); transactions cost double, and a condition check on another item is billed as a transactional write of that item.",
 		"GSI and copy writes are counted as one index write per entry; an index key change is a delete plus a put.",
 		fmt.Sprintf("Prices: $%.3f per million WRU, $%.3f per million RRU, $%.2f per GB-month (on-demand).", p.WRUPerMillion, p.RRUPerMillion, p.GBMonth),
@@ -317,19 +318,17 @@ func writeCost(m *schema.Model, e *schema.Entity, w *schema.Write, er *EntityRep
 	// the items the write itself puts, updates, deletes or checks.
 	var gsi, own Units
 	ops := 0
-	write := func(async bool, name string, s Size, times int) {
+	write := func(async bool, name string, s Size, n Count) {
 		dst := &own
 		if async {
 			dst = &gsi
 		} else {
-			ops += times
+			ops += n.P99
 		}
-		for i := 0; i < times; i++ {
-			*dst = dst.add(Units{wru(s.P50), wru(s.P99)})
-		}
+		*dst = dst.add(Units{float64(n.P50) * wru(s.P50), float64(n.P99) * wru(s.P99)})
 		wc.Items = append(wc.Items, name)
 	}
-	write(false, e.Name, er.Item, 1)
+	write(false, e.Name, er.Item, once)
 	derivedWrites(e, w, er, "", write)
 	if wc.ReadFirst {
 		wc.RRU = rru(er.Item.P50, 1)
@@ -338,7 +337,7 @@ func writeCost(m *schema.Model, e *schema.Entity, w *schema.Write, er *EntityRep
 		switch {
 		case rq.Counter != nil:
 			// A condition check on another item is billed as a transactional write of that item.
-			write(false, "check counter "+rq.Counter.Name, counterSize, 1)
+			write(false, "check counter "+rq.Counter.Name, counterSize, once)
 		case rq.Writes():
 			ter := sizes(m, rq.Target)
 			tw := rq.TargetWrite()
@@ -346,13 +345,13 @@ func writeCost(m *schema.Model, e *schema.Entity, w *schema.Write, er *EntityRep
 			if rq.Consume {
 				tw = &schema.Write{Name: "requires", Entity: rq.Target, Kind: schema.WriteDelete}
 			}
-			write(false, label, ter.Item, 1)
+			write(false, label, ter.Item, once)
 			derivedWrites(rq.Target, tw, ter, rq.Name+"'s ", write)
 			if !rq.Fast {
 				wc.RRU += rru(ter.Item.P50, 1)
 			}
 		default:
-			write(false, "check "+rq.Name, ItemSize(m, rq.Target), 1)
+			write(false, "check "+rq.Name, ItemSize(m, rq.Target), once)
 		}
 	}
 	wc.MaxTxItems = ops
@@ -366,7 +365,25 @@ func writeCost(m *schema.Model, e *schema.Entity, w *schema.Write, er *EntityRep
 
 // writeFunc records one item a write touches: async marks GSI entries, which DynamoDB writes
 // outside the transaction.
-type writeFunc func(async bool, name string, s Size, times int)
+type writeFunc func(async bool, name string, s Size, n Count)
+
+// Count is how many items of one kind a write touches, typically (P50) and at worst (P99).
+type Count struct{ P50, P99 int }
+
+var (
+	once  = Count{1, 1}
+	twice = Count{2, 2}
+)
+
+// setElementBytes is the assumed size of one element of a string set, for estimating how many
+// claims a set makes from the set's declared size.
+const setElementBytes = 20
+
+// setElements estimates the number of elements of a string set field.
+func setElements(f *schema.Field) Count {
+	n := func(size int) int { return max(1, (size+setElementBytes-1)/setElementBytes) }
+	return Count{n(f.SizeP50), n(f.SizeP99)}
+}
 
 // derivedWrites records the index entries, copies, counters and claims a write of e changes. A
 // create or delete touches everything the entity has; an update only what its fields feed.
@@ -394,21 +411,21 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 		if ix.Strategy == schema.StrategyGSI {
 			switch {
 			case all:
-				write(true, owner+"GSI "+ix.Name+" entry", size, 1)
+				write(true, owner+"GSI "+ix.Name+" entry", size, once)
 			case moved:
-				write(true, owner+"GSI "+ix.Name+" entry (moved: delete + put)", size, 2)
+				write(true, owner+"GSI "+ix.Name+" entry (moved: delete + put)", size, twice)
 			case projected:
-				write(true, owner+"GSI "+ix.Name+" entry", size, 1)
+				write(true, owner+"GSI "+ix.Name+" entry", size, once)
 			}
 			continue
 		}
 		switch {
 		case all:
-			write(false, owner+"copy "+ix.Name, size, 1)
+			write(false, owner+"copy "+ix.Name, size, once)
 		case moved:
-			write(false, owner+"copy "+ix.Name+" (moved: put + delete)", size, 2)
+			write(false, owner+"copy "+ix.Name+" (moved: put + delete)", size, twice)
 		case touches(ix.ProjectedFields()):
-			write(false, owner+"copy "+ix.Name, size, 1)
+			write(false, owner+"copy "+ix.Name, size, once)
 		}
 	}
 	for _, c := range e.Counters {
@@ -421,21 +438,33 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 		}
 		switch {
 		case all:
-			write(false, owner+"counter "+c.Name, counterSize, 1)
+			write(false, owner+"counter "+c.Name, counterSize, once)
 		case touches(c.KeyFields()):
-			write(false, owner+"counter "+c.Name+" (moved: two counter items)", counterSize, 2)
+			write(false, owner+"counter "+c.Name+" (moved: two counter items)", counterSize, twice)
 		case touches(in...):
-			write(false, owner+"counter "+c.Name, counterSize, 1)
+			write(false, owner+"counter "+c.Name, counterSize, once)
 		}
 	}
 	for _, u := range e.Uniques {
+		if u.Set != nil {
+			// One claim per element: all of them on a create or delete. An update claims the
+			// elements it adds and releases those it drops: typically one of each, at worst all.
+			n := setElements(u.Set)
+			switch {
+			case all:
+				write(false, fmt.Sprintf("%sclaims %s (one per %s element)", owner, u.Name, u.Set.Name), claimSize, n)
+			case touches(u.Fields):
+				write(false, fmt.Sprintf("%sclaims %s (added and dropped %s elements)", owner, u.Name, u.Set.Name), claimSize, Count{2, 2 * n.P99})
+			}
+			continue
+		}
 		switch {
 		case all:
-			write(false, owner+"claim "+u.Name, claimSize, 1)
+			write(false, owner+"claim "+u.Name, claimSize, once)
 		case touches(u.Fields) && clears(w, u.Fields):
-			write(false, owner+"claim "+u.Name+" (released)", claimSize, 1)
+			write(false, owner+"claim "+u.Name+" (released)", claimSize, once)
 		case touches(u.Fields):
-			write(false, owner+"claim "+u.Name+" (moved: put + delete)", claimSize, 2)
+			write(false, owner+"claim "+u.Name+" (moved: put + delete)", claimSize, twice)
 		}
 	}
 }

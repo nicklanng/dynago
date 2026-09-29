@@ -771,3 +771,55 @@ func TestBorrowFallsBackToReading(t *testing.T) {
 		t.Fatalf("tool counts after return = %+v", c)
 	}
 }
+
+// Barcodes are a set with one claim per element: a tool can carry several labels, and each label
+// identifies one tool in its library.
+func TestBarcodes(t *testing.T) {
+	e := setup(t)
+	add := func(lib, id string, codes ...string) error {
+		return e.st.Tools.Add(ctx, &toollibrary.Tool{LibraryID: lib, ToolID: id, Name: "Tool " + id, Category: toollibrary.ToolCategoryHand,
+			Status: toollibrary.ToolStatusAvailable, Barcodes: codes})
+	}
+	holder := func(code string) string {
+		t.Helper()
+		tool, err := e.st.Tools.GetByBarcode(ctx, "lib1", code)
+		if errors.Is(err, toollibrary.ErrToolNotFound) {
+			return ""
+		}
+		must(t, err)
+		return tool.ToolID
+	}
+	must(t, add("lib1", "t1", "B1", "B2"))
+	must(t, add("lib1", "t2", "B3"))
+	if holder("B1") != "t1" || holder("B2") != "t1" || holder("B3") != "t2" {
+		t.Fatalf("holders: B1=%s B2=%s B3=%s", holder("B1"), holder("B2"), holder("B3"))
+	}
+	// Each claim points back at its tool.
+	if claim := e.raw(t, "UNIQUE#Tool.Barcode#lib1#B2", "UNIQUE"); claim["ownerPK"] != "LIB#lib1#TOOL#t1" || claim["ownerSK"] != "TOOL" {
+		t.Fatalf("claim = %v", claim)
+	}
+
+	// One taken label refuses the whole create: none of its other labels are claimed.
+	wantErr(t, add("lib1", "t3", "B4", "B2"), toollibrary.ErrToolBarcodeTaken)
+	if holder("B4") != "" {
+		t.Fatal("a refused create claimed a label")
+	}
+
+	// Relabelling claims the new labels and frees the dropped ones, in one transaction.
+	must(t, e.st.Tools.Relabel(ctx, toollibrary.ToolKey{LibraryID: "lib1", ToolID: "t1"}, toollibrary.ToolRelabel{Barcodes: []string{"B1", "B5"}}))
+	if holder("B2") != "" || holder("B5") != "t1" || holder("B1") != "t1" {
+		t.Fatalf("after relabel: B1=%s B2=%s B5=%s", holder("B1"), holder("B2"), holder("B5"))
+	}
+	must(t, add("lib1", "t3", "B4", "B2")) // B2 is free again
+	wantErr(t, e.st.Tools.Relabel(ctx, toollibrary.ToolKey{LibraryID: "lib1", ToolID: "t2"}, toollibrary.ToolRelabel{Barcodes: []string{"B1"}}), toollibrary.ErrToolBarcodeTaken)
+	if holder("B3") != "t2" {
+		t.Fatal("a refused relabel released a label")
+	}
+	// Removing every label releases every claim.
+	must(t, e.st.Tools.Relabel(ctx, toollibrary.ToolKey{LibraryID: "lib1", ToolID: "t1"}, toollibrary.ToolRelabel{}))
+	if holder("B1") != "" || holder("B5") != "" {
+		t.Fatal("labels still claimed after removing them")
+	}
+	// Labels are unique per library, not globally.
+	must(t, add("lib2", "t1", "B3"))
+}

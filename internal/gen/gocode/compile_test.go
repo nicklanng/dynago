@@ -26,6 +26,7 @@ var awkward = []struct {
 	{"when on a key field", "      W: { update: [name], when: { thingId: x } }\n", "primary key field"},
 	{"percent in a when value", "      W: { update: [name], when: { note: \"50% off\" } }\n", ""},
 	{"unique fields named like locals", "      claim: string\n      it: string\n      fmt: string\n    unique:\n      U: { fields: [claim, it, fmt] }\n    access:\n      ByU: { get: { unique: U } }\n", ""},
+	{"unique set, lowered and not last in its key", "      emails: string_set\n    unique:\n      Email: { fields: [tenantId, emails], pk: \"E#{emails|lower}#T#{tenantId}\" }\n    access:\n      ByEmail: { get: { unique: Email } }\n", ""},
 	{"range query key field named from", "      from: string\n    indexes:\n      ByFrom: { pk: \"F#{from}\", sk: \"AT#{at}\", project: keys }\n    access:\n      L: { query: ByFrom, range: at }\n", "collides with the range bound"},
 }
 

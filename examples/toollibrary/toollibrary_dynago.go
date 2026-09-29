@@ -1153,8 +1153,11 @@ type Tool struct {
 	Manual string   `dynamo:"manual,omitempty"`
 	Tags   []string `dynamo:"tags,set,omitempty"`
 	// The maker's serial number, if it has one.
-	SerialNumber string    `dynamo:"serialNumber,omitempty"`
-	AddedAt      time.Time `dynamo:"addedAt,omitempty"`
+	SerialNumber string `dynamo:"serialNumber,omitempty"`
+	// The library's labels on the tool, scanned at the desk. A tool can carry several (one per part of
+	// a kit).
+	Barcodes []string  `dynamo:"barcodes,set,omitempty"`
+	AddedAt  time.Time `dynamo:"addedAt,omitempty"`
 
 	loaded *toolLoaded // set when the store returns the entity
 }
@@ -1182,6 +1185,7 @@ func (e *Tool) clone() Tool {
 	c := *e
 	c.loaded = nil
 	c.Tags = append([]string(nil), e.Tags...)
+	c.Barcodes = append([]string(nil), e.Barcodes...)
 	return c
 }
 
@@ -1226,9 +1230,10 @@ var (
 	ErrToolExists             = fmt.Errorf("%w: Tool", dynago.ErrExists)
 	ErrToolRetirePrecondition = fmt.Errorf("%w: Tool.Retire requires status = \"available\"", dynago.ErrPrecondition)
 	ErrToolSerialTaken        = fmt.Errorf("%w: Tool.Serial", dynago.ErrTaken)
+	ErrToolBarcodeTaken       = fmt.Errorf("%w: Tool.Barcode", dynago.ErrTaken)
 )
 
-const toolVersion = 1
+const toolVersion = 2
 
 type toolItem struct {
 	Tool
@@ -1297,6 +1302,14 @@ func toolDerived(e *Tool, owner dynago.Key, v int) []dynago.Derived {
 	// unique Serial
 	if e.LibraryID != "" && e.SerialNumber != "" {
 		d = append(d, dynago.Derived{Kind: dynago.KindClaim, Key: dynago.Key{PK: "UNIQUE#Tool.Serial#" + e.LibraryID + "#" + e.SerialNumber, SK: "UNIQUE"}, Type: "Tool.Serial", TakenErr: ErrToolSerialTaken})
+	}
+	// unique Barcode
+	if v >= 2 && e.LibraryID != "" {
+		for _, elem := range e.Barcodes {
+			if elem != "" {
+				d = append(d, dynago.Derived{Kind: dynago.KindClaim, Key: dynago.Key{PK: "UNIQUE#Tool.Barcode#" + e.LibraryID + "#" + elem, SK: "UNIQUE"}, Type: "Tool.Barcode", TakenErr: ErrToolBarcodeTaken})
+			}
+		}
 	}
 	return d
 }
@@ -1441,7 +1454,7 @@ func (s *ToolStore) Catalogue(ctx context.Context, q ToolCatalogueQuery, page dy
 		return nil, "", err
 	}
 	pk := "LIB#" + q.LibraryID + "#CAT#" + string(q.Category)
-	spec := dynago.QuerySpec{Scope: "Tool.Catalogue@v1\x00" + pk, PK: pk, PageSize: 25, MaxPage: 100, Index: "ByCategory", PKAttr: "ByCategoryPK", SKAttr: "ByCategorySK"}
+	spec := dynago.QuerySpec{Scope: "Tool.Catalogue@v2\x00" + pk, PK: pk, PageSize: 25, MaxPage: 100, Index: "ByCategory", PKAttr: "ByCategoryPK", SKAttr: "ByCategorySK"}
 	var out []ToolByCategory
 	next, err := dynago.Query(ctx, s.t, spec, page, &out)
 	if err != nil {
@@ -1450,9 +1463,45 @@ func (s *ToolStore) Catalogue(ctx context.Context, q ToolCatalogueQuery, page dy
 	return out, next, nil
 }
 
+// GetByBarcode finds the Tool holding the given element of barcodes (with libraryId): a consistent
+// read of the claim, then of the item.
+func (s *ToolStore) GetByBarcode(ctx context.Context, libraryID string, barcodesElem string) (*Tool, error) {
+	if libraryID == "" {
+		return nil, fmt.Errorf("%w: GetByBarcode needs libraryId", dynago.ErrInvalidKey)
+	}
+	if barcodesElem == "" {
+		return nil, fmt.Errorf("%w: GetByBarcode needs barcodes", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("libraryId", libraryID, "#"); err != nil {
+		return nil, err
+	}
+	claimKey := dynago.Key{PK: "UNIQUE#Tool.Barcode#" + libraryID + "#" + barcodesElem, SK: "UNIQUE"}
+	var claim dynago.Claim
+	found, err := dynago.GetOne(ctx, s.t, claimKey, true, &claim)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrToolNotFound
+	}
+	it, err := s.load(ctx, dynago.Key{PK: claim.OwnerPK, SK: claim.OwnerSK}, true)
+	if err != nil {
+		return nil, err
+	}
+	// The claim is only trusted while the item still holds the value it was taken for.
+	held := false
+	for _, elem := range it.Barcodes {
+		held = held || (dynago.Key{PK: "UNIQUE#Tool.Barcode#" + it.LibraryID + "#" + elem, SK: "UNIQUE"}) == claimKey
+	}
+	if !held {
+		return nil, ErrToolNotFound
+	}
+	return &it.Tool, nil
+}
+
 // Add creates a Tool, failing with ErrToolExists if one already exists. In the same transaction it
-// maintains counter ToolCounts, unique claim Serial. Afterwards e.Version() returns the new item's
-// version.
+// maintains counter ToolCounts, unique claim Serial, unique claim Barcode. Afterwards e.Version()
+// returns the new item's version.
 func (s *ToolStore) Add(ctx context.Context, e *Tool) error {
 	key, err := e.Key().dynamoKey()
 	if err != nil {
@@ -1490,8 +1539,8 @@ type ToolEditDetails struct {
 // EditDetails updates name, manual and tags of a Tool. It reads the item consistently first (not
 // with dynago.From) because the change affects the ByCategory index entry, then writes everything
 // in one transaction guarded by the item's revision. In the same transaction it maintains counter
-// ToolCounts, unique claim Serial. A call that leaves name nil changes nothing derived, and runs as
-// a single conditional UpdateItem instead.
+// ToolCounts, unique claim Serial, unique claim Barcode. A call that leaves name nil changes
+// nothing derived, and runs as a single conditional UpdateItem instead.
 func (s *ToolStore) EditDetails(ctx context.Context, k ToolKey, v ToolEditDetails, opts ...dynago.WriteOption) error {
 	key, err := k.dynamoKey()
 	if err != nil {
@@ -1556,11 +1605,54 @@ func (s *ToolStore) EditDetails(ctx context.Context, k ToolKey, v ToolEditDetail
 	})
 }
 
+// ToolRelabel holds the new values for Tool.Relabel.
+type ToolRelabel struct {
+	Barcodes []string
+}
+
+// Relabel updates barcodes of a Tool. It reads the item consistently first (not with dynago.From)
+// because the change affects unique claim Barcode, then writes everything in one transaction
+// guarded by the item's revision. In the same transaction it maintains counter ToolCounts, unique
+// claim Serial, unique claim Barcode.
+//
+// Replaces the tool's labels: new ones are claimed, dropped ones freed.
+func (s *ToolStore) Relabel(ctx context.Context, k ToolKey, v ToolRelabel, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	return dynago.Retry(ctx, func() error {
+		it, versioned, err := s.start(ctx, key, o, false)
+		if err != nil {
+			return err
+		}
+		if it.V > toolVersion {
+			return fmt.Errorf("%w: Tool at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, toolVersion)
+		}
+		before := &it.Tool
+		after := before.clone()
+		after.Barcodes = v.Barcodes
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(toolToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", toolVersion), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: toolDerived(before, key, it.V), After: toolDerived(&after, key, toolVersion)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return dynago.StaleAs(versioned, err)
+		}
+		o.Written(it.Rev + 1)
+		return nil
+	})
+}
+
 // Retire updates status of a Tool when status = "available" (else ErrToolRetirePrecondition). The
 // change to counter ToolCounts is known from the arguments, so it runs without reading the item:
 // conditional writes in one transaction. If the item is not in the state assumed, it falls back to
-// reading it. In the same transaction it maintains counter ToolCounts, unique claim Serial. In the
-// same transaction it deletes the Hold if there is one.
+// reading it. In the same transaction it maintains counter ToolCounts, unique claim Serial, unique
+// claim Barcode. In the same transaction it deletes the Hold if there is one.
 //
 // Takes the tool out of the catalogue, cancelling any hold on it.
 func (s *ToolStore) Retire(ctx context.Context, k ToolKey, opts ...dynago.WriteOption) error {
@@ -1586,7 +1678,7 @@ func (s *ToolStore) Retire(ctx context.Context, k ToolKey, opts ...dynago.WriteO
 			u := s.t.Update("PK", key.PK).Range("SK", key.SK)
 			dynago.SetFields(u, sets)
 			dynago.GuardUpdate(u, dynago.Guard{ExpectRev: expect, Version: toolVersion}, dynago.Now())
-			dynago.AtLeastVersion(u, 1)
+			dynago.AtLeastVersion(u, 2)
 			for _, c := range []dynago.Cond{{Attr: "status", Value: ToolStatusAvailable, Zero: false}} {
 				dynago.CondUpdate(u, c)
 			}
@@ -2407,7 +2499,7 @@ func (s *LoanStore) requireBorrowTool(ctx context.Context, e *Loan, read bool) (
 		u := s.t.Update("PK", key.PK).Range("SK", key.SK)
 		dynago.SetFields(u, sets)
 		dynago.GuardUpdate(u, dynago.Guard{Version: toolVersion}, dynago.Now())
-		dynago.AtLeastVersion(u, 1)
+		dynago.AtLeastVersion(u, 2)
 		dynago.CondUpdate(u, dynago.Cond{Attr: "status", Value: ToolStatusAvailable, Zero: false})
 		return []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}, dynago.Change{Owner: key, Before: toolDerived(&before, key, toolVersion), After: toolDerived(&after, key, toolVersion)}, nil
 	}
@@ -2482,7 +2574,7 @@ func (s *LoanStore) requireReturnTool(ctx context.Context, e *Loan, read bool) (
 		u := s.t.Update("PK", key.PK).Range("SK", key.SK)
 		dynago.SetFields(u, sets)
 		dynago.GuardUpdate(u, dynago.Guard{Version: toolVersion}, dynago.Now())
-		dynago.AtLeastVersion(u, 1)
+		dynago.AtLeastVersion(u, 2)
 		dynago.CondUpdate(u, dynago.Cond{Attr: "status", Value: ToolStatusOnLoan, Zero: false})
 		return []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}, dynago.Change{Owner: key, Before: toolDerived(&before, key, toolVersion), After: toolDerived(&after, key, toolVersion)}, nil
 	}

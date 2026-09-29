@@ -4,6 +4,7 @@ package docs
 import (
 	"bytes"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -163,8 +164,12 @@ func (d *doc) entity(e *schema.Entity) {
 		}
 	}
 	for _, u := range e.Uniques {
-		d.p("| Claim `%s` | `%s` | `%s` | %s | ~150 B | the writes below, in the same transaction; a conditional put makes %s unique. |",
-			u.Name, u.PK.Raw, u.SK.Raw, example(e, u.PK, u.SK, true), fieldCodes(u.Fields))
+		what := fmt.Sprintf("a conditional put makes %s unique", fieldCodes(u.Fields))
+		if u.Set != nil {
+			what = fmt.Sprintf("one claim per element of `%s`, each taken by a conditional put", u.Set.Name)
+		}
+		d.p("| Claim `%s` | `%s` | `%s` | %s | ~150 B each | the writes below, in the same transaction; %s. |",
+			u.Name, u.PK.Raw, u.SK.Raw, example(e, u.PK, u.SK, true), what)
 	}
 	for _, c := range e.Counters {
 		pk := c.PK.Raw
@@ -207,7 +212,14 @@ func (d *doc) entity(e *schema.Entity) {
 		d.p("### Uniqueness")
 		d.p("")
 		for _, u := range e.Uniques {
-			d.p("- **%s**: no two %s items share %s. %s", u.Name, e.Name, fieldCodes(u.Fields), strings.TrimSpace(u.Doc))
+			rule := fmt.Sprintf("no two %s items share %s", e.Name, fieldCodes(u.Fields))
+			if u.Set != nil {
+				rule = fmt.Sprintf("no element of `%s` appears in two %s items", u.Set.Name, e.Name)
+				if len(u.Fields) > 1 {
+					rule = fmt.Sprintf("for the same %s, %s", fieldCodes(slices.DeleteFunc(slices.Clone(u.Fields), func(f *schema.Field) bool { return f == u.Set })), rule)
+				}
+			}
+			d.p("- **%s**: %s. %s", u.Name, rule, strings.TrimSpace(u.Doc))
 		}
 		d.p("")
 	}

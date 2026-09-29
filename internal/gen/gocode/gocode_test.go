@@ -234,3 +234,30 @@ func TestReadFreeWriteRequiresAVersion(t *testing.T) {
 		t.Errorf("MakeA's read-free path doesn't require a version:\n%s", fast)
 	}
 }
+
+// Each element of a unique set gets its own claim, and elements are checked for the separator
+// that follows the set in the claim key.
+func TestUniqueSetClaimsEachElement(t *testing.T) {
+	src := strings.Replace(strings.Replace(src, "%s", "1", 1), "%s", `    unique:
+      Alias: { fields: [tenantId, aliases], pk: "A#{aliases|lower}#T#{tenantId}" }
+`, 1)
+	src = strings.Replace(src, "      kind: { type: enum, values: [a, b] }", "      kind: { type: enum, values: [a, b] }\n      aliases: string_set", 1)
+	m, err := schema.Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := Generate(m, "things.dynago.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code := string(out)
+	for _, want := range []string{
+		"for _, elem := range e.Aliases {",
+		`Key: dynago.Key{PK: "A#" + dynago.Lower(elem) + "#T#" + e.TenantID, SK: "UNIQUE"}`,
+		`if err := dynago.CheckKeyPart("aliases", elem, "#"); err != nil {`,
+	} {
+		if !strings.Contains(code, want) {
+			t.Errorf("generated code lacks %q", want)
+		}
+	}
+}

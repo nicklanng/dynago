@@ -239,15 +239,18 @@ Limits: 20 GSIs per table and 100 projected attributes across a table's GSIs (Dy
 unique:
   Slug: { fields: [slug] }                         # global
   Email: { fields: [libraryId, email] }            # unique per library
+  Barcode: { fields: [libraryId, barcodes] }       # barcodes is a string_set: each label is unique
 ```
 
 A uniqueness constraint is enforced by a **claim** item keyed by the value, created in the same
 transaction as the entity with a condition that it does not exist (or is already the entity's
-own). Names are PascalCase.
+own). The claim stores the owner's key (`ownerPK`, `ownerSK`), which lookups follow back to the
+entity. Constraints are scoped to their entity: another entity's claims never collide with them.
+Names are PascalCase.
 
 | Key | Required | Default | Meaning |
 |---|---|---|---|
-| `fields` | yes | | The fields whose combination must be unique. Types allowed in keys only. |
+| `fields` | yes | | The fields whose combination must be unique. Types allowed in keys, plus at most one `string_set`, whose elements are each unique (one claim per element). A `string_list` can hold duplicates, so it can't be unique. |
 | `pk` | no | `UNIQUE#<Entity>.<Name>#{field1}#{field2}…` | Claim partition key. Must use exactly the unique fields (with `sk`). |
 | `sk` | no | `UNIQUE` | Claim sort key. |
 | `doc` | no | | Shown in the model document. |
@@ -255,6 +258,11 @@ own). Names are PascalCase.
 Behaviour:
 
 - Creating an entity whose value is taken fails with `Err<Entity><Name>Taken` and writes nothing.
+- **Sets**: with a `string_set` among the fields, each element is claimed. A write claims the
+  elements it adds and releases those it drops, all in the entity's transaction; one taken element
+  refuses the whole write. `{field|lower}` and separator checks apply per element. Every claim is
+  an item in the transaction, so the set's size counts toward DynamoDB's 100-item limit:
+  `dynago check` estimates it from the field's `size` and reports writes that could exceed it.
 - An update that changes the value moves the claim (claims the new value, releases the old) in one
   transaction; a delete releases it.
 - **Optional values**: no claim is made while any `string`, `enum` or `time` field of the

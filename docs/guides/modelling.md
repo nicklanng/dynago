@@ -149,6 +149,10 @@ looks it up with strongly consistent reads.
 - A claim can encode a rule: the example's `Serial` claim stops the same physical tool being
   catalogued twice.
 - Optional values (empty strings) make no claim, so any number of entities can leave them empty.
+- A **set** of unique values (several emails per user, several labels per tool) is a `string_set`
+  in `fields`: one claim per element, each pointing back to the entity, added and released as the
+  set changes. The example's tools do this with their barcodes. Keep such sets small: every
+  element is an item in the write's transaction.
 - **Don't combine claims with `ttl`**: an expired item leaves its claim behind. For a token on an
   expiring item, use a GSI (its entry expires with the item). The example's `Hold` entity does
   exactly this for its pickup codes. It stores an HMAC of the code under a server-side secret, not

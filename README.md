@@ -121,7 +121,8 @@ walks through it end to end.
 - **Only declared reads and writes exist.** Each read is one request. A query nobody declared has no
   method, so every new way of reading data shows up in review as a schema change.
 - **Derived items stay consistent.** Copies (a transactional index, readable immediately),
-  uniqueness claims, and counters with upper (`limit`) and lower (`min`) bounds change atomically
+  uniqueness claims (one per value, or per element of a set), and counters with upper (`limit`)
+  and lower (`min`) bounds change atomically
   with the item, and every write path computes them the same way. GSIs are maintained by DynamoDB,
   asynchronously: usually well under a second behind.
 - **Rules and changes across entities** (`requires`) happen in the write's transaction: check

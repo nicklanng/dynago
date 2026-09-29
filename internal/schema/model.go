@@ -276,10 +276,12 @@ type GSI struct {
 
 // Unique is a uniqueness constraint enforced by a claim item.
 type Unique struct {
-	Name    string
-	GoName  string
-	Entity  *Entity
-	Fields  []*Field
+	Name   string
+	GoName string
+	Entity *Entity
+	Fields []*Field
+	// Set, if not nil, is the one string_set field among Fields: each of its elements is claimed.
+	Set     *Field
 	PK, SK  Template
 	Doc     string
 	Since   int

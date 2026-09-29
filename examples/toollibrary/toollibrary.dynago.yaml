@@ -101,6 +101,7 @@ entities:
 
   Tool:
     doc: A tool the library lends out.
+    version: 2 # v2 added barcodes
     fields:
       libraryId: { type: string, example: lib_1 }
       toolId: { type: string, example: t_42 }
@@ -110,6 +111,7 @@ entities:
       manual: { type: string, size: 2000/20000, doc: "Care and safety notes. Large, so never listed." }
       tags: { type: string_set, size: 30/120 }
       serialNumber: { type: string, doc: "The maker's serial number, if it has one." }
+      barcodes: { type: string_set, size: 14/60, doc: "The library's labels on the tool, scanned at the desk. A tool can carry several (one per part of a kit)." }
       addedAt: time
     key:
       pk: "LIB#{libraryId}#TOOL#{toolId}"
@@ -124,6 +126,9 @@ entities:
       Serial:
         doc: Stops the same physical tool being catalogued twice. Tools without a serial number make no claim.
         fields: [libraryId, serialNumber]
+      Barcode:
+        doc: "Each label identifies one tool: one claim per barcode, so the desk can look a tool up by any of them."
+        fields: [libraryId, barcodes]
     counters:
       ToolCounts:
         doc: Holds the library's catalogue numbers.
@@ -136,9 +141,11 @@ entities:
     access:
       Get: get
       Catalogue: { query: ByCategory, page: 25 }
+      GetByBarcode: { get: { unique: Barcode } }
     writes:
       Add: create
       EditDetails: { patch: [name, manual, tags], versioned: required }
+      Relabel: { update: [barcodes], doc: "Replaces the tool's labels: new ones are claimed, dropped ones freed." }
       Retire:
         set: { status: retired }
         when: { status: available }

@@ -66,7 +66,7 @@ Every item that exists because of a Library, and what keeps it up to date.
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
 | **Library** | `LIB#{libraryId}` | `LIBRARY` | `LIB#lib_1`<br>`LIBRARY` | 162 B / 345 B | the writes below |
-| Claim `Slug` | `UNIQUE#Library.Slug#{slug}` | `UNIQUE` | `UNIQUE#Library.Slug#greenwood`<br>`UNIQUE` | ~150 B | the writes below, in the same transaction; a conditional put makes `slug` unique. |
+| Claim `Slug` | `UNIQUE#Library.Slug#{slug}` | `UNIQUE` | `UNIQUE#Library.Slug#greenwood`<br>`UNIQUE` | ~150 B each | the writes below, in the same transaction; a conditional put makes `slug` unique. |
 
 ### Uniqueness
 
@@ -156,7 +156,7 @@ Every item that exists because of a Member, and what keeps it up to date.
 |---|---|---|---|---|---|
 | **Member** | `LIB#{libraryId}` | `MEMBER#{memberId}` | `LIB#lib_1`<br>`MEMBER#m_7` | 369 B / 832 B | the writes below |
 | GSI `ByName` entry | `LIB#{libraryId}#MEMBERS` | `{name|lower}#{memberId}` | `LIB#lib_1#MEMBERS`<br>`{name}#m_7` | 253 B / 607 B | DynamoDB, from the item's `ByNamePK`/`ByNameSK` attributes (eventually consistent). Sparse: absent when a key field is empty. |
-| Claim `Email` | `UNIQUE#Member.Email#{libraryId}#{email|lower}` | `UNIQUE` | `UNIQUE#Member.Email#lib_1#{email}`<br>`UNIQUE` | ~150 B | the writes below, in the same transaction; a conditional put makes `libraryId`, `email` unique. |
+| Claim `Email` | `UNIQUE#Member.Email#{libraryId}#{email|lower}` | `UNIQUE` | `UNIQUE#Member.Email#lib_1#{email}`<br>`UNIQUE` | ~150 B each | the writes below, in the same transaction; a conditional put makes `libraryId`, `email` unique. |
 | Counter `MemberCounts` | `LIB#{libraryId}` | `COUNTS#MEMBERS` | `LIB#lib_1`<br>`COUNTS#MEMBERS` | ~100 B | the writes below, with atomic ADDs in the same transaction. |
 
 ### Indexes
@@ -202,7 +202,7 @@ Every item that exists because of a Member, and what keeps it up to date.
 
 A tool the library lends out.
 
-Schema version **1**. Go type `Tool`, store `Store.Tools`.
+Schema version **2**. Go type `Tool`, store `Store.Tools`.
 
 ```mermaid
 flowchart LR
@@ -210,11 +210,14 @@ flowchart LR
   ix_ByCategory[("GSI ByCategory<br/>LIB#35;{libraryId}#35;CAT#35;{category}")]
   item_Tool -. DynamoDB maintains .-> ix_ByCategory
   claim_Serial["claim Serial<br/>UNIQUE#35;Tool.Serial#35;{libraryId}#35;{serialNumber}"]
+  claim_Barcode["claim Barcode<br/>UNIQUE#35;Tool.Barcode#35;{libraryId}#35;{barcodes}"]
   counter_ToolCounts["counter ToolCounts<br/>LIB#35;{libraryId} / COUNTS#35;TOOLS"]
   w_Add(["Add"])
-  w_Add --> item_Tool & claim_Serial & counter_ToolCounts
+  w_Add --> item_Tool & claim_Serial & claim_Barcode & counter_ToolCounts
   w_EditDetails(["EditDetails"])
   w_EditDetails --> item_Tool
+  w_Relabel(["Relabel"])
+  w_Relabel --> item_Tool & claim_Barcode
   w_Retire(["Retire"])
   w_Retire --> item_Tool & counter_ToolCounts
   other_Hold["Hold item"]
@@ -223,6 +226,8 @@ flowchart LR
   item_Tool --> r_Get
   r_Catalogue{{"Catalogue"}}
   ix_ByCategory --> r_Catalogue
+  r_GetByBarcode{{"GetByBarcode"}}
+  claim_Barcode & item_Tool --> r_GetByBarcode
 ```
 
 Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB; solid arrows are written by the generated code.
@@ -239,6 +244,7 @@ Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB
 | `manual` | string | `manual` | 2000 / 20000 B | Care and safety notes. Large, so never listed. |
 | `tags` | string_set | `tags` | 30 / 120 B |  |
 | `serialNumber` | string | `serialNumber` | 20 / 64 B | The maker's serial number, if it has one. |
+| `barcodes` | string_set | `barcodes` | 14 / 60 B | The library's labels on the tool, scanned at the desk. A tool can carry several (one per part of a kit). |
 | `addedAt` | time | `addedAt` | 30 / 35 B |  |
 
 ### Stored items
@@ -247,9 +253,10 @@ Every item that exists because of a Tool, and what keeps it up to date.
 
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
-| **Tool** | `LIB#{libraryId}#TOOL#{toolId}` | `TOOL` | `LIB#lib_1#TOOL#t_42`<br>`TOOL` | 2.3 KB / 20.4 KB | the writes below |
+| **Tool** | `LIB#{libraryId}#TOOL#{toolId}` | `TOOL` | `LIB#lib_1#TOOL#t_42`<br>`TOOL` | 2.4 KB / 20.5 KB | the writes below |
 | GSI `ByCategory` entry | `LIB#{libraryId}#CAT#{category}` | `{name|lower}#{toolId}` | `LIB#lib_1#CAT#{category}`<br>`{name}#t_42` | 312 B / 746 B | DynamoDB, from the item's `ByCategoryPK`/`ByCategorySK` attributes (eventually consistent). Sparse: absent when a key field is empty. |
-| Claim `Serial` | `UNIQUE#Tool.Serial#{libraryId}#{serialNumber}` | `UNIQUE` | `UNIQUE#Tool.Serial#lib_1#{serialNumber}`<br>`UNIQUE` | ~150 B | the writes below, in the same transaction; a conditional put makes `libraryId`, `serialNumber` unique. |
+| Claim `Serial` | `UNIQUE#Tool.Serial#{libraryId}#{serialNumber}` | `UNIQUE` | `UNIQUE#Tool.Serial#lib_1#{serialNumber}`<br>`UNIQUE` | ~150 B each | the writes below, in the same transaction; a conditional put makes `libraryId`, `serialNumber` unique. |
+| Claim `Barcode` | `UNIQUE#Tool.Barcode#{libraryId}#{barcodes}` | `UNIQUE` | `UNIQUE#Tool.Barcode#lib_1#{barcodes}`<br>`UNIQUE` | ~150 B each | the writes below, in the same transaction; one claim per element of `barcodes`, each taken by a conditional put. |
 | Counter `ToolCounts` | `LIB#{libraryId}` | `COUNTS#TOOLS` | `LIB#lib_1`<br>`COUNTS#TOOLS` | ~100 B | the writes below, with atomic ADDs in the same transaction. |
 
 ### Indexes
@@ -266,6 +273,7 @@ Every item that exists because of a Tool, and what keeps it up to date.
 ### Uniqueness
 
 - **Serial**: no two Tool items share `libraryId`, `serialNumber`. Stops the same physical tool being catalogued twice. Tools without a serial number make no claim.
+- **Barcode**: for the same `libraryId`, no element of `barcodes` appears in two Tool items. Each label identifies one tool: one claim per barcode, so the desk can look a tool up by any of them.
 
 ### Access patterns
 
@@ -273,15 +281,18 @@ Every item that exists because of a Tool, and what keeps it up to date.
 |---|---|---|---|---|---|
 | `Get` | item by key | `PK = LIB#{libraryId}#TOOL#{toolId}`, `SK = TOOL` | eventual | GetItem | 0.5 / 3 |
 | `Catalogue` | GSI `ByCategory`, page 25 (max 100) | `ByCategoryPK = LIB#{libraryId}#CAT#{category}`, ascending | eventual (GSI) | Query | 1 / 2.5 |
+| `GetByBarcode` | claim `Barcode`, then the item | `PK = UNIQUE#Tool.Barcode#{libraryId}#{barcodes}` | strong | GetItem (claim) → GetItem | 2 / 7 |
 
 ### Writes
 
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
-| `Add` | create (fails if it exists) | Tool<br>GSI ByCategory entry<br>counter ToolCounts<br>claim Serial | no | transaction (3 items) | — | 11 / 47 | `ErrToolExists`<br>`ErrToolSerialTaken` |
+| `Add` | create (fails if it exists) | Tool<br>GSI ByCategory entry<br>counter ToolCounts<br>claim Serial<br>claims Barcode (one per barcodes element) | no | transaction (6 items) | — | 13 / 53 | `ErrToolExists`<br>`ErrToolSerialTaken`<br>`ErrToolBarcodeTaken` |
 | `EditDetails` | set `name` if given, set `manual` if given, set `tags` if given | Tool<br>GSI ByCategory entry (moved: delete + put) | yes (1 consistent read; none with `dynago.From`) | single item | **required** | 5 / 23 | `ErrToolNotFound`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrVersionRequired`<br>`dynago.ErrConflict` (after retries) |
+| `Relabel` | set `barcodes` | Tool<br>claims Barcode (added and dropped barcodes elements) | yes (1 consistent read; none with `dynago.From`) | transaction (7 items) | optional | 10 / 54 | `ErrToolNotFound`<br>`ErrToolBarcodeTaken`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 | `Retire` | set `status` = "retired" when `status = "available"`; requires nothing of any Hold and deletes the Hold if there is one | Tool<br>GSI ByCategory entry<br>counter ToolCounts<br>Hold (deletes the Hold if there is one)<br>Hold's GSI ByCode entry | no: read-free (reads only if the item is not in the assumed state) | transaction (3 items) | optional | 12 / 48 | `ErrToolNotFound`<br>`ErrToolRetirePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 
+- `Relabel`: Replaces the tool's labels: new ones are claimed, dropped ones freed.
 - `Retire`: Takes the tool out of the catalogue, cancelling any hold on it.
 
 ## Loan
@@ -461,23 +472,24 @@ Every item that exists because of a Hold, and what keeps it up to date.
 
 | | Subject | Finding |
 |---|---|---|
-| ⚠️ warning | Tool | manual (p99 19.5 KB) makes every write cost up to 21 WRU, including writes that never change it: Retire, Loan.Borrow, Loan.Return. Consider moving it to an entity of its own, written only when it changes. |
+| ⚠️ warning | Tool | manual (p99 19.5 KB) makes every write cost up to 21 WRU, including writes that never change it: Relabel, Retire, Loan.Borrow, Loan.Return. Consider moving it to an entity of its own, written only when it changes. |
 | ⚠️ warning | Loan.toolName | copies Tool.name. dynago keeps copies within one entity in sync, but not this one: when Tool.name changes, your code must rewrite every Loan that copied it. |
 
 | Entity | Items (assumed) | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
 |---|---|---|---|---|---|
 | Library | 2000 | 162 B / 345 B | 0.00 GB | $0.00 | $0.00 |
 | Member | 40000 | 369 B / 832 B | 0.04 GB | $0.01 | $0.00 |
-| Tool | 120000 | 2.3 KB / 20.4 KB | 0.35 GB | $0.09 | $0.00 |
+| Tool | 120000 | 2.4 KB / 20.5 KB | 0.38 GB | $0.10 | $0.00 |
 | Loan | 2000000 | 464 B / 1.9 KB | 2.68 GB | $0.67 | $74.52 |
 | Hold | 3000 | 398 B / 630 B | 0.00 GB | $0.00 | $0.00 |
 
-Estimated total: **$75.29/month** for the declared item counts and rates.
+Estimated total: **$75.30/month** for the declared item counts and rates.
 
 Assumptions:
 
 - Sizes use each field's declared size (p50/p99); undeclared sizes use type defaults (string 20/64 B, time 30/35 B, int 8/11 B).
 - Every declared field is assumed present; empty fields are not stored, so real items are usually smaller.
+- A unique string set makes one claim per element; the number of elements is estimated from the set's declared size at 20 B per element.
 - Capacity follows DynamoDB rules: 1 WRU per started 1 KB written, 1 RRU per started 4 KB read strongly (half for eventually consistent); transactions cost double, and a condition check on another item is billed as a transactional write of that item.
 - GSI and copy writes are counted as one index write per entry; an index key change is a delete plus a put.
 - Prices: $0.625 per million WRU, $0.125 per million RRU, $0.25 per GB-month (on-demand).

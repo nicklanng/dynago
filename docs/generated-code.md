@@ -103,8 +103,9 @@ The entity carries its version.
 func (s *MemberStore) GetByEmail(ctx context.Context, libraryID string, email string) (*Member, error)
 ```
 
-One parameter per unique field. A strongly consistent read of the claim, then of the item; returns
-`Err<Entity>NotFound` if no item holds the value.
+One parameter per unique field; for a `string_set` field, one element (`barcodesElem string`). A
+strongly consistent read of the claim, then of the item it points to; returns
+`Err<Entity>NotFound` if no item holds the value (or the set no longer contains the element).
 
 ### `query`
 

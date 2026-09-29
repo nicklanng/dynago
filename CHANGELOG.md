@@ -16,7 +16,8 @@ First version.
   types, views for projected indexes and queries, entity-specific errors wrapping `dynago` sentinels.
 - Indexes as GSIs (maintained by DynamoDB) or copies (written in the same transaction), sparse by
   empty key fields and `where`.
-- Uniqueness claims, including composite and optional values, moved atomically on change.
+- Uniqueness claims, including composite and optional values, moved atomically on change, and
+  one claim per element of a `string_set`. Claims point back to their owner.
 - Counters maintained atomically from every write: counts and sums, conditional (`where`), upper
   bounds (`limit`, constant or caller-supplied), lower bounds (`min`), sharding. Counters can be read
   from any entity of the table.

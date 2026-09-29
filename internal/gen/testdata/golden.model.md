@@ -165,6 +165,7 @@ Assumptions:
 
 - Sizes use each field's declared size (p50/p99); undeclared sizes use type defaults (string 20/64 B, time 30/35 B, int 8/11 B).
 - Every declared field is assumed present; empty fields are not stored, so real items are usually smaller.
+- A unique string set makes one claim per element; the number of elements is estimated from the set's declared size at 20 B per element.
 - Capacity follows DynamoDB rules: 1 WRU per started 1 KB written, 1 RRU per started 4 KB read strongly (half for eventually consistent); transactions cost double, and a condition check on another item is billed as a transactional write of that item.
 - GSI and copy writes are counted as one index write per entry; an index key change is a delete plus a put.
 - Prices: $0.625 per million WRU, $0.125 per million RRU, $0.25 per GB-month (on-demand).

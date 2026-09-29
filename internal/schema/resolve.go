@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -323,8 +324,9 @@ func parseSize(s string) (int, int, error) {
 	return p50, p99, nil
 }
 
-// template parses a key template and resolves its fields against the entity.
-func (r *resolver) template(e *Entity, where, raw string, required bool) (Template, bool) {
+// template parses a key template and resolves its fields against the entity. Fields in multi are
+// allowed although they are sets: a unique constraint renders one key per element.
+func (r *resolver) template(e *Entity, where, raw string, required bool, multi ...*Field) (Template, bool) {
 	if raw == "" {
 		if required {
 			r.errorf("%s: required", where)
@@ -342,7 +344,7 @@ func (r *resolver) template(e *Entity, where, raw string, required bool) (Templa
 		if sg.Transform == "" {
 			continue
 		}
-		if f := e.Field(sg.Field); f != nil && f.Type != TypeString && f.Type != TypeEnum {
+		if f := e.Field(sg.Field); f != nil && f.Type != TypeString && f.Type != TypeEnum && f.Type != TypeStringSet {
 			r.errorf("%s: {%s|%s}: transforms apply to string and enum fields; %s is a %s", where, sg.Field, sg.Transform, sg.Field, f.Type)
 			ok = false
 		}
@@ -354,7 +356,7 @@ func (r *resolver) template(e *Entity, where, raw string, required bool) (Templa
 			ok = false
 			continue
 		}
-		if !f.KeyCapable() {
+		if !f.KeyCapable() && !slices.Contains(multi, f) {
 			r.errorf("%s: field %s has type %s, which cannot be part of a key", where, name, f.Type)
 			ok = false
 			continue
@@ -516,7 +518,16 @@ func (r *resolver) unique(e *Entity, name string, raw RawUnique) *Unique {
 			r.errorf("%s: %s is not a field of %s", where, fn, e.Name)
 			return nil
 		}
-		if !f.KeyCapable() {
+		switch {
+		case f.Type == TypeStringSet && u.Set != nil:
+			r.errorf("%s: %s and %s are both sets; a constraint can make one set's elements unique", where, u.Set.Name, fn)
+			return nil
+		case f.Type == TypeStringSet:
+			u.Set = f
+		case f.Type == TypeList:
+			r.errorf("%s: field %s is a string_list, which can hold duplicates; make it a string_set to make its elements unique", where, fn)
+			return nil
+		case !f.KeyCapable():
 			r.errorf("%s: field %s has type %s, which cannot be unique", where, fn, f.Type)
 			return nil
 		}
@@ -532,10 +543,10 @@ func (r *resolver) unique(e *Entity, name string, raw RawUnique) *Unique {
 		pk = b.String()
 	}
 	var ok bool
-	if u.PK, ok = r.template(e, where+" pk", pk, true); !ok {
+	if u.PK, ok = r.template(e, where+" pk", pk, true, u.Set); !ok {
 		return nil
 	}
-	if u.SK, ok = r.template(e, where+" sk", orDefault(raw.SK, "UNIQUE"), true); !ok {
+	if u.SK, ok = r.template(e, where+" sk", orDefault(raw.SK, "UNIQUE"), true, u.Set); !ok {
 		return nil
 	}
 	used := map[*Field]bool{}

@@ -542,8 +542,20 @@ func (g *gen) derived(e *schema.Entity) {
 		}
 		g.p("// unique %s", u.Name)
 		g.p("if %s {", orTrue(conds))
-		g.p("d = append(d, dynago.Derived{Kind: dynago.KindClaim, Key: dynago.Key{PK: %s, SK: %s}, Type: %q, TakenErr: %s})",
-			tmplExpr(e, u.PK, "e"), tmplExpr(e, u.SK, "e"), e.Name+"."+u.Name, u.ErrName)
+		if u.Set == nil {
+			g.p("d = append(d, dynago.Derived{Kind: dynago.KindClaim, Key: dynago.Key{PK: %s, SK: %s}, Type: %q, TakenErr: %s})",
+				tmplExpr(e, u.PK, "e"), tmplExpr(e, u.SK, "e"), e.Name+"."+u.Name, u.ErrName)
+		} else {
+			// One claim per element. Elements that render the same key (differing only in case
+			// under |lower) share one claim.
+			vals := uniqueVals(u, "e", "elem")
+			g.p("for _, elem := range e.%s {", u.Set.GoName)
+			g.p("if elem != \"\" {")
+			g.p("d = append(d, dynago.Derived{Kind: dynago.KindClaim, Key: dynago.Key{PK: %s, SK: %s}, Type: %q, TakenErr: %s})",
+				tmplExprVals(e, u.PK, vals), tmplExprVals(e, u.SK, vals), e.Name+"."+u.Name, u.ErrName)
+			g.p("}")
+			g.p("}")
+		}
 		g.p("}")
 	}
 	for _, ix := range e.Indexes {
@@ -613,19 +625,40 @@ func (g *gen) getUnique(a *schema.Access) {
 	vals := map[string]string{}
 	for _, f := range u.Fields {
 		name := paramName(f)
-		params = append(params, fmt.Sprintf("%s %s", name, goType(e, f)))
+		typ := goType(e, f)
+		if f == u.Set {
+			name, typ = paramName(f)+"Elem", "string" // one element of the set
+		}
+		params = append(params, fmt.Sprintf("%s %s", name, typ))
 		vals[f.Name] = name
 	}
-	g.docComment(a.GoName, a.Doc, fmt.Sprintf("finds the %s holding the unique %s: a consistent read of the claim, then of the item.", e.Name, fieldList(u.Fields)))
+	what := "the unique " + fieldList(u.Fields)
+	if u.Set != nil {
+		what = "the given element of " + u.Set.Name
+		if len(u.Fields) > 1 {
+			what += " (with " + fieldList(slices.DeleteFunc(slices.Clone(u.Fields), func(f *schema.Field) bool { return f == u.Set })) + ")"
+		}
+	}
+	g.docComment(a.GoName, a.Doc, fmt.Sprintf("finds the %s holding %s: a consistent read of the claim, then of the item.", e.Name, what))
 	g.p("func (s *%sStore) %s(ctx context.Context, %s) (*%s, error) {", e.GoName, a.GoName, strings.Join(params, ", "), e.GoName)
 	for _, f := range u.Fields {
-		if pc := present(f, vals[f.Name]); pc != "" {
+		pc := present(f, vals[f.Name])
+		if f == u.Set {
+			pc = vals[f.Name] + ` != ""`
+		}
+		if pc != "" {
 			g.p("if %s {", negate(pc))
 			g.p("return nil, fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", a.Name, f.Name)
 			g.p("}")
 		}
 	}
-	g.keyPartChecks(u.Fields, func(f *schema.Field) string { return vals[f.Name] }, "return nil, err")
+	for _, f := range u.Fields {
+		if f == u.Set {
+			g.keyPartCheck(f, vals[f.Name], "return nil, err")
+		} else {
+			g.keyPartChecks([]*schema.Field{f}, func(f *schema.Field) string { return vals[f.Name] }, "return nil, err")
+		}
+	}
 	g.p("claimKey := dynago.Key{PK: %s, SK: %s}", tmplExprVals(e, u.PK, vals), tmplExprVals(e, u.SK, vals))
 	g.p("var claim dynago.Claim")
 	g.p("found, err := dynago.GetOne(ctx, s.t, claimKey, true, &claim)")
@@ -640,9 +673,20 @@ func (g *gen) getUnique(a *schema.Access) {
 	g.p("return nil, err")
 	g.p("}")
 	g.p("// The claim is only trusted while the item still holds the value it was taken for.")
-	g.p("if (dynago.Key{PK: %s, SK: %s}) != claimKey {", tmplExpr(e, u.PK, "it"), tmplExpr(e, u.SK, "it"))
-	g.p("return nil, Err%sNotFound", e.GoName)
-	g.p("}")
+	if u.Set == nil {
+		g.p("if (dynago.Key{PK: %s, SK: %s}) != claimKey {", tmplExpr(e, u.PK, "it"), tmplExpr(e, u.SK, "it"))
+		g.p("return nil, Err%sNotFound", e.GoName)
+		g.p("}")
+	} else {
+		vals := uniqueVals(u, "it", "elem")
+		g.p("held := false")
+		g.p("for _, elem := range it.%s {", u.Set.GoName)
+		g.p("held = held || (dynago.Key{PK: %s, SK: %s}) == claimKey", tmplExprVals(e, u.PK, vals), tmplExprVals(e, u.SK, vals))
+		g.p("}")
+		g.p("if !held {")
+		g.p("return nil, Err%sNotFound", e.GoName)
+		g.p("}")
+	}
 	g.p("return &it.%s, nil", e.GoName)
 	g.p("}")
 	g.p("")
@@ -1410,7 +1454,7 @@ func (g *gen) separators() map[*schema.Field]string {
 				continue
 			}
 			f := e.Field(sg.Field)
-			if f == nil || (f.Type != schema.TypeString && f.Type != schema.TypeEnum) {
+			if f == nil || (f.Type != schema.TypeString && f.Type != schema.TypeEnum && f.Type != schema.TypeStringSet) {
 				continue
 			}
 			own[f] += string([]rune(segs[i+1].Literal)[0])
@@ -1480,18 +1524,29 @@ func dedupeChars(s string) string {
 }
 
 // keyPartChecks emits a CheckKeyPart for each of fields that appears in a key template.
+// keyPartCheck emits a CheckKeyPart for one value of f (an element, if f is a set).
+func (g *gen) keyPartCheck(f *schema.Field, val, ret string) {
+	sep := g.separators()[f]
+	if sep == "" {
+		return
+	}
+	if f.Type == schema.TypeEnum {
+		val = "string(" + val + ")"
+	}
+	g.p("if err := dynago.CheckKeyPart(%q, %s, %q); err != nil {", f.Name, val, sep)
+	g.p("%s", ret)
+	g.p("}")
+}
+
 func (g *gen) keyPartChecks(fields []*schema.Field, expr func(*schema.Field) string, ret string) {
-	seps := g.separators()
 	for _, f := range fields {
-		if sep := seps[f]; sep != "" {
-			val := expr(f)
-			if f.Type == schema.TypeEnum {
-				val = "string(" + val + ")"
-			}
-			g.p("if err := dynago.CheckKeyPart(%q, %s, %q); err != nil {", f.Name, val, sep)
-			g.p("%s", ret)
+		if f.Type == schema.TypeStringSet && g.separators()[f] != "" {
+			g.p("for _, elem := range %s {", expr(f))
+			g.keyPartCheck(f, "elem", ret)
 			g.p("}")
+			continue
 		}
+		g.keyPartCheck(f, expr(f), ret)
 	}
 }
 
@@ -2183,4 +2238,17 @@ func comment(buf *bytes.Buffer, text string) {
 		}
 		buf.WriteString(line + "\n")
 	}
+}
+
+// uniqueVals maps the fields of a unique constraint to value expressions: recv's fields, and elem
+// for the set field.
+func uniqueVals(u *schema.Unique, recv, elem string) map[string]string {
+	vals := map[string]string{}
+	for _, f := range u.Fields {
+		vals[f.Name] = recv + "." + f.GoName
+	}
+	if u.Set != nil {
+		vals[u.Set.Name] = elem
+	}
+	return vals
 }

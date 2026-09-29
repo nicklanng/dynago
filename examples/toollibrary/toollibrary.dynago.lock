@@ -468,6 +468,139 @@
               }
             ]
           }
+        },
+        {
+          "version": 2,
+          "fingerprint": "01a4224028a05a11",
+          "shape": {
+            "fields": [
+              {
+                "name": "libraryId",
+                "attr": "libraryId",
+                "type": "string"
+              },
+              {
+                "name": "toolId",
+                "attr": "toolId",
+                "type": "string"
+              },
+              {
+                "name": "name",
+                "attr": "name",
+                "type": "string"
+              },
+              {
+                "name": "category",
+                "attr": "category",
+                "type": "enum",
+                "values": [
+                  "power",
+                  "garden",
+                  "hand",
+                  "kitchen",
+                  "camping"
+                ]
+              },
+              {
+                "name": "status",
+                "attr": "status",
+                "type": "enum",
+                "values": [
+                  "available",
+                  "onLoan",
+                  "retired"
+                ]
+              },
+              {
+                "name": "manual",
+                "attr": "manual",
+                "type": "string"
+              },
+              {
+                "name": "tags",
+                "attr": "tags",
+                "type": "string_set"
+              },
+              {
+                "name": "serialNumber",
+                "attr": "serialNumber",
+                "type": "string"
+              },
+              {
+                "name": "barcodes",
+                "attr": "barcodes",
+                "type": "string_set"
+              },
+              {
+                "name": "addedAt",
+                "attr": "addedAt",
+                "type": "time"
+              }
+            ],
+            "pk": "LIB#{libraryId}#TOOL#{toolId}",
+            "sk": "TOOL",
+            "indexes": [
+              {
+                "name": "ByCategory",
+                "strategy": "gsi",
+                "pk": "LIB#{libraryId}#CAT#{category}",
+                "sk": "{name|lower}#{toolId}",
+                "projection": "include",
+                "project": [
+                  "status",
+                  "tags"
+                ]
+              }
+            ],
+            "uniques": [
+              {
+                "name": "Serial",
+                "fields": [
+                  "libraryId",
+                  "serialNumber"
+                ],
+                "pk": "UNIQUE#Tool.Serial#{libraryId}#{serialNumber}",
+                "sk": "UNIQUE"
+              },
+              {
+                "name": "Barcode",
+                "fields": [
+                  "libraryId",
+                  "barcodes"
+                ],
+                "pk": "UNIQUE#Tool.Barcode#{libraryId}#{barcodes}",
+                "sk": "UNIQUE"
+              }
+            ],
+            "counters": [
+              {
+                "name": "ToolCounts",
+                "pk": "LIB#{libraryId}",
+                "sk": "COUNTS#TOOLS",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "available",
+                    "where": [
+                      "status=available"
+                    ]
+                  },
+                  {
+                    "name": "onLoan",
+                    "where": [
+                      "status=onLoan"
+                    ]
+                  },
+                  {
+                    "name": "retired",
+                    "where": [
+                      "status=retired"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
         }
       ]
     }
