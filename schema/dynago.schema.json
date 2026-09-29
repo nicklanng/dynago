@@ -1,0 +1,845 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/nicklanng/dynago/main/schema/dynago.schema.json",
+  "title": "dynago schema",
+  "description": "A DynamoDB table: its entities, how they are keyed, and every way they are read and written. See docs/schema.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "dynago",
+    "package",
+    "table",
+    "entities"
+  ],
+  "properties": {
+    "dynago": {
+      "const": 1,
+      "description": "Schema format version. Always 1."
+    },
+    "package": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*$",
+      "description": "Go package name of the generated code."
+    },
+    "table": {
+      "$ref": "#/$defs/table"
+    },
+    "output": {
+      "$ref": "#/$defs/output"
+    },
+    "entities": {
+      "type": "object",
+      "description": "The entities stored in the table, by PascalCase name.",
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/pascalName"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/entity"
+      }
+    }
+  },
+  "$defs": {
+    "pascalName": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Za-z0-9]*$"
+    },
+    "camelName": {
+      "type": "string",
+      "pattern": "^[a-z][A-Za-z0-9]*$"
+    },
+    "doc": {
+      "type": "string",
+      "description": "Documentation copied into the generated Go and model document."
+    },
+    "keyTemplate": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Literal text with {field} placeholders, e.g. \"LIB#{libraryId}#TOOL#{toolId}\". Placeholders must be separated by literal text. {field|lower} puts the lower-cased value in the key."
+    },
+    "sortKeyTemplate": {
+      "type": "string",
+      "pattern": "^[^{]",
+      "description": "A key template that starts with literal text, so its items can be told apart from other items in the same partition."
+    },
+    "scalar": {
+      "type": [
+        "string",
+        "number",
+        "boolean"
+      ]
+    },
+    "predicates": {
+      "type": "object",
+      "description": "Equality conditions, all of which must hold: {field: value}.",
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/camelName"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/scalar"
+      }
+    },
+    "fieldList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/camelName"
+      },
+      "uniqueItems": true
+    },
+    "table": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Default physical table name (the Terraform variable's default)."
+        },
+        "doc": {
+          "$ref": "#/$defs/doc"
+        },
+        "ttl_attribute": {
+          "type": "string",
+          "default": "ttl",
+          "description": "Attribute holding the expiry time in epoch seconds."
+        }
+      }
+    },
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Paths of generated files, relative to the schema file.",
+      "properties": {
+        "go": {
+          "type": "string",
+          "description": "Default <table>_dynago.go"
+        },
+        "docs": {
+          "type": "string",
+          "description": "Default <table>.model.md"
+        },
+        "terraform": {
+          "type": "string",
+          "description": "Default <table>.tf.json"
+        },
+        "table_json": {
+          "type": "string",
+          "description": "Default <table>.table.json"
+        },
+        "lock": {
+          "type": "string",
+          "description": "Default <table>.dynago.lock"
+        }
+      }
+    },
+    "entity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fields",
+        "key"
+      ],
+      "properties": {
+        "doc": {
+          "$ref": "#/$defs/doc"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Storage shape version. Bump it whenever fields, keys, indexes, claims or counters change."
+        },
+        "fields": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/camelName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/field"
+          }
+        },
+        "key": {
+          "$ref": "#/$defs/key"
+        },
+        "ttl": {
+          "$ref": "#/$defs/camelName",
+          "description": "A time field: the item expires at that time."
+        },
+        "indexes": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/pascalName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/index"
+          }
+        },
+        "unique": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/pascalName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/unique"
+          }
+        },
+        "counters": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/pascalName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/counter"
+          }
+        },
+        "access": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/pascalName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/access"
+          }
+        },
+        "writes": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/pascalName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/write"
+          }
+        },
+        "estimate": {
+          "$ref": "#/$defs/estimate"
+        }
+      }
+    },
+    "key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pk",
+        "sk"
+      ],
+      "properties": {
+        "pk": {
+          "$ref": "#/$defs/keyTemplate"
+        },
+        "sk": {
+          "$ref": "#/$defs/sortKeyTemplate"
+        }
+      }
+    },
+    "estimate": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "items": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Expected number of items, for the storage estimate."
+        }
+      }
+    },
+    "fieldType": {
+      "enum": [
+        "string",
+        "enum",
+        "int",
+        "float",
+        "bool",
+        "time",
+        "bytes",
+        "string_list",
+        "string_set",
+        "string_map"
+      ]
+    },
+    "field": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/fieldType"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "$ref": "#/$defs/fieldType"
+            },
+            "attr": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_.-]+$",
+              "description": "Stored attribute name; defaults to the field name."
+            },
+            "doc": {
+              "$ref": "#/$defs/doc"
+            },
+            "size": {
+              "type": [
+                "string",
+                "integer"
+              ],
+              "pattern": "^[0-9]+(/[0-9]+)?$",
+              "description": "Bytes, or p50/p99 bytes, for the cost estimate."
+            },
+            "example": {
+              "type": [
+                "string",
+                "number",
+                "boolean"
+              ],
+              "description": "Example value shown in rendered keys in the model document."
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1,
+              "uniqueItems": true,
+              "description": "The values of an enum field."
+            },
+            "copy_of": {
+              "type": "string",
+              "pattern": "^[A-Z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$",
+              "description": "Entity.field this field copies. dynago does not keep it in sync; declaring it documents the duty and makes dynago check warn."
+            },
+            "required": {
+              "type": "boolean",
+              "default": false,
+              "description": "Writes may not leave this field at its zero value (dynago.ErrFieldRequired): creates must set it, and updates may not clear it."
+            }
+          },
+          "if": {
+            "properties": {
+              "type": {
+                "const": "enum"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "values"
+            ]
+          },
+          "else": {
+            "not": {
+              "required": [
+                "values"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "projection": {
+      "oneOf": [
+        {
+          "enum": [
+            "all",
+            "keys"
+          ]
+        },
+        {
+          "$ref": "#/$defs/fieldList"
+        }
+      ]
+    },
+    "index": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pk",
+        "project"
+      ],
+      "properties": {
+        "strategy": {
+          "enum": [
+            "gsi",
+            "copy"
+          ],
+          "default": "gsi",
+          "description": "gsi: a global secondary index maintained by DynamoDB. copy: copy items written in the same transaction."
+        },
+        "pk": {
+          "$ref": "#/$defs/keyTemplate"
+        },
+        "sk": {
+          "$ref": "#/$defs/keyTemplate"
+        },
+        "project": {
+          "$ref": "#/$defs/projection"
+        },
+        "where": {
+          "$ref": "#/$defs/predicates"
+        },
+        "doc": {
+          "$ref": "#/$defs/doc"
+        }
+      },
+      "if": {
+        "properties": {
+          "strategy": {
+            "const": "copy"
+          }
+        },
+        "required": [
+          "strategy"
+        ]
+      },
+      "then": {
+        "required": [
+          "sk"
+        ],
+        "properties": {
+          "sk": {
+            "$ref": "#/$defs/sortKeyTemplate"
+          }
+        }
+      }
+    },
+    "unique": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "fields"
+      ],
+      "properties": {
+        "fields": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/fieldList"
+            },
+            {
+              "minItems": 1
+            }
+          ]
+        },
+        "pk": {
+          "$ref": "#/$defs/keyTemplate",
+          "description": "Default UNIQUE#<Entity>.<Name>#{field}..."
+        },
+        "sk": {
+          "$ref": "#/$defs/keyTemplate",
+          "description": "Default UNIQUE"
+        },
+        "doc": {
+          "$ref": "#/$defs/doc"
+        }
+      }
+    },
+    "counter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pk",
+        "sk",
+        "values"
+      ],
+      "properties": {
+        "pk": {
+          "$ref": "#/$defs/keyTemplate"
+        },
+        "sk": {
+          "$ref": "#/$defs/sortKeyTemplate"
+        },
+        "shards": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 1,
+          "description": "Spread writes over this many counter items; reads sum them."
+        },
+        "doc": {
+          "$ref": "#/$defs/doc"
+        },
+        "values": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/camelName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/counterValue"
+          }
+        }
+      }
+    },
+    "counterValue": {
+      "oneOf": [
+        {
+          "const": "count"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "count": {
+              "const": true
+            },
+            "sum": {
+              "$ref": "#/$defs/camelName",
+              "description": "An int field to sum."
+            },
+            "where": {
+              "$ref": "#/$defs/predicates"
+            },
+            "limit": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                {
+                  "const": "arg"
+                }
+              ],
+              "description": "Upper bound: a number, or arg for a caller-supplied dynago.Limit."
+            },
+            "min": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Lower bound: writes that would take the value below it fail."
+            },
+            "doc": {
+              "$ref": "#/$defs/doc"
+            }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "count"
+              ]
+            },
+            {
+              "required": [
+                "sum"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "access": {
+      "oneOf": [
+        {
+          "const": "get"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "get": {
+              "oneOf": [
+                {
+                  "const": "key"
+                },
+                {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "unique"
+                  ],
+                  "properties": {
+                    "unique": {
+                      "$ref": "#/$defs/pascalName"
+                    }
+                  }
+                }
+              ]
+            },
+            "query": {
+              "type": "string",
+              "description": "key (the entity's own partition) or an index name."
+            },
+            "counter": {
+              "$ref": "#/$defs/pascalName"
+            },
+            "order": {
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "asc"
+            },
+            "page": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "default": 50
+            },
+            "max_page": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000,
+              "description": "Default max(100, page)."
+            },
+            "range": {
+              "$ref": "#/$defs/camelName",
+              "description": "Adds From/To bounds on the sort key's first placeholder."
+            },
+            "consistent": {
+              "type": "boolean",
+              "default": false
+            },
+            "doc": {
+              "$ref": "#/$defs/doc"
+            },
+            "rate": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Average calls per second, for the cost estimate."
+            },
+            "project": {
+              "$ref": "#/$defs/projection",
+              "description": "For query: key only. Read just these fields (plus key fields), for bandwidth and to keep other fields from callers. DynamoDB still bills the whole item."
+            }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "get"
+              ]
+            },
+            {
+              "required": [
+                "query"
+              ]
+            },
+            {
+              "required": [
+                "counter"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "write": {
+      "oneOf": [
+        {
+          "enum": [
+            "create",
+            "delete"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "create": {
+              "const": true
+            },
+            "delete": {
+              "const": true
+            },
+            "update": {
+              "$ref": "#/$defs/fieldList",
+              "description": "Fields the caller supplies."
+            },
+            "set": {
+              "$ref": "#/$defs/predicates",
+              "description": "Fields set to constants. On a create, they override what the caller passed (a new loan is always active)."
+            },
+            "when": {
+              "$ref": "#/$defs/predicates",
+              "description": "Preconditions that must hold for the update."
+            },
+            "versioned": {
+              "enum": [
+                "optional",
+                "required"
+              ],
+              "default": "optional"
+            },
+            "doc": {
+              "$ref": "#/$defs/doc"
+            },
+            "rate": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Average calls per second, for the cost estimate."
+            },
+            "hot_key_rate": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Peak calls per second against one partition key, for hot-key warnings."
+            },
+            "patch": {
+              "$ref": "#/$defs/fieldList",
+              "description": "Optional fields the caller may supply: nil leaves the field unchanged."
+            },
+            "requires": {
+              "type": "object",
+              "description": "Conditions on other items of the table (entities, or counters by name), checked in the same transaction. A requirement on an entity may also change it (set) or delete it (consume).",
+              "propertyNames": {
+                "$ref": "#/$defs/pascalName"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/require"
+              }
+            }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "create"
+              ],
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "delete"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "update"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "patch"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "when"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "versioned"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "required": [
+                "delete"
+              ],
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "create"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "update"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "patch"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "set"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "when"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "anyOf": [
+                {
+                  "required": [
+                    "update"
+                  ]
+                },
+                {
+                  "required": [
+                    "patch"
+                  ]
+                },
+                {
+                  "required": [
+                    "set"
+                  ]
+                }
+              ],
+              "not": {
+                "anyOf": [
+                  {
+                    "required": [
+                      "create"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "delete"
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "require": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key"
+      ],
+      "properties": {
+        "key": {
+          "type": "object",
+          "minProperties": 1,
+          "description": "Each key field of the required entity (or counter), mapped to the field of this entity holding its value.",
+          "propertyNames": {
+            "$ref": "#/$defs/camelName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/camelName"
+          }
+        },
+        "when": {
+          "$ref": "#/$defs/predicates",
+          "description": "Values the required item must have. For an entity, a value \"{field}\" means this entity's field. For a counter, integers, where a missing value counts as 0."
+        },
+        "set": {
+          "$ref": "#/$defs/predicates",
+          "description": "Changes the required entity in the same transaction, maintaining its counters and indexes. Values are constants or \"{field}\" of this entity."
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false,
+          "description": "The write goes ahead if the entity is absent or expired; when applies only to one that is there."
+        },
+        "consume": {
+          "type": "boolean",
+          "default": false,
+          "description": "Deletes the required entity in the same transaction."
+        }
+      },
+      "not": {
+        "required": [
+          "set",
+          "consume"
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,4 @@
+/dynago
+*.test
+*.out
+internal/gen/gocode/testdata/compile/

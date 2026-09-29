@@ -1,0 +1,272 @@
+# Generated code
+
+`dynago generate` writes one Go file per schema (`<table>_dynago.go`). This page lists everything
+in it, how it is named, and how each generated method behaves. The generated code depends only on
+[guregu/dynamo](https://github.com/guregu/dynamo) and the small runtime package
+`github.com/nicklanng/dynago`, whose exported names you also use: errors, `Page`, `Limit`, `Max`,
+`Unlimited`, `Ptr`, `From`, `IfVersion`, `ReturnVersion`, `SignCursors` and `SetRetries`.
+
+Names below come from [the example](../examples/toollibrary): entities `Loan`, `Member`, `Tool`,
+counter `MemberLoans`, index `Overdue`, and so on.
+
+## Package level
+
+| Name | What it is |
+|---|---|
+| `TableSpec` | The table's physical shape (GSIs, TTL attribute), a `dynago.TableSpec`. |
+| `Store` | One field per entity, named as the plural of the entity: `Store.Loans`, `Store.Libraries`. |
+| `New(db *dynamo.DB, tableName string) *Store` | Returns a store for the named table. The table name is a parameter, so environments can differ. |
+| `EnsureTable(ctx, db, tableName) error` | Creates the table (and enables TTL) if it does not exist. For local development and tests; production tables belong in the generated Terraform. |
+
+```go
+db := dynamo.New(cfg)                                   // guregu/dynamo
+st := toollibrary.New(db, "toollibrary-prod")
+tool, err := st.Tools.Get(ctx, toollibrary.ToolKey{LibraryID: lib, ToolID: id})
+```
+
+## Per entity
+
+For an entity `Loan`:
+
+| Name | Declared by | What it is |
+|---|---|---|
+| `Loan` | the entity | A struct with one exported field per schema field, tagged for guregu. Has `Key()` and `Version()`. |
+| `LoanKey` | the key templates | The primary key fields, in template order. |
+| `(*Loan).Key() LoanKey` | | The entity's key. |
+| `(*Loan).Version() string` | | The opaque version the entity was read or created at, or `""` if the store never saw it. See [Concurrency](guides/concurrency.md). |
+| `LoanStatus` + `LoanStatusActive`, … | an `enum` field `status` | A string type and one constant per value. |
+| `LoanStore` | | The methods below. Get it from `Store.Loans`. |
+| `LoanOverdue` | an index `Overdue` without `project: all` | What a query through the index returns: key fields plus projected fields. |
+| `LoanHistoryItem` | a `query: key` access `History` with `project` | What the projected query returns. |
+| `MemberLoans`, `MemberLoansKey` | a counter `MemberLoans` | The counter's values (`int64` fields) and the fields that address it. |
+| `Loan<Access>Query` | a `query` access pattern | Its partition key fields, plus `From, To *T` when it has a `range`. |
+| `Loan<Write>` | an update with `update:` or `patch:` fields | The values the caller supplies; `patch` fields are pointers. |
+| `Loan<Write>Limits` | a write that can grow a `limit: arg` counter value | One `dynago.Limit` per value, named `<Counter><Value>`. |
+
+### Errors
+
+Each error wraps a `dynago` sentinel, so match either the specific or the general one:
+
+```go
+switch {
+case errors.Is(err, toollibrary.ErrMemberLoansActiveLimit): // this member's cap
+case errors.Is(err, dynago.ErrLimit):                       // any limit
+}
+```
+
+| Name | Wraps | When |
+|---|---|---|
+| `Err<Entity>NotFound` | `dynago.ErrNotFound` | A get, update or delete found no item (or only an expired one); a unique lookup found no holder. |
+| `Err<Entity>Exists` | `dynago.ErrExists` | A create found an item at that key that hasn't expired. |
+| `Err<Entity><Write>Precondition` | `dynago.ErrPrecondition` | An update's `when` did not hold. |
+| `Err<Entity><Write>Requires<Target>` | `dynago.ErrPrecondition` | A `requires` check failed: the other item is missing or expired (unless `optional`), not in the required state, or a counter doesn't have the required value. |
+| `Err<Entity><Unique>Taken` | `dynago.ErrTaken` | The unique value belongs to another item. |
+| `Err<Counter><Value>Limit` | `dynago.ErrLimit` | The write would take the value above its `limit`. |
+| `Err<Counter><Value>Min` | `dynago.ErrLimit` | The write would take the value below its `min`. |
+
+And, from the runtime directly:
+
+| Error | When | Retried by the generated code? |
+|---|---|---|
+| `dynago.ErrInvalidKey` | A key field is empty, contains a separator character of its template, or the entity passed with `From` is a different item. | no |
+| `dynago.ErrFieldRequired` | A write left a `required: true` field at its zero value. | no |
+| `dynago.ErrLimitRequired` | A write that takes a `limit: arg` value was not given one. Pass `dynago.Max(n)`, or `dynago.Unlimited()` deliberately. | no |
+| `dynago.ErrInvalidCursor` | A page cursor is malformed, came from another query, partition or schema version, or fails its signature. | no |
+| `dynago.ErrVersionMismatch` | A version was supplied and the item has changed since. | no: the caller decides |
+| `dynago.ErrVersionRequired` | The write is `versioned: required` and no version was supplied. | no |
+| `dynago.ErrNewerSchema` | The item was written by code at a newer schema version (a rolling deploy in progress). | no |
+| `dynago.ErrConflict` | The item kept changing, or other transactions kept holding its items (a single-item write can be blocked by a transaction too), until retries ran out (about half a second by default; `dynago.SetRetries` changes the policy). | it is the result of retries |
+| `dynago.ErrSameItemTwice` | A write would touch one item twice in a transaction, which DynamoDB rejects. dynago refuses the schema shapes that cause it, so this means a bug: please report it. | no |
+| `dynago.ErrTooManyItems` | The write would exceed DynamoDB's 100-item transaction limit. | no |
+
+When several bounded values of one counter item are checked in a single write, DynamoDB cannot say
+which one failed, so the error matches each of their sentinels.
+
+## Reads
+
+Every read is one request, except a lookup by unique value (two). None of them scan or page
+internally. Items whose `ttl` time has passed are treated as absent everywhere, even though
+DynamoDB may not delete them for days.
+
+### `get: key`
+
+```go
+func (s *ToolStore) Get(ctx context.Context, k ToolKey) (*Tool, error)
+```
+
+One GetItem (strongly consistent with `consistent: true`). Returns `ErrToolNotFound` if absent.
+The entity carries its version.
+
+### `get: { unique: Name }`
+
+```go
+func (s *MemberStore) GetByEmail(ctx context.Context, libraryID string, email string) (*Member, error)
+```
+
+One parameter per unique field. A strongly consistent read of the claim, then of the item; returns
+`Err<Entity>NotFound` if no item holds the value.
+
+### `query`
+
+```go
+func (s *LoanStore) Overdue(ctx context.Context, q LoanOverdueQuery, page dynago.Page) ([]LoanOverdue, string, error)
+```
+
+Exactly one Query request per call. `page.Size` defaults to the pattern's `page` and is clamped to
+`max_page`; `page.Cursor` is the cursor the previous call returned. The result is at most
+`page.Size` items and the next cursor, `""` at the end. A page can hold fewer items than asked for
+(expired items are left out) and still have a next cursor; keep going until the cursor is `""`.
+
+```go
+page := dynago.Page{Size: 25}
+for {
+    tools, next, err := st.Tools.Catalogue(ctx, q, page)
+    if err != nil { return err }
+    // use tools
+    if next == "" { break }
+    page.Cursor = next
+}
+```
+
+Cursors are opaque, URL-safe strings, tied to the access pattern, the partition, the range bounds
+and the entity's schema version: reused anywhere else they fail with `dynago.ErrInvalidCursor`.
+Call `dynago.SignCursors(secret)` at startup to make them tamper-proof too; they still show the
+key of the last item, so sign them if keys are sensitive. To rotate the secret, deploy
+`dynago.SignCursors(next, current)` (signing with `next`, still accepting `current`), then drop
+`current` once old cursors have gone out of use.
+
+Queries on the entity's own partition or through `project: all` indexes return entities. Through
+a GSI they carry the version they were indexed at, which may be a moment old: a write passed one
+with `dynago.From` fails with `ErrVersionMismatch` if so. Copy items don't store the revision, so
+entities read through a copy index have no version (`Version()` is `""`, and `dynago.From` refuses
+them): get the item when you need one. Other indexes return the `<Entity><Index>` view type, and
+projected base queries the `<Entity><Access>Item` type.
+
+### `counter`
+
+```go
+func (s *LibraryStore) MemberStats(ctx context.Context, k MemberCountsKey) (MemberCounts, error)
+```
+
+One GetItem, or one BatchGetItem over all shards of a sharded counter, summed. A counter that
+nothing has written reads as zero. The method can live on any entity's store (here the library
+reads the member counts).
+
+## Writes
+
+Every write is atomic: either all of its items change or none do. The request shape of each write is
+decided from the schema, and the model document lists it.
+
+### create
+
+```go
+func (s *LoanStore) Borrow(ctx context.Context, e *Loan, limits LoanBorrowLimits) error
+```
+
+The `limits` parameter appears only if the write can grow a `limit: arg` counter value. Every
+limit must be given (`dynago.Max(n)` or `dynago.Unlimited()`).
+
+Sets the write's `set` constants on `e` (overriding what the caller passed) and checks `required`
+fields. Then writes the item on the condition that no unexpired item exists at the key, plus every
+claim, copy and counter contribution the entity has, and everything its `requires` declare. With
+none of those it is a single PutItem; otherwise a transaction. Afterwards `e.Version()` is the new
+item's version.
+
+### update
+
+```go
+func (s *LoanStore) Return(ctx context.Context, k LoanKey, v LoanReturn, opts ...dynago.WriteOption) error
+func (s *MemberStore) UpdateProfile(ctx context.Context, k MemberKey, v MemberUpdateProfile, opts ...dynago.WriteOption) error
+```
+
+`v` is present if the update has `update:` or `patch:` fields; `patch` fields are pointers, and
+`nil` leaves a field unchanged (`dynago.Ptr` makes pointers). An update whose patch fields are all
+`nil` and that has no other changes writes nothing. `limits` is present if the update can grow a
+`limit: arg` value. `opts` takes `dynago.From(entity)`, `dynago.IfVersion(version)` and
+`dynago.ReturnVersion(&s)`.
+
+The generator picks one of three shapes:
+
+| Shape | When | Requests |
+|---|---|---|
+| **Single update** | The changed fields feed no index key, `where`, copy, claim or counter, and the write has no `requires`. | One conditional UpdateItem. No read. (Only if the condition fails is the item read once, to report which condition failed.) |
+| **Read-free** | The counters and claims it changes depend only on key fields and fields its `when` pins, e.g. `Retire: { set: { status: retired }, when: { status: available } }`, and its `requires` use only fields known from the call. | One transaction: the conditional update plus the counter changes and `requires`, with no read. If the item isn't in the assumed state (or was written before a counter existed), it falls back to the read-first shape, which reports exactly why. `From` and `ReturnVersion` use read-first directly: they need the stored state. |
+| **Read-first** | Anything else. | A consistent GetItem (skipped with `dynago.From`), then a transaction (or a single PutItem if there are no derived items) conditioned on the revision read. |
+
+A `patch` update is decided per call as well: if every patch field that feeds something derived is
+`nil`, the call runs as a single update. `UpdateProfile` with only a new phone number doesn't read;
+with a new name, which moves the directory entry, it does.
+
+The read-first shape computes every derived item before and after the change and writes only the
+differences: counter deltas, claims to take and release, copies to put and delete. If the item
+changed between the read and the write, it re-reads and tries again, unless a version was
+supplied, in which case it returns `dynago.ErrVersionMismatch`.
+
+`when` preconditions fail with `Err<Entity><Write>Precondition`, and a `required` field set to
+its zero value with `dynago.ErrFieldRequired`.
+
+### requires
+
+A `requires` entry adds items to the write's transaction:
+
+| Declared | In the transaction |
+|---|---|
+| `when` only | A ConditionCheck: the item exists, hasn't expired and matches (with `optional`, an absent or expired item passes). |
+| a counter | A ConditionCheck on the counter item's values; a missing value counts as 0. |
+| `set` | An update of the other entity, with its revision bumped and its counters, claims, copies and index keys maintained. |
+| `consume` | A delete of the other entity, releasing what it contributed. |
+
+A change to another entity is built by an unexported method on the writing store
+(`requireBorrowTool`). When its derived changes are known from `when` and `set`, it is first
+written without reading the other item, conditioned on the required state. If that condition
+fails, the transaction is cancelled and the write runs again reading the other item
+(`dynago.ReadIfNeeded`), which either reports the precondition error or writes the change guarded
+by that item's revision. Otherwise the other item is always read first. Either way, the item
+changes only in the same transaction as the write.
+
+### delete
+
+```go
+func (s *MemberStore) Leave(ctx context.Context, k MemberKey, opts ...dynago.WriteOption) error
+```
+
+An entity with no claims, copies, counters or `requires` is deleted with one conditional
+DeleteItem. Otherwise the item is read (or taken from `dynago.From`) so its contributions can be
+released in the same transaction.
+
+## What every write guarantees
+
+- **Atomic derived items.** Claims, copies, counters and everything `requires` declares (checks,
+  and changes to other entities) are in the same transaction as the item, so they never disagree
+  with it. GSI entries are maintained by DynamoDB,
+  eventually consistently.
+- **No lost read-modify-writes.** Read-first writes are conditioned on the revision they read.
+  Revisions start at a random value, so an item deleted and re-created in between is detected.
+- **Retries are safe.** Transactions carry an idempotency token. A single-item create that the SDK
+  retries after it had already succeeded recognises its own item by its random revision and
+  reports success.
+- **Rolling deploys.** No write path, including single updates and deletes, rewrites an item that
+  newer code wrote (`dynago.ErrNewerSchema`). An old instance cannot drop attributes or counts a new
+  one stored.
+- **Expired items are absent.** Updates and deletes treat an item past its `ttl` as not found, and
+  a create may replace one.
+- **No key collisions.** A string or enum value containing the character that follows it in a key
+  identifying an item (the item's own key, copies, claims, counters, required items, GSI partition
+  keys) is rejected with `dynago.ErrInvalidKey`, since it could render another item's key. A field
+  at the end of its template needs no check, nor do GSI sort keys, which needn't be unique: a tool
+  can be called "Drill #2". Updates check only the fields they change. Fields linked by a
+  `requires` key share their checks: a loan's `toolId` appears mid-key in its MyLoans copy, so
+  `Tools.Add` refuses a `toolId` containing `#`, rather than every later borrow of that tool
+  failing.
+- **Exact counters across schema versions.** An item only contributes to counter values, claims and
+  copies that existed at the version it was written at. See
+  [Schema changes](guides/schema-changes.md).
+- **Limits are never silently off.** A missing caller-supplied limit is an error.
+
+## What the generated code does not do
+
+- It does not expose raw DynamoDB access, scans or filters. A read that is not declared does not
+  exist. Add an access pattern to the schema instead.
+- It does not change another entity in arbitrary ways: `requires` can set constants (or the
+  writer's field values) on another entity and delete it, not compute new values from it.
+- It does not decrement counters or release claims and copies when DynamoDB deletes an expired item.

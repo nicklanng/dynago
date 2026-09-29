@@ -1,0 +1,153 @@
+{
+  "AttributeDefinitions": [
+    {
+      "AttributeName": "PK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "SK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "ByNamePK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "ByNameSK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "ByCategoryPK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "ByCategorySK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "OverduePK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "OverdueSK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "ByCodePK",
+      "AttributeType": "S"
+    }
+  ],
+  "BillingMode": "PAY_PER_REQUEST",
+  "GlobalSecondaryIndexes": [
+    {
+      "IndexName": "ByName",
+      "KeySchema": [
+        {
+          "AttributeName": "ByNamePK",
+          "KeyType": "HASH"
+        },
+        {
+          "AttributeName": "ByNameSK",
+          "KeyType": "RANGE"
+        }
+      ],
+      "Projection": {
+        "NonKeyAttributes": [
+          "_t",
+          "_v",
+          "libraryId",
+          "memberId",
+          "name",
+          "role",
+          "status"
+        ],
+        "ProjectionType": "INCLUDE"
+      }
+    },
+    {
+      "IndexName": "ByCategory",
+      "KeySchema": [
+        {
+          "AttributeName": "ByCategoryPK",
+          "KeyType": "HASH"
+        },
+        {
+          "AttributeName": "ByCategorySK",
+          "KeyType": "RANGE"
+        }
+      ],
+      "Projection": {
+        "NonKeyAttributes": [
+          "_t",
+          "_v",
+          "libraryId",
+          "toolId",
+          "name",
+          "category",
+          "status",
+          "tags"
+        ],
+        "ProjectionType": "INCLUDE"
+      }
+    },
+    {
+      "IndexName": "Overdue",
+      "KeySchema": [
+        {
+          "AttributeName": "OverduePK",
+          "KeyType": "HASH"
+        },
+        {
+          "AttributeName": "OverdueSK",
+          "KeyType": "RANGE"
+        }
+      ],
+      "Projection": {
+        "NonKeyAttributes": [
+          "_t",
+          "_v",
+          "libraryId",
+          "toolId",
+          "loanId",
+          "memberId",
+          "toolName",
+          "dueAt"
+        ],
+        "ProjectionType": "INCLUDE"
+      }
+    },
+    {
+      "IndexName": "ByCode",
+      "KeySchema": [
+        {
+          "AttributeName": "ByCodePK",
+          "KeyType": "HASH"
+        }
+      ],
+      "Projection": {
+        "NonKeyAttributes": [
+          "_t",
+          "_v",
+          "libraryId",
+          "toolId",
+          "memberId",
+          "codeHash",
+          "expiresAt",
+          "ttl"
+        ],
+        "ProjectionType": "INCLUDE"
+      }
+    }
+  ],
+  "KeySchema": [
+    {
+      "AttributeName": "PK",
+      "KeyType": "HASH"
+    },
+    {
+      "AttributeName": "SK",
+      "KeyType": "RANGE"
+    }
+  ],
+  "TableName": "toollibrary"
+}

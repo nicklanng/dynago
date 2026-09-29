@@ -1,0 +1,265 @@
+# yaml-language-server: $schema=../../schema/dynago.schema.json
+#
+# A neighbourhood tool library. Members borrow drills and tents instead of buying them, reserve a
+# tool for pickup with a code, and stewards run the place. A fictional domain, chosen to use every
+# feature of dynago in one realistic table.
+#
+# The rules that matter hold in single transactions, so no crash or race can leave them half done:
+#   - Borrow creates the loan, marks the tool on loan, counts it against the member's cap, and
+#     collects the member's own pickup hold, checking the member is active and nobody else holds
+#     the tool. Return reverses the tool and the count.
+#   - A hold reserves the tool: while it is live, only its member can borrow the tool. Holds lapse
+#     by TTL, with nothing to undo, because a hold changes nothing but itself.
+#   - A member with tools out can't leave, and the last active steward can't be suspended, demoted
+#     or leave.
+dynago: 1
+package: toollibrary
+
+table:
+  name: toollibrary
+  doc: Libraries, their members and tools, loans and pickup holds.
+
+entities:
+  Library:
+    doc: A tool library, run by volunteers in one neighbourhood.
+    fields:
+      libraryId: { type: string, example: lib_1 }
+      name: { type: string, size: 20/80 }
+      slug: { type: string, size: 12/40, example: greenwood, doc: The library's URL name. }
+      openedAt: time
+    key:
+      pk: "LIB#{libraryId}"
+      sk: "LIBRARY"
+    unique:
+      Slug:
+        doc: Routes /l/{slug} to its library. Global, because the URL carries nothing else.
+        fields: [slug]
+    access:
+      Get: get
+      GetBySlug: { get: { unique: Slug } }
+      MemberStats: { counter: MemberCounts, doc: "The member counts, read from the library's page." }
+      ToolStats: { counter: ToolCounts }
+    writes:
+      Open: create
+      Rename: { patch: [name], versioned: required, doc: "A steward editing the library's settings." }
+      ChangeSlug: { update: [slug], versioned: required }
+    estimate: { items: 2000 }
+
+  Member:
+    doc: A person who can borrow tools from one library.
+    fields:
+      libraryId: { type: string, example: lib_1 }
+      memberId: { type: string, example: m_7 }
+      email: { type: string, size: 25/80, doc: "Stored as given; matched case-insensitively." }
+      name: { type: string, size: 15/60 }
+      phone: string
+      role: { type: enum, values: [member, steward] }
+      status: { type: enum, values: [active, suspended] }
+      maxLoans: { type: int, doc: How many tools the member may have out at once. }
+      joinedAt: time
+    key:
+      pk: "LIB#{libraryId}"
+      sk: "MEMBER#{memberId}"
+    indexes:
+      ByName:
+        doc: "The member directory, alphabetical. Lower-cased in the key, so \"adam\" sorts before \"Zoe\"."
+        pk: "LIB#{libraryId}#MEMBERS"
+        sk: "{name|lower}#{memberId}"
+        project: [role, status]
+    unique:
+      Email:
+        doc: One membership per email address in each library, ignoring case.
+        fields: [libraryId, email]
+        pk: "UNIQUE#Member.Email#{libraryId}#{email|lower}"
+    counters:
+      MemberCounts:
+        doc: Holds the library's member numbers.
+        pk: "LIB#{libraryId}"
+        sk: "COUNTS#MEMBERS"
+        values:
+          active: { count: true, where: { status: active } }
+          suspended: { count: true, where: { status: suspended } }
+          stewards: { count: true, where: { role: steward, status: active }, min: 1, doc: A library always keeps at least one active steward. }
+    access:
+      Get: get
+      GetByEmail: { get: { unique: Email } }
+      Directory: { query: ByName }
+    writes:
+      Join: create
+      UpdateProfile: { patch: [name, phone], doc: "The member editing their own profile; only what they changed is sent." }
+      SetLoanCap: { update: [maxLoans] }
+      Suspend: { set: { status: suspended }, when: { status: active } }
+      Reinstate: { set: { status: active }, when: { status: suspended } }
+      MakeSteward: { set: { role: steward }, when: { role: member } }
+      StepDown: { set: { role: member }, when: { role: steward } }
+      Leave:
+        delete: true
+        requires:
+          MemberLoans: { key: { libraryId: libraryId, memberId: memberId }, when: { active: 0 } }
+        doc: Members return everything before they go.
+    estimate: { items: 40000 }
+
+  Tool:
+    doc: A tool the library lends out.
+    fields:
+      libraryId: { type: string, example: lib_1 }
+      toolId: { type: string, example: t_42 }
+      name: { type: string, size: 20/60 }
+      category: { type: enum, values: [power, garden, hand, kitchen, camping] }
+      status: { type: enum, values: [available, onLoan, retired] }
+      manual: { type: string, size: 2000/20000, doc: "Care and safety notes. Large, so never listed." }
+      tags: { type: string_set, size: 30/120 }
+      serialNumber: { type: string, doc: "The maker's serial number, if it has one." }
+      addedAt: time
+    key:
+      pk: "LIB#{libraryId}#TOOL#{toolId}"
+      sk: "TOOL"
+    indexes:
+      ByCategory:
+        doc: The catalogue, by category then name. Status is projected, so lending doesn't move entries.
+        pk: "LIB#{libraryId}#CAT#{category}"
+        sk: "{name|lower}#{toolId}"
+        project: [status, tags]
+    unique:
+      Serial:
+        doc: Stops the same physical tool being catalogued twice. Tools without a serial number make no claim.
+        fields: [libraryId, serialNumber]
+    counters:
+      ToolCounts:
+        doc: Holds the library's catalogue numbers.
+        pk: "LIB#{libraryId}"
+        sk: "COUNTS#TOOLS"
+        values:
+          available: { count: true, where: { status: available } }
+          onLoan: { count: true, where: { status: onLoan } }
+          retired: { count: true, where: { status: retired } }
+    access:
+      Get: get
+      Catalogue: { query: ByCategory, page: 25 }
+    writes:
+      Add: create
+      EditDetails: { patch: [name, manual, tags], versioned: required }
+      Retire:
+        set: { status: retired }
+        when: { status: available }
+        requires:
+          Hold: { key: { libraryId: libraryId, toolId: toolId }, optional: true, consume: true }
+        doc: Takes the tool out of the catalogue, cancelling any hold on it.
+    # Tools go on and off loan through Loan.Borrow and Loan.Return, which change them in the same
+    # transaction as the loan.
+    estimate: { items: 120000 }
+
+  Loan:
+    doc: A member borrowing a tool.
+    fields:
+      libraryId: { type: string, example: lib_1 }
+      toolId: { type: string, example: t_42 }
+      loanId: { type: string, example: ln_9, doc: "A ULID, so a tool's loans sort by time." }
+      memberId: { type: string, required: true, example: m_7 }
+      toolName: { type: string, size: 20/60, copy_of: Tool.name, doc: Shown in "my loans" without reading the tool. }
+      status: { type: enum, values: [active, returned], doc: Set by Borrow and Return; callers never choose it. }
+      borrowedAt: { type: time, required: true }
+      dueAt: { type: time, required: true, example: "2026-10-12T17:00:00Z" }
+      returnedAt: time
+      notes: { type: string, size: 0/1000, doc: Condition notes from the steward. Not listed. }
+    key:
+      pk: "LIB#{libraryId}#TOOL#{toolId}"
+      sk: "LOAN#{loanId}"
+    indexes:
+      ByMember:
+        strategy: copy
+        doc: "A member's current loans, soonest due first. Copies, not a GSI, so a member sees a loan the moment they take it; returned loans drop out."
+        pk: "LIB#{libraryId}#MEMBER#{memberId}"
+        sk: "MYLOAN#{dueAt}#{toolId}#{loanId}"
+        where: { status: active }
+        project: [toolName, dueAt]
+      Overdue:
+        doc: Active loans by due date, for the steward's reminder run. Returned loans drop out.
+        pk: "LIB#{libraryId}#DUE"
+        sk: "{dueAt}#{loanId}"
+        where: { status: active }
+        project: [memberId, toolName]
+    counters:
+      MemberLoans:
+        doc: Counts each member's loans.
+        pk: "LIB#{libraryId}#MEMBER#{memberId}"
+        sk: "LOANS"
+        values:
+          active: { count: true, where: { status: active }, limit: arg, doc: Capped by the member's maxLoans. }
+      LoanTotals:
+        doc: "Counts every loan the library has made. Sharded to show how: a counter that every write of a busy entity touches can take ~1,000 writes/s per shard. This library's rate needs one item."
+        pk: "LIB#{libraryId}#LOANTOTALS"
+        sk: "TOTALS"
+        shards: 4
+        values:
+          started: count
+    access:
+      Get: get
+      History: { query: key, order: desc, page: 20, project: [memberId, status, borrowedAt, dueAt, returnedAt], doc: "A tool's loans, newest first, without the notes." }
+      MyLoans: { query: ByMember, consistent: true, doc: "A member's current loans, soonest due first." }
+      Overdue: { query: Overdue, range: dueAt }
+      ActiveLoans: { counter: MemberLoans }
+      Totals: { counter: LoanTotals }
+    writes:
+      Borrow:
+        create: true
+        set: { status: active }
+        requires:
+          Member: { key: { libraryId: libraryId, memberId: memberId }, when: { status: active } }
+          Tool:
+            key: { libraryId: libraryId, toolId: toolId }
+            when: { status: available }
+            set: { status: onLoan }
+          Hold:
+            key: { libraryId: libraryId, toolId: toolId }
+            optional: true
+            when: { memberId: "{memberId}" }
+            consume: true
+        rate: 2
+        hot_key_rate: 1
+      Return:
+        update: [returnedAt]
+        set: { status: returned }
+        when: { status: active }
+        requires:
+          Tool:
+            key: { libraryId: libraryId, toolId: toolId }
+            when: { status: onLoan }
+            set: { status: available }
+      Extend: { update: [dueAt], when: { status: active } }
+      AddNote: { patch: [notes] }
+    estimate: { items: 2000000 }
+
+  Hold:
+    doc: "A tool reserved for a member to collect, with a pickup code. While it is live, only that member can borrow the tool; borrowing collects it. Lapses after two days."
+    fields:
+      libraryId: { type: string, example: lib_1 }
+      toolId: { type: string, example: t_42 }
+      memberId: { type: string, required: true }
+      codeHash:
+        type: string
+        size: 64
+        required: true
+        doc: "HMAC-SHA256 of the pickup code under a server-side secret, hex-encoded. Neither the code nor a plain hash of it is stored: keys end up in backups and logs, and a short code's plain hash is reversed by trying every code."
+      createdAt: time
+      expiresAt: { type: time, required: true, doc: "When the hold lapses. Required: a hold without one would reserve the tool forever." }
+    key:
+      pk: "LIB#{libraryId}#TOOL#{toolId}"
+      sk: "HOLD"
+    ttl: expiresAt
+    indexes:
+      ByCode:
+        doc: "Finds a hold from its code. A GSI, not a claim: the hold expires by TTL and its index entry goes with it, whereas a claim would be left behind."
+        pk: "HOLDCODE#{codeHash}"
+        project: [memberId, expiresAt]
+    access:
+      Get: get
+      FindByCode: { query: ByCode, page: 1, max_page: 1 }
+    writes:
+      Place:
+        create: true
+        requires:
+          Tool: { key: { libraryId: libraryId, toolId: toolId }, when: { status: available } }
+          Member: { key: { libraryId: libraryId, memberId: memberId }, when: { status: active } }
+      Release: delete
+    estimate: { items: 3000 }

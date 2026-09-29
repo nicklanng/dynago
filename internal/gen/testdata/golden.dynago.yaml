@@ -1,0 +1,61 @@
+# Golden input for the docs and infra generators: a small schema using shapes the example doesn't.
+dynago: 1
+package: golden
+table:
+  name: 2shop
+  doc: A table whose name starts with a digit.
+entities:
+  Order:
+    doc: An order in a shop.
+    fields:
+      shopId: string
+      orderId: string
+      customerId: string
+      status: { type: enum, values: [open, closed] }
+      total: int
+      placedAt: time
+    key: { pk: "SHOP#{shopId}", sk: "ORDER#{orderId}" }
+    indexes:
+      ByDay:
+        pk: "SHOP#{shopId}#DAY"
+        sk: "ORDER#{placedAt}#{orderId}"
+        project: [status, total]
+      Recent:
+        strategy: copy
+        pk: "CUST#{customerId}#RECENT"
+        sk: "ORDER#{placedAt}#{shopId}#{orderId}"
+        project: all
+    counters:
+      CustomerOrders:
+        pk: "CUST#{customerId}"
+        sk: "ORDERS"
+        values:
+          open: { count: true, where: { status: open } }
+          spent: { sum: total }
+    access:
+      Get: get
+      Day: { query: ByDay, range: placedAt }
+      Recent: { query: Recent, order: desc }
+    writes:
+      Place: { create: true, set: { status: open } }
+      Close: { set: { status: closed }, when: { status: open } }
+  Cart:
+    doc: A basket that lapses.
+    fields:
+      shopId: string
+      cartId: string
+      placedAt: time
+      expiresAt: { type: time, required: true }
+    key: { pk: "SHOP#{shopId}", sk: "CART#{cartId}" }
+    ttl: expiresAt
+    indexes:
+      ByDay:
+        pk: "SHOP#{shopId}#DAY"
+        sk: "CART#{placedAt}#{cartId}"
+        project: keys
+    writes:
+      Open: create
+      Checkout:
+        delete: true
+        requires:
+          Order: { key: { shopId: shopId, orderId: cartId }, optional: true, when: { status: open } }

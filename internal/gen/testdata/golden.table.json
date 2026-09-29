@@ -1,0 +1,61 @@
+{
+  "AttributeDefinitions": [
+    {
+      "AttributeName": "PK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "SK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "ByDayPK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "ByDaySK",
+      "AttributeType": "S"
+    }
+  ],
+  "BillingMode": "PAY_PER_REQUEST",
+  "GlobalSecondaryIndexes": [
+    {
+      "IndexName": "ByDay",
+      "KeySchema": [
+        {
+          "AttributeName": "ByDayPK",
+          "KeyType": "HASH"
+        },
+        {
+          "AttributeName": "ByDaySK",
+          "KeyType": "RANGE"
+        }
+      ],
+      "Projection": {
+        "NonKeyAttributes": [
+          "_t",
+          "_v",
+          "shopId",
+          "orderId",
+          "status",
+          "total",
+          "placedAt",
+          "cartId",
+          "ttl"
+        ],
+        "ProjectionType": "INCLUDE"
+      }
+    }
+  ],
+  "KeySchema": [
+    {
+      "AttributeName": "PK",
+      "KeyType": "HASH"
+    },
+    {
+      "AttributeName": "SK",
+      "KeyType": "RANGE"
+    }
+  ],
+  "TableName": "2shop"
+}

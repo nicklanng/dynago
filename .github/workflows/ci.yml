@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # gofmt, go vet and golangci-lint, over hand-written and generated code.
+      - run: make lint
+      # Starts DynamoDB Local in Docker; DYNAGO_REQUIRE_DB makes a missing database a failure.
+      # Also fails if any committed generated file is out of date.
+      - run: make test

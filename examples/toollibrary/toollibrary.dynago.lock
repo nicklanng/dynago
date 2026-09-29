@@ -1,0 +1,475 @@
+{
+  "dynago": 1,
+  "entities": {
+    "Hold": {
+      "versions": [
+        {
+          "version": 1,
+          "fingerprint": "05e37472cd3872a4",
+          "shape": {
+            "fields": [
+              {
+                "name": "libraryId",
+                "attr": "libraryId",
+                "type": "string"
+              },
+              {
+                "name": "toolId",
+                "attr": "toolId",
+                "type": "string"
+              },
+              {
+                "name": "memberId",
+                "attr": "memberId",
+                "type": "string"
+              },
+              {
+                "name": "codeHash",
+                "attr": "codeHash",
+                "type": "string"
+              },
+              {
+                "name": "createdAt",
+                "attr": "createdAt",
+                "type": "time"
+              },
+              {
+                "name": "expiresAt",
+                "attr": "expiresAt",
+                "type": "time"
+              }
+            ],
+            "pk": "LIB#{libraryId}#TOOL#{toolId}",
+            "sk": "HOLD",
+            "ttl": "expiresAt",
+            "ttl_attribute": "ttl",
+            "indexes": [
+              {
+                "name": "ByCode",
+                "strategy": "gsi",
+                "pk": "HOLDCODE#{codeHash}",
+                "projection": "include",
+                "project": [
+                  "memberId",
+                  "expiresAt"
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "Library": {
+      "versions": [
+        {
+          "version": 1,
+          "fingerprint": "ca3837d612625a76",
+          "shape": {
+            "fields": [
+              {
+                "name": "libraryId",
+                "attr": "libraryId",
+                "type": "string"
+              },
+              {
+                "name": "name",
+                "attr": "name",
+                "type": "string"
+              },
+              {
+                "name": "slug",
+                "attr": "slug",
+                "type": "string"
+              },
+              {
+                "name": "openedAt",
+                "attr": "openedAt",
+                "type": "time"
+              }
+            ],
+            "pk": "LIB#{libraryId}",
+            "sk": "LIBRARY",
+            "uniques": [
+              {
+                "name": "Slug",
+                "fields": [
+                  "slug"
+                ],
+                "pk": "UNIQUE#Library.Slug#{slug}",
+                "sk": "UNIQUE"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "Loan": {
+      "versions": [
+        {
+          "version": 1,
+          "fingerprint": "a63d3dff9a242916",
+          "shape": {
+            "fields": [
+              {
+                "name": "libraryId",
+                "attr": "libraryId",
+                "type": "string"
+              },
+              {
+                "name": "toolId",
+                "attr": "toolId",
+                "type": "string"
+              },
+              {
+                "name": "loanId",
+                "attr": "loanId",
+                "type": "string"
+              },
+              {
+                "name": "memberId",
+                "attr": "memberId",
+                "type": "string"
+              },
+              {
+                "name": "toolName",
+                "attr": "toolName",
+                "type": "string"
+              },
+              {
+                "name": "status",
+                "attr": "status",
+                "type": "enum",
+                "values": [
+                  "active",
+                  "returned"
+                ]
+              },
+              {
+                "name": "borrowedAt",
+                "attr": "borrowedAt",
+                "type": "time"
+              },
+              {
+                "name": "dueAt",
+                "attr": "dueAt",
+                "type": "time"
+              },
+              {
+                "name": "returnedAt",
+                "attr": "returnedAt",
+                "type": "time"
+              },
+              {
+                "name": "notes",
+                "attr": "notes",
+                "type": "string"
+              }
+            ],
+            "pk": "LIB#{libraryId}#TOOL#{toolId}",
+            "sk": "LOAN#{loanId}",
+            "indexes": [
+              {
+                "name": "ByMember",
+                "strategy": "copy",
+                "pk": "LIB#{libraryId}#MEMBER#{memberId}",
+                "sk": "MYLOAN#{dueAt}#{toolId}#{loanId}",
+                "projection": "include",
+                "project": [
+                  "toolName",
+                  "dueAt"
+                ],
+                "where": [
+                  "status=active"
+                ]
+              },
+              {
+                "name": "Overdue",
+                "strategy": "gsi",
+                "pk": "LIB#{libraryId}#DUE",
+                "sk": "{dueAt}#{loanId}",
+                "projection": "include",
+                "project": [
+                  "memberId",
+                  "toolName"
+                ],
+                "where": [
+                  "status=active"
+                ]
+              }
+            ],
+            "counters": [
+              {
+                "name": "MemberLoans",
+                "pk": "LIB#{libraryId}#MEMBER#{memberId}",
+                "sk": "LOANS",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "active",
+                    "where": [
+                      "status=active"
+                    ]
+                  }
+                ]
+              },
+              {
+                "name": "LoanTotals",
+                "pk": "LIB#{libraryId}#LOANTOTALS",
+                "sk": "TOTALS",
+                "shards": 4,
+                "values": [
+                  {
+                    "name": "started"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "Member": {
+      "versions": [
+        {
+          "version": 1,
+          "fingerprint": "1de4c215aad80d00",
+          "shape": {
+            "fields": [
+              {
+                "name": "libraryId",
+                "attr": "libraryId",
+                "type": "string"
+              },
+              {
+                "name": "memberId",
+                "attr": "memberId",
+                "type": "string"
+              },
+              {
+                "name": "email",
+                "attr": "email",
+                "type": "string"
+              },
+              {
+                "name": "name",
+                "attr": "name",
+                "type": "string"
+              },
+              {
+                "name": "phone",
+                "attr": "phone",
+                "type": "string"
+              },
+              {
+                "name": "role",
+                "attr": "role",
+                "type": "enum",
+                "values": [
+                  "member",
+                  "steward"
+                ]
+              },
+              {
+                "name": "status",
+                "attr": "status",
+                "type": "enum",
+                "values": [
+                  "active",
+                  "suspended"
+                ]
+              },
+              {
+                "name": "maxLoans",
+                "attr": "maxLoans",
+                "type": "int"
+              },
+              {
+                "name": "joinedAt",
+                "attr": "joinedAt",
+                "type": "time"
+              }
+            ],
+            "pk": "LIB#{libraryId}",
+            "sk": "MEMBER#{memberId}",
+            "indexes": [
+              {
+                "name": "ByName",
+                "strategy": "gsi",
+                "pk": "LIB#{libraryId}#MEMBERS",
+                "sk": "{name|lower}#{memberId}",
+                "projection": "include",
+                "project": [
+                  "role",
+                  "status"
+                ]
+              }
+            ],
+            "uniques": [
+              {
+                "name": "Email",
+                "fields": [
+                  "libraryId",
+                  "email"
+                ],
+                "pk": "UNIQUE#Member.Email#{libraryId}#{email|lower}",
+                "sk": "UNIQUE"
+              }
+            ],
+            "counters": [
+              {
+                "name": "MemberCounts",
+                "pk": "LIB#{libraryId}",
+                "sk": "COUNTS#MEMBERS",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "active",
+                    "where": [
+                      "status=active"
+                    ]
+                  },
+                  {
+                    "name": "suspended",
+                    "where": [
+                      "status=suspended"
+                    ]
+                  },
+                  {
+                    "name": "stewards",
+                    "where": [
+                      "role=steward",
+                      "status=active"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "Tool": {
+      "versions": [
+        {
+          "version": 1,
+          "fingerprint": "4f392fef7983e6a7",
+          "shape": {
+            "fields": [
+              {
+                "name": "libraryId",
+                "attr": "libraryId",
+                "type": "string"
+              },
+              {
+                "name": "toolId",
+                "attr": "toolId",
+                "type": "string"
+              },
+              {
+                "name": "name",
+                "attr": "name",
+                "type": "string"
+              },
+              {
+                "name": "category",
+                "attr": "category",
+                "type": "enum",
+                "values": [
+                  "power",
+                  "garden",
+                  "hand",
+                  "kitchen",
+                  "camping"
+                ]
+              },
+              {
+                "name": "status",
+                "attr": "status",
+                "type": "enum",
+                "values": [
+                  "available",
+                  "onLoan",
+                  "retired"
+                ]
+              },
+              {
+                "name": "manual",
+                "attr": "manual",
+                "type": "string"
+              },
+              {
+                "name": "tags",
+                "attr": "tags",
+                "type": "string_set"
+              },
+              {
+                "name": "serialNumber",
+                "attr": "serialNumber",
+                "type": "string"
+              },
+              {
+                "name": "addedAt",
+                "attr": "addedAt",
+                "type": "time"
+              }
+            ],
+            "pk": "LIB#{libraryId}#TOOL#{toolId}",
+            "sk": "TOOL",
+            "indexes": [
+              {
+                "name": "ByCategory",
+                "strategy": "gsi",
+                "pk": "LIB#{libraryId}#CAT#{category}",
+                "sk": "{name|lower}#{toolId}",
+                "projection": "include",
+                "project": [
+                  "status",
+                  "tags"
+                ]
+              }
+            ],
+            "uniques": [
+              {
+                "name": "Serial",
+                "fields": [
+                  "libraryId",
+                  "serialNumber"
+                ],
+                "pk": "UNIQUE#Tool.Serial#{libraryId}#{serialNumber}",
+                "sk": "UNIQUE"
+              }
+            ],
+            "counters": [
+              {
+                "name": "ToolCounts",
+                "pk": "LIB#{libraryId}",
+                "sk": "COUNTS#TOOLS",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "available",
+                    "where": [
+                      "status=available"
+                    ]
+                  },
+                  {
+                    "name": "onLoan",
+                    "where": [
+                      "status=onLoan"
+                    ]
+                  },
+                  {
+                    "name": "retired",
+                    "where": [
+                      "status=retired"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

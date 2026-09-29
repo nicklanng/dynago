@@ -1,0 +1,27 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - gocritic
+    - govet
+    - ineffassign
+    - revive
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # The CLI prints to stdout and stderr; a failed write there has nowhere to be reported.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+  exclusions:
+    # Lint generated code too: people read it, and it should be as clean as hand-written code.
+    generated: disable
+
+formatters:
+  enable:
+    - gofmt
+  exclusions:
+    generated: disable
