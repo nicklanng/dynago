@@ -296,3 +296,16 @@ func dedupe(keys []Key) []Key {
 	}
 	return out
 }
+
+// Unbounded returns derived items without their limits and lower bounds. The migration job uses
+// it: it copies what the old table holds, whose writes already enforced its rules, so a count
+// briefly out of range while items are copied in any order is not an error.
+func Unbounded(ds []Derived) []Derived {
+	out := make([]Derived, len(ds))
+	for i, d := range ds {
+		d.Limit, d.LimitErr, d.LimitRequired = Limit{}, nil, false
+		d.Min, d.MinErr = Limit{}, nil
+		out[i] = d
+	}
+	return out
+}

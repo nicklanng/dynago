@@ -54,7 +54,7 @@ func (g *gen) migration() {
 	g.p("st := New(db, TableName(base))")
 	g.p("return &dynago.Migration{DB: db, From: base + \"-g%d\", To: TableName(base),", prev.Generation)
 	g.p("Types: map[string]bool{%s},", strings.Join(types, ", "))
-	g.p("Copy: st.migrateCopy, Remove: st.migrateRemove, Check: migrationCheck}")
+	g.p("Copy: st.migrateCopy, KeyOf: st.migrateKeyOf, Remove: st.migrateRemove, Check: migrationCheck, TTLAttr: %q}", m.Table.TTLAttr)
 	g.p("}")
 	g.p("")
 	for _, e := range m.Entities {
@@ -213,72 +213,113 @@ func (g *gen) migrationCheck() {
 
 func (g *gen) migrationDispatch() {
 	prev := g.m.Previous
-	g.p("// migrateCopy converts one item of the previous generation and writes it into this one.")
-	g.p("func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item) error {")
-	g.p("src, srcRev, err := dynago.SourceOf(raw)")
-	g.p("if err != nil {")
-	g.p("return err")
-	g.p("}")
-	if g.m.Table.TTLAttr != "" {
-		g.p("if dynago.ExpiredItem(raw, %q) {", g.m.Table.TTLAttr)
-		g.p("return dynago.ErrUnchanged // expired: gone, even if DynamoDB hasn't deleted it yet")
-		g.p("}")
-	}
-	g.p("switch dynago.ItemType(raw) {")
+	ttl := g.m.Table.TTLAttr
+	var carried []*schema.Entity
 	for _, e := range g.m.Entities {
-		if _, ok := prev.Entities[e.Name]; !ok {
-			continue
+		if _, ok := prev.Entities[e.Name]; ok {
+			carried = append(carried, e)
 		}
-		g.p("case %q:", e.Name)
+	}
+	for _, e := range carried {
+		g.p("// convert%s converts a %s stored by generation %d into this generation's.", e.GoName, e.Name, prev.Generation)
+		g.p("func convert%s(raw dynamo.Item) (%s, error) {", e.GoName, e.GoName)
 		g.p("var old %sG%d", e.GoName, prev.Generation)
 		g.p("if err := dynamo.UnmarshalItem(raw, &old); err != nil {")
+		g.p("return %s{}, err", e.GoName)
+		g.p("}")
+		g.p("if Migrate%s == nil {", e.GoName)
+		g.p("return AutoMigrate%s(old), nil", e.GoName)
+		g.p("}")
+		g.p("e, err := Migrate%s(old)", e.GoName)
+		g.p("if err != nil {")
+		g.p("return %s{}, fmt.Errorf(\"%%w: %%w\", dynago.ErrMigrationConflict, err)", e.GoName)
+		g.p("}")
+		g.p("return e, nil")
+		g.p("}")
+		g.p("")
+	}
+	g.p("// migrateCopy converts one item of the previous generation and writes it into this one.")
+	g.p("func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {")
+	g.p("if dynago.ExpiredItem(raw, %q) {", ttl)
+	g.p("return dynago.ErrUnchanged // expired: gone, even if DynamoDB hasn't deleted it yet")
+	g.p("}")
+	g.dispatch(carried, func(e *schema.Entity) {
+		g.p("e, err := convert%s(raw)", e.GoName)
+		g.p("if err != nil {")
 		g.p("return err")
 		g.p("}")
-		g.p("e := AutoMigrate%s(old)", e.GoName)
-		g.p("if Migrate%s != nil {", e.GoName)
-		g.p("if e, err = Migrate%s(old); err != nil {", e.GoName)
-		g.p("return fmt.Errorf(\"%%w: %%w\", dynago.ErrMigrationConflict, err)")
+		g.p("src, srcRev, err := dynago.SourceOf(raw)")
+		g.p("if err != nil {")
+		g.p("return err")
 		g.p("}")
-		g.p("}")
-		g.p("return s.%s.migrate(ctx, &e, src, srcRev)", schema.Plural(e.GoName))
-	}
-	g.p("}")
-	g.p("return nil")
+		g.p("return s.%s.migrate(ctx, &e, src, srcRev, fence)", schema.Plural(e.GoName))
+	})
+	g.p("return dynago.ErrUnchanged")
 	g.p("}")
 	g.p("")
-	g.p("// migrateRemove deletes an entity copied from an item the previous generation no longer has.")
-	g.p("func (s *Store) migrateRemove(ctx context.Context, raw dynamo.Item) error {")
-	g.p("switch dynago.ItemType(raw) {")
-	for _, e := range g.m.Entities {
-		g.p("case %q:", e.Name)
-		g.p("return s.%s.migrateRemove(ctx, raw)", schema.Plural(e.GoName))
-	}
+	g.p("// migrateKeyOf returns the key an item of the previous generation converts to, or false if it")
+	g.p("// isn't copied.")
+	g.p("func (s *Store) migrateKeyOf(raw dynamo.Item) (dynago.Key, bool, error) {")
+	g.p("if dynago.ExpiredItem(raw, %q) {", ttl)
+	g.p("return dynago.Key{}, false, nil")
 	g.p("}")
+	g.dispatch(carried, func(e *schema.Entity) {
+		g.p("e, err := convert%s(raw)", e.GoName)
+		g.p("if err != nil {")
+		g.p("return dynago.Key{}, false, err")
+		g.p("}")
+		g.p("key, err := e.Key().dynamoKey()")
+		g.p("return key, err == nil, err")
+	})
+	g.p("return dynago.Key{}, false, nil")
+	g.p("}")
+	g.p("")
+	g.p("// migrateRemove deletes an entity the migration copied, because its source is gone or now")
+	g.p("// converts to another key.")
+	g.p("func (s *Store) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {")
+	g.dispatch(g.m.Entities, func(e *schema.Entity) {
+		g.p("return s.%s.migrateRemove(ctx, raw, fence)", schema.Plural(e.GoName))
+	})
 	g.p("return nil")
 	g.p("}")
 	g.p("")
 }
 
+// dispatch emits a branch per entity on the stored item's type: a switch, or an if for one.
+func (g *gen) dispatch(es []*schema.Entity, body func(e *schema.Entity)) {
+	switch len(es) {
+	case 0:
+	case 1:
+		g.p("if dynago.ItemType(raw) == %q {", es[0].Name)
+		body(es[0])
+		g.p("}")
+	default:
+		g.p("switch dynago.ItemType(raw) {")
+		for _, e := range es {
+			g.p("case %q:", e.Name)
+			body(e)
+		}
+		g.p("}")
+	}
+}
+
 // migrateEntity emits the writes the migration job makes for one entity: a copy that replaces
-// whatever the new table holds, and a removal, both maintaining derived items.
+// whatever the new table holds, and a removal, both maintaining derived items and carrying the
+// job's fence (a check that it still holds its lease).
 func (g *gen) migrateEntity(e *schema.Entity) {
 	lo := lowerFirst(e.GoName)
 	limits := ""
 	if hasLimitArgs(e) {
-		var fs []string
-		for _, c := range e.Counters {
-			for _, v := range c.Values {
-				if v.LimitArg {
-					fs = append(fs, fmt.Sprintf("%s%s: dynago.Unlimited()", c.GoName, v.GoName))
-				}
-			}
-		}
-		// Copying the old table counts what is there: caller limits don't apply to history.
-		limits = fmt.Sprintf(", %sLimits{%s}", lo, strings.Join(fs, ", "))
+		limits = fmt.Sprintf(", %sLimits{}", lo)
+	}
+	// Copying counts what the old table holds, whose writes already enforced its rules: limits
+	// and lower bounds are left out (dynago.Unbounded), so copying in any order can't trip them.
+	derived := func(recv string) string {
+		return fmt.Sprintf("dynago.Unbounded(%sDerived(%s, key%s))", lo, recv, limits)
 	}
 	g.p("// migrate writes e, converted from the item at src in the previous generation (revision")
 	g.p("// srcRev), replacing what the new table holds for it, with its derived items.")
-	g.p("func (s *%sStore) migrate(ctx context.Context, e *%s, src dynago.Key, srcRev int64) error {", e.GoName, e.GoName)
+	g.p("func (s *%sStore) migrate(ctx context.Context, e *%s, src dynago.Key, srcRev int64, fence dynago.Op) error {", e.GoName, e.GoName)
 	g.p("key, err := e.Key().dynamoKey()")
 	g.p("if err != nil {")
 	g.p("return err")
@@ -308,7 +349,7 @@ func (g *gen) migrateEntity(e *schema.Entity) {
 	g.p("return err")
 	g.p("}")
 	if e.HasDerived() {
-		g.p("before = %sDerived(&it.%s, key%s)", lo, e.GoName, limits)
+		g.p("before = %s", derived("&it."+e.GoName))
 	}
 	g.p("rev = it.Rev + 1")
 	g.p("}")
@@ -320,9 +361,9 @@ func (g *gen) migrateEntity(e *schema.Entity) {
 	g.p("if found {")
 	g.p("put = s.t.Put(item).If(\"$ = ?\", \"_rev\", rev-1)")
 	g.p("}")
-	g.p("ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}")
+	g.p("ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale), fence}")
 	if e.HasDerived() {
-		g.p("derived, err := dynago.Diff(s.t, key, before, %sDerived(e, key%s))", lo, limits)
+		g.p("derived, err := dynago.Diff(s.t, key, before, %s)", derived("e"))
 		g.p("if err != nil {")
 		g.p("return err")
 		g.p("}")
@@ -334,23 +375,29 @@ func (g *gen) migrateEntity(e *schema.Entity) {
 	g.p("})")
 	g.p("}")
 	g.p("")
-	g.p("// migrateRemove deletes an entity the migration copied, with its derived items, because its")
-	g.p("// source is gone.")
-	g.p("func (s *%sStore) migrateRemove(ctx context.Context, raw dynamo.Item) error {", e.GoName)
-	g.p("it, err := %sDecode(raw)", lo)
+	g.p("// migrateRemove deletes an entity the migration copied, with its derived items.")
+	g.p("func (s *%sStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {", e.GoName)
+	g.p("return dynago.Retry(ctx, func() error {")
+	g.p("var current dynamo.Item")
+	g.p("found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)")
+	g.p("if err != nil || !found {")
+	g.p("return err")
+	g.p("}")
+	g.p("it, err := %sDecode(current)", lo)
 	g.p("if err != nil {")
 	g.p("return err")
 	g.p("}")
 	g.p("key := dynago.Key{PK: it.PK, SK: it.SK}")
-	g.p("ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete(\"PK\", key.PK).Range(\"SK\", key.SK).If(\"$ = ?\", \"_rev\", it.Rev), dynago.ErrStale)}")
+	g.p("ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete(\"PK\", key.PK).Range(\"SK\", key.SK).If(\"$ = ?\", \"_rev\", it.Rev), dynago.ErrStale), fence}")
 	if e.HasDerived() {
-		g.p("derived, err := dynago.Diff(s.t, key, %sDerived(&it.%s, key%s), nil)", lo, e.GoName, limits)
+		g.p("derived, err := dynago.Diff(s.t, key, %s, nil)", derived("&it."+e.GoName))
 		g.p("if err != nil {")
 		g.p("return err")
 		g.p("}")
 		g.p("ops = append(ops, derived...)")
 	}
 	g.p("return dynago.Run(ctx, s.db, ops)")
+	g.p("})")
 	g.p("}")
 	g.p("")
 }

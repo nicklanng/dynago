@@ -144,6 +144,11 @@ func TestMigrationCopiesAndCatchesUp(t *testing.T) {
 		t.Fatalf("member counts after catching up: %+v", c)
 	}
 
+	// Carol leaves and Dave joins with her email. Whichever order the last pass reaches them in,
+	// Dave's copy must not conflict with Carol's: conflicts are retried after removals.
+	must(t, old.Members.Leave(ctx, toollibrary.MemberKey{LibraryID: "lib1", MemberID: "carol"}))
+	must(t, old.Members.Join(ctx, &toollibrary.Member{LibraryID: "lib1", MemberID: "dave", Email: "carol@example.org", Status: toollibrary.MemberStatusActive}))
+
 	// Writes stop; finish makes the last pass. Every new pod can run it: one does the work.
 	var wg sync.WaitGroup
 	errs := make([]error, 3)
@@ -163,8 +168,11 @@ func TestMigrationCopiesAndCatchesUp(t *testing.T) {
 	if !strings.Contains(g.out.String(), "is finished") {
 		t.Fatalf("copy after finish: %s", g.out.String())
 	}
+	if m, err := nu.Members.GetByEmail(ctx, "lib1", "carol@example.org"); err != nil || m.MemberID != "dave" {
+		t.Fatalf("reused email after finish: %+v %v", m, err)
+	}
 	// The new generation serves.
-	must(t, nu.Loans.Borrow(ctx, &toollibrary.Loan{LibraryID: "lib1", ToolID: "t4", LoanID: "l2", MemberID: "carol", BorrowedAt: time.Now(),
+	must(t, nu.Loans.Borrow(ctx, &toollibrary.Loan{LibraryID: "lib1", ToolID: "t4", LoanID: "l2", MemberID: "dave", BorrowedAt: time.Now(),
 		DueAt: time.Now().Add(time.Hour)}, toollibrary.LoanBorrowLimits{MemberLoansActive: dynago.Max(1)}))
 
 	// The command line, as the generated job runs it.

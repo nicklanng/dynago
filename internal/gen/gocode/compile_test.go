@@ -70,9 +70,14 @@ func TestAwkwardSchemasCompileOrAreRefused(t *testing.T) {
 		}
 	})
 	var dirs []string
-	check := func(name, src, refused string) {
+	check := func(name, src, refused string, adjust ...func(*schema.Model)) {
 		t.Helper()
 		m, err := schema.Parse([]byte(src))
+		if err == nil {
+			for _, f := range adjust {
+				f(m)
+			}
+		}
 		switch {
 		case refused != "" && (err == nil || !strings.Contains(err.Error(), refused)):
 			t.Errorf("%s: want an error containing %q, got %v", name, refused, err)
@@ -112,6 +117,11 @@ func TestAwkwardSchemasCompileOrAreRefused(t *testing.T) {
 		src := fill("ent"+pkg(i), "", "")
 		check(c.name, src+c.extra, c.refused)
 	}
+	// A new generation in which no entity carries over from the previous one (all renamed).
+	check("nothing carries over", fill("migratenone", "", ""), "", func(m *schema.Model) {
+		m.Table.Generation = 2
+		m.Previous = &schema.Previous{Generation: 1, Entities: map[string][]schema.PreviousField{}}
+	})
 	if len(dirs) == 0 {
 		return
 	}

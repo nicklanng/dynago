@@ -1,0 +1,85 @@
+{
+  "dynago": 1,
+  "generation": 2,
+  "tables": [
+    {
+      "generation": 1,
+      "spec": {}
+    },
+    {
+      "generation": 2,
+      "spec": {}
+    }
+  ],
+  "entities": {
+    "Person": {
+      "versions": [
+        {
+          "version": 1,
+          "generation": 1,
+          "fingerprint": "db1fc729a192d9cf",
+          "shape": {
+            "fields": [
+              {
+                "name": "personId",
+                "attr": "personId",
+                "type": "string"
+              },
+              {
+                "name": "email",
+                "attr": "email",
+                "type": "string"
+              },
+              {
+                "name": "name",
+                "attr": "name",
+                "type": "string"
+              }
+            ],
+            "pk": "P#{personId}",
+            "sk": "PERSON"
+          }
+        },
+        {
+          "version": 2,
+          "generation": 2,
+          "fingerprint": "3842939d848333b2",
+          "shape": {
+            "fields": [
+              {
+                "name": "personId",
+                "attr": "personId",
+                "type": "string"
+              },
+              {
+                "name": "email",
+                "attr": "email",
+                "type": "string"
+              },
+              {
+                "name": "name",
+                "attr": "name",
+                "type": "string"
+              }
+            ],
+            "pk": "E#{email}",
+            "sk": "PERSON",
+            "counters": [
+              {
+                "name": "People",
+                "pk": "PEOPLE",
+                "sk": "COUNT",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "all"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

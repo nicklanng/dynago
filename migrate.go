@@ -23,17 +23,22 @@ import (
 // scanning, checkpoints, rate limit, lease and reporting.
 //
 // Its state lives in the new table, under a partition of its own, so a restarted job resumes and
-// a second job waits instead of racing the first.
+// a second job waits instead of racing the first. Every write the job makes, to entities or to its
+// own state, is fenced by the lease: a job that lost it (paused, partitioned, or too slow to renew)
+// can write nothing more.
 
 // ErrUnchanged is returned by a migration's Copy when the new table already holds the item at the
-// source's revision.
+// source's revision, or when the item isn't copied at all (it has expired).
 var ErrUnchanged = errors.New("dynago: already copied at this revision")
 
 // ErrMigrationConflict is wrapped by errors a migration reports as conflicts: items it can't copy
 // until a person fixes the data in the old table (two old items converting to one new key, a
-// value a conversion rejects). Claims taken, limits crossed, invalid keys and empty required
-// fields are conflicts too. Other errors stop the job.
+// value a conversion rejects). Claims taken, invalid keys and empty required fields are conflicts
+// too. Other errors stop the job.
 var ErrMigrationConflict = errors.New("dynago: item can't be copied")
+
+// ErrLeaseLost means another migration job took over: this one stops without writing more.
+var ErrLeaseLost = errors.New("dynago: another migration job holds the lease")
 
 // Migration copies one table generation into the next.
 type Migration struct {
@@ -44,18 +49,27 @@ type Migration struct {
 	// table's derived items are rebuilt from the entities.
 	Types map[string]bool
 	// Copy writes the entity converted from one item of the old table into the new one, with its
-	// derived items. It returns ErrUnchanged if the new table already has that revision.
-	Copy func(ctx context.Context, raw dynamo.Item) error
-	// Remove deletes an entity of the new table, with its derived items, because the item it was
-	// copied from no longer exists.
-	Remove func(ctx context.Context, raw dynamo.Item) error
+	// derived items and fence (an op the write must include in its transaction). It returns
+	// ErrUnchanged if the new table already has that revision, or the item isn't copied.
+	Copy func(ctx context.Context, raw dynamo.Item, fence Op) error
+	// KeyOf returns the key an item of the old table converts to in the new one, or ok false if
+	// it isn't copied (expired, or not an entity of this generation).
+	KeyOf func(raw dynamo.Item) (key Key, ok bool, err error)
+	// Remove deletes an entity of the new table, with its derived items and fence, because the
+	// item it was copied from is gone or now converts to another key.
+	Remove func(ctx context.Context, raw dynamo.Item, fence Op) error
 	// Check reports why the migration can't run at all (a conversion function not provided), or nil.
 	Check func() error
+	// TTLAttr is the TTL attribute: expired items of the old table are not copied.
+	TTLAttr string
 
 	Workers   int     // parallel scan segments; default 8
 	Rate      float64 // items per second across workers; 0 for no limit
 	MaxPasses int     // catch-up passes after the first, for copy; default 3
 	Out       io.Writer
+	// LeaseFor is how long a job holds the lease without renewing it; default 2 minutes. The
+	// lease is renewed every third of it.
+	LeaseFor time.Duration
 }
 
 // Attributes the migration adds to the items it copies, recording where each came from.
@@ -82,18 +96,31 @@ func MigrationItem(item any, src Key, srcRev int64) (dynamo.Item, error) {
 // srcRev; other reports whether it was copied from a different source item (two old items
 // converting to one new key).
 func MigratedFrom(raw dynamo.Item, src Key, srcRev int64) (same, other bool) {
+	m, ok := migratedFrom(raw)
+	if !ok {
+		return false, false
+	}
+	if m.src != src {
+		return false, true
+	}
+	return m.rev == srcRev, false
+}
+
+type migSource struct {
+	src Key
+	rev int64
+}
+
+func migratedFrom(raw dynamo.Item) (migSource, bool) {
 	var m struct {
 		PK  string `dynamo:"_msrcPK"`
 		SK  string `dynamo:"_msrcSK"`
 		Rev int64  `dynamo:"_mrev"`
 	}
 	if dynamo.UnmarshalItem(raw, &m) != nil || m.PK == "" {
-		return false, false
+		return migSource{}, false
 	}
-	if (Key{m.PK, m.SK}) != src {
-		return false, true
-	}
-	return m.Rev == srcRev, false
+	return migSource{Key{m.PK, m.SK}, m.Rev}, true
 }
 
 // SourceOf returns the key and revision of an item of the old table.
@@ -105,6 +132,25 @@ func SourceOf(raw dynamo.Item) (Key, int64, error) {
 	}
 	err := dynamo.UnmarshalItem(raw, &s)
 	return Key{s.PK, s.SK}, s.Rev, err
+}
+
+// ItemType returns the entity or derived-item type (_t) of a stored item.
+func ItemType(raw dynamo.Item) string {
+	if s, ok := raw[AttrType].(*types.AttributeValueMemberS); ok {
+		return s.Value
+	}
+	return ""
+}
+
+// ExpiredItem reports whether a stored item's TTL attribute has passed.
+func ExpiredItem(raw dynamo.Item, ttlAttr string) bool {
+	if n, ok := raw[ttlAttr].(*types.AttributeValueMemberN); ok && ttlAttr != "" {
+		var ttl int64
+		if _, err := fmt.Sscan(n.Value, &ttl); err == nil {
+			return Expired(ttl, Now())
+		}
+	}
+	return false
 }
 
 // migState is the migration's record in the new table.
@@ -140,8 +186,6 @@ type migConflict struct {
 	Problem string `dynamo:"problem"`
 }
 
-const leaseFor = 2 * time.Minute
-
 // Run runs a migration command: "copy" (bulk copy and catch-up passes, while the old generation
 // serves), "finish" (a final pass, with writes to the old generation stopped) or "status".
 func (m *Migration) Run(ctx context.Context, command string) error {
@@ -153,6 +197,9 @@ func (m *Migration) Run(ctx context.Context, command string) error {
 	}
 	if m.MaxPasses <= 0 {
 		m.MaxPasses = 3
+	}
+	if m.LeaseFor <= 0 {
+		m.LeaseFor = 2 * time.Minute
 	}
 	if m.Check != nil {
 		if err := m.Check(); err != nil {
@@ -174,30 +221,52 @@ func (m *Migration) Run(ctx context.Context, command string) error {
 		m.logf("the migration from %s to %s is finished", m.From, m.To)
 		return nil
 	}
-	defer m.release(context.WithoutCancel(ctx), owner)
-	st, err := m.state(ctx)
+	j := &job{Migration: m, owner: owner}
+	// Renew the lease on a timer; if that fails, stop everything this job is doing.
+	jctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	go j.keepLease(jctx, cancel)
+	defer j.release(context.WithoutCancel(ctx))
+	err = j.run(jctx, command)
+	if cause := context.Cause(jctx); errors.Is(cause, ErrLeaseLost) {
+		return cause
+	}
+	return err
+}
+
+// job is one run of a migration command, holding the lease.
+type job struct {
+	*Migration
+	owner string
+
+	mu sync.Mutex
+	// conflicts is the conflict records known to exist, so clearing one costs a write only when
+	// there is something to clear.
+	conflicts map[Key]bool
+}
+
+func (j *job) run(ctx context.Context, command string) error {
+	st, err := j.state(ctx)
 	if err != nil {
 		return err
 	}
 	if st.Phase == "finished" {
-		m.logf("the migration from %s to %s is finished", m.From, m.To)
+		j.logf("the migration from %s to %s is finished", j.From, j.To)
 		return nil
 	}
 	if command == "copy" {
-		if err := m.copyPasses(ctx, owner, st); err != nil {
+		if err := j.copyPasses(ctx, st); err != nil {
 			return err
 		}
-	} else {
-		if err := m.finishPass(ctx, owner, st); err != nil {
-			return err
-		}
+	} else if err := j.finishPass(ctx, st); err != nil {
+		return err
 	}
-	return m.report(ctx, command)
+	return j.report(ctx, command)
 }
 
 // copyPasses runs (or resumes) the bulk pass, then catch-up passes until one changes nothing or
 // MaxPasses is reached.
-func (m *Migration) copyPasses(ctx context.Context, owner string, st migState) error {
+func (j *job) copyPasses(ctx context.Context, st migState) error {
 	if st.Finishing && !st.PassDone {
 		return fmt.Errorf("dynago migrate: a finish pass is in progress; run finish to complete it")
 	}
@@ -206,73 +275,63 @@ func (m *Migration) copyPasses(ctx context.Context, owner string, st migState) e
 		pass = st.Pass // resume the interrupted pass
 	}
 	for runs := 1; ; runs, pass = runs+1, pass+1 {
-		changed, err := m.pass(ctx, owner, pass, false)
+		changed, err := j.pass(ctx, pass, false)
 		if err != nil {
 			return err
 		}
-		if changed == 0 || runs > m.MaxPasses {
-			m.logf("pass %d changed %d items; ready for finish", pass, changed)
-			return m.setPhase(ctx, "copied")
+		if changed == 0 || runs > j.MaxPasses {
+			j.logf("pass %d changed %d items; ready for finish", pass, changed)
+			return j.setState(ctx, "phase", "copied")
 		}
-		m.logf("pass %d changed %d items; catching up", pass, changed)
+		j.logf("pass %d changed %d items; catching up", pass, changed)
 	}
 }
 
 // finishPass runs one full pass that started after writes stopped (resuming it if it was
 // interrupted), then marks the migration finished.
-func (m *Migration) finishPass(ctx context.Context, owner string, st migState) error {
+func (j *job) finishPass(ctx context.Context, st migState) error {
 	pass := st.Pass + 1
 	if st.Finishing && !st.PassDone {
 		pass = st.Pass // resume the interrupted final pass
 	}
-	if _, err := m.pass(ctx, owner, pass, true); err != nil {
+	if _, err := j.pass(ctx, pass, true); err != nil {
 		return err
 	}
-	conflicts, err := m.liveConflicts(ctx)
+	conflicts, err := j.liveConflicts(ctx)
 	if err != nil {
 		return err
 	}
 	if len(conflicts) > 0 {
 		return nil // report returns the error
 	}
-	if err := m.setPhase(ctx, "finished"); err != nil {
+	if err := j.setState(ctx, "phase", "finished"); err != nil {
 		return err
 	}
-	return m.tidy(ctx)
+	return j.tidy(ctx)
 }
 
-// tidy deletes the finished migration's checkpoints, leaving its state record.
-func (m *Migration) tidy(ctx context.Context) error {
-	var segs []migSegment
-	err := m.DB.Table(m.To).Get(AttrPK, m.statePK()).Range(AttrSK, dynamo.BeginsWith, "PASS#").Consistent(true).All(ctx, &segs)
-	if err != nil && !errors.Is(err, dynamo.ErrNotFound) {
-		return err
-	}
-	for _, s := range segs {
-		if err := m.DB.Table(m.To).Delete(AttrPK, s.PK).Range(AttrSK, s.SK).Run(ctx); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// pass copies every entity of the old table and removes copies whose source is gone. It returns
-// how many items it wrote or removed.
-func (m *Migration) pass(ctx context.Context, owner string, pass int, finishing bool) (int64, error) {
-	if err := m.startPass(ctx, pass, finishing); err != nil {
+// pass copies every entity of the old table, removes copies whose source is gone or now converts
+// to another key, then retries the items that conflicted. It returns how many items it wrote or
+// removed.
+func (j *job) pass(ctx context.Context, pass int, finishing bool) (int64, error) {
+	err := j.stateUpdate().Set("pass", pass).Set("passDone", false).Set("finishing", finishing).If("$ = ?", "leaseOwner", j.owner).Run(ctx)
+	if err := leaseErr(err); err != nil {
 		return 0, err
 	}
-	limit := newLimiter(m.Rate)
+	if err := j.loadConflicts(ctx); err != nil {
+		return 0, err
+	}
+	limit := newLimiter(j.Rate)
 	var changed int64
 	var mu sync.Mutex
 	for _, phase := range []string{"copy", "remove"} {
 		var wg sync.WaitGroup
-		errs := make([]error, m.Workers)
-		for seg := 0; seg < m.Workers; seg++ {
+		errs := make([]error, j.Workers)
+		for seg := 0; seg < j.Workers; seg++ {
 			wg.Add(1)
 			go func(seg int) {
 				defer wg.Done()
-				n, err := m.segment(ctx, owner, pass, phase, seg, limit)
+				n, err := j.segment(ctx, pass, phase, seg, limit)
 				mu.Lock()
 				changed += n
 				mu.Unlock()
@@ -284,31 +343,35 @@ func (m *Migration) pass(ctx context.Context, owner string, pass int, finishing 
 			return changed, err
 		}
 	}
-	return changed, m.stateTable().Set("passDone", true).Run(ctx)
+	// A conflict can be an artefact of order: a member who joined with the email of one who left
+	// is copied before the leaver's copy is removed. Now that removals are done, try again.
+	retried, err := j.retryConflicts(ctx, limit)
+	if err != nil {
+		return changed, err
+	}
+	changed += retried
+	return changed, leaseErr(j.stateUpdate().Set("passDone", true).If("$ = ?", "leaseOwner", j.owner).Run(ctx))
 }
 
 // segment scans one segment of the old table (phase "copy") or the new one ("remove"), resuming
 // from its checkpoint.
-func (m *Migration) segment(ctx context.Context, owner string, pass int, phase string, seg int, limit *limiter) (int64, error) {
-	table := m.DB.Table(m.From)
+func (j *job) segment(ctx context.Context, pass int, phase string, seg int, limit *limiter) (int64, error) {
+	table := j.DB.Table(j.From)
 	if phase == "remove" {
-		table = m.DB.Table(m.To)
+		table = j.DB.Table(j.To)
 	}
 	sk := fmt.Sprintf("PASS#%06d#%s#%03d", pass, phase, seg)
 	var cp migSegment
-	found, err := GetOne(ctx, m.DB.Table(m.To), Key{m.statePK(), sk}, true, &cp)
+	found, err := GetOne(ctx, j.DB.Table(j.To), Key{j.statePK(), sk}, true, &cp)
 	if err != nil {
 		return 0, err
 	}
 	if found && cp.Done {
 		return cp.Copied + cp.Removed, nil
 	}
-	cp = migSegment{PK: m.statePK(), SK: sk, T: migType, Next: cp.Next, Copied: cp.Copied, Same: cp.Same, Removed: cp.Removed, Skipped: cp.Skipped}
+	cp = migSegment{PK: j.statePK(), SK: sk, T: migType, Next: cp.Next, Copied: cp.Copied, Same: cp.Same, Removed: cp.Removed, Skipped: cp.Skipped}
 	for {
-		if err := m.renew(ctx, owner); err != nil {
-			return 0, err
-		}
-		scan := table.Scan().Segment(seg, m.Workers).Consistent(true).SearchLimit(100)
+		scan := table.Scan().Segment(seg, j.Workers).Consistent(true).SearchLimit(100)
 		if len(cp.Next) > 0 {
 			scan = scan.StartFrom(pagingKey(cp.Next))
 		}
@@ -318,16 +381,18 @@ func (m *Migration) segment(ctx context.Context, owner string, pass int, phase s
 			return 0, err
 		}
 		if phase == "copy" {
-			err = m.copyItems(ctx, items, &cp, limit)
+			err = j.copyItems(ctx, items, &cp, limit)
 		} else {
-			err = m.removeItems(ctx, items, &cp, limit)
+			err = j.removeItems(ctx, items, &cp, limit)
 		}
 		if err != nil {
 			return 0, err
 		}
 		cp.Next = stringKey(next)
 		cp.Done = len(next) == 0
-		if err := m.DB.Table(m.To).Put(cp).Run(ctx); err != nil {
+		// The checkpoint is fenced too, so a job that lost the lease can't move it.
+		ops := []Op{PutOp(Key{cp.PK, cp.SK}, j.DB.Table(j.To).Put(cp), nil), j.fence()}
+		if err := leaseErr(Run(ctx, j.DB, ops)); err != nil {
 			return 0, err
 		}
 		if cp.Done {
@@ -336,104 +401,322 @@ func (m *Migration) segment(ctx context.Context, owner string, pass int, phase s
 	}
 }
 
-func (m *Migration) copyItems(ctx context.Context, items []dynamo.Item, cp *migSegment, limit *limiter) error {
+func (j *job) copyItems(ctx context.Context, items []dynamo.Item, cp *migSegment, limit *limiter) error {
 	for _, raw := range items {
-		if !m.Types[itemType(raw)] {
+		if !j.Types[ItemType(raw)] {
 			cp.Skipped++
 			continue
 		}
 		if err := limit.wait(ctx); err != nil {
 			return err
 		}
-		src, _, err := SourceOf(raw)
-		if err != nil {
-			return err
-		}
-		err = m.Copy(ctx, raw)
-		switch {
-		case errors.Is(err, ErrUnchanged):
-			cp.Same++
-		case errors.Is(err, ErrMigrationConflict), errors.Is(err, ErrTaken), errors.Is(err, ErrLimit),
-			errors.Is(err, ErrInvalidKey), errors.Is(err, ErrFieldRequired):
-			if err := m.recordConflict(ctx, src, err); err != nil {
-				return err
-			}
+		switch copied, err := j.copyOne(ctx, raw); {
 		case err != nil:
-			return fmt.Errorf("copying %s / %s: %w", src.PK, src.SK, err)
-		default:
+			return err
+		case copied:
 			cp.Copied++
-			if err := m.clearConflict(ctx, src); err != nil {
-				return err
-			}
+		default:
+			cp.Same++
 		}
 	}
 	return nil
 }
 
-// removeItems deletes the new table's copies of items the old table no longer has.
-func (m *Migration) removeItems(ctx context.Context, items []dynamo.Item, cp *migSegment, limit *limiter) error {
-	bySource := map[Key]dynamo.Item{}
-	var keys []dynamo.Keyed
-	for _, raw := range items {
-		var s struct {
-			PK string `dynamo:"_msrcPK"`
-			SK string `dynamo:"_msrcSK"`
+// copyOne copies an item of the old table, recording a conflict if it can't be copied. It reports
+// whether it wrote anything.
+func (j *job) copyOne(ctx context.Context, raw dynamo.Item) (bool, error) {
+	src, _, err := SourceOf(raw)
+	if err != nil {
+		return false, err
+	}
+	err = j.patient(ctx, func() error { return j.Copy(ctx, raw, j.fence()) })
+	switch {
+	case errors.Is(err, ErrLeaseLost):
+		return false, err
+	case errors.Is(err, ErrUnchanged):
+		return false, j.clearConflict(ctx, src)
+	case isConflict(err):
+		return false, j.recordConflict(ctx, src, err)
+	case err != nil:
+		return false, fmt.Errorf("copying %s / %s: %w", src.PK, src.SK, err)
+	}
+	return true, j.clearConflict(ctx, src)
+}
+
+func isConflict(err error) bool {
+	return errors.Is(err, ErrMigrationConflict) || errors.Is(err, ErrTaken) || errors.Is(err, ErrInvalidKey) ||
+		errors.Is(err, ErrFieldRequired) || errors.Is(err, ErrLimit)
+}
+
+// patient runs one item's write, retrying past the usual retry policy when other transactions
+// keep holding its items: many copies at once can queue on one busy counter item.
+func (j *job) patient(ctx context.Context, fn func() error) error {
+	for attempt := 0; ; attempt++ {
+		err := fn()
+		if !errors.Is(err, ErrConflict) || attempt == 5 {
+			return err
 		}
-		if dynamo.UnmarshalItem(raw, &s) != nil || s.PK == "" || itemType(raw) == migType {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond << attempt):
+		}
+	}
+}
+
+// removeItems deletes the new table's copies whose source is gone from the old table, or now
+// converts to another key (its key fields changed while the old generation served).
+func (j *job) removeItems(ctx context.Context, items []dynamo.Item, cp *migSegment, limit *limiter) error {
+	type copied struct {
+		raw dynamo.Item
+		key Key
+		src Key
+	}
+	var copies []copied
+	var keys []dynamo.Keyed
+	seen := map[Key]bool{}
+	for _, raw := range items {
+		ms, ok := migratedFrom(raw)
+		if !ok || ItemType(raw) == migType {
 			continue
 		}
-		k := Key{s.PK, s.SK}
-		bySource[k] = raw
-		keys = append(keys, dynamo.Keys{k.PK, k.SK})
+		own, _, err := SourceOf(raw) // its own key in the new table
+		if err != nil {
+			return err
+		}
+		copies = append(copies, copied{raw, own, ms.src})
+		if !seen[ms.src] {
+			seen[ms.src] = true
+			keys = append(keys, dynamo.Keys{ms.src.PK, ms.src.SK})
+		}
 	}
 	if len(keys) == 0 {
 		return nil
 	}
-	var present []struct {
-		PK string `dynamo:"PK"`
-		SK string `dynamo:"SK"`
-	}
-	err := m.DB.Table(m.From).Batch(AttrPK, AttrSK).Get(keys...).Project(AttrPK, AttrSK).Consistent(true).All(ctx, &present)
+	var sources []dynamo.Item
+	err := j.DB.Table(j.From).Batch(AttrPK, AttrSK).Get(keys...).Consistent(true).All(ctx, &sources)
 	if err != nil && !errors.Is(err, dynamo.ErrNotFound) {
 		return err
 	}
-	for _, p := range present {
-		delete(bySource, Key{p.PK, p.SK})
+	bySource := map[Key]dynamo.Item{}
+	for _, s := range sources {
+		k, _, err := SourceOf(s)
+		if err != nil {
+			return err
+		}
+		bySource[k] = s
 	}
-	for src, raw := range bySource {
+	for _, c := range copies {
+		if s, ok := bySource[c.src]; ok {
+			key, keep, err := j.KeyOf(s)
+			if err == nil && keep && key == c.key {
+				continue
+			}
+			// Otherwise the source expired, or converts elsewhere (or not at all, which the
+			// copy phase reports as a conflict): this copy is stale.
+		}
 		if err := limit.wait(ctx); err != nil {
 			return err
 		}
-		if err := m.Remove(ctx, raw); err != nil {
-			return fmt.Errorf("removing the copy of %s / %s: %w", src.PK, src.SK, err)
+		if err := j.patient(ctx, func() error { return j.Remove(ctx, c.raw, j.fence()) }); err != nil {
+			if errors.Is(err, ErrLeaseLost) {
+				return err
+			}
+			return fmt.Errorf("removing %s / %s, copied from %s / %s: %w", c.key.PK, c.key.SK, c.src.PK, c.src.SK, err)
 		}
 		cp.Removed++
-		if err := m.clearConflict(ctx, src); err != nil {
+	}
+	return nil
+}
+
+// retryConflicts tries the items with conflicts again. It returns how many it copied.
+func (j *job) retryConflicts(ctx context.Context, limit *limiter) (int64, error) {
+	j.mu.Lock()
+	var srcs []Key
+	for k := range j.conflicts {
+		srcs = append(srcs, k)
+	}
+	j.mu.Unlock()
+	var n int64
+	for _, src := range srcs {
+		var raw dynamo.Item
+		found, err := GetOne(ctx, j.DB.Table(j.From), src, true, &raw)
+		if err != nil {
+			return n, err
+		}
+		if !found {
+			if err := j.clearConflict(ctx, src); err != nil {
+				return n, err
+			}
+			continue
+		}
+		if err := limit.wait(ctx); err != nil {
+			return n, err
+		}
+		copied, err := j.copyOne(ctx, raw)
+		if err != nil {
+			return n, err
+		}
+		if copied {
+			n++
+		}
+	}
+	return n, nil
+}
+
+// fence is the op every write of the job includes: a check that this job still holds the lease.
+func (j *job) fence() Op {
+	k := Key{j.statePK(), "STATE"}
+	return CheckOp(k, j.DB.Table(j.To).Check(AttrPK, k.PK).Range(AttrSK, k.SK).If("$ = ?", "leaseOwner", j.owner), ErrLeaseLost)
+}
+
+// leaseErr turns the failure of a lease-conditioned write into ErrLeaseLost.
+func leaseErr(err error) error {
+	if dynamo.IsCondCheckFailed(err) {
+		return ErrLeaseLost
+	}
+	return err
+}
+
+func (j *job) keepLease(ctx context.Context, cancel context.CancelCauseFunc) {
+	tick := time.NewTicker(j.LeaseFor / 3)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			err := j.stateUpdate().Set("leaseUntil", time.Now().Add(j.LeaseFor).Unix()).If("$ = ?", "leaseOwner", j.owner).Run(ctx)
+			if errors.Is(leaseErr(err), ErrLeaseLost) {
+				cancel(ErrLeaseLost)
+				return
+			}
+		}
+	}
+}
+
+func (j *job) release(ctx context.Context) {
+	_ = j.DB.Table(j.To).Update(AttrPK, j.statePK()).Range(AttrSK, "STATE").
+		Remove("leaseOwner", "leaseUntil").If("$ = ?", "leaseOwner", j.owner).Run(ctx)
+}
+
+func (j *job) setState(ctx context.Context, attr string, value any) error {
+	return leaseErr(j.stateUpdate().Set(attr, value).If("$ = ?", "leaseOwner", j.owner).Run(ctx))
+}
+
+func (j *job) loadConflicts(ctx context.Context) error {
+	cs, err := j.allConflicts(ctx)
+	if err != nil {
+		return err
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.conflicts = map[Key]bool{}
+	for _, c := range cs {
+		j.conflicts[conflictSource(c)] = true
+	}
+	return nil
+}
+
+func conflictSource(c migConflict) Key {
+	pk, sk, _ := strings.Cut(strings.TrimPrefix(c.SK, "CONFLICT#"), "|")
+	return Key{pk, sk}
+}
+
+func (j *job) recordConflict(ctx context.Context, src Key, problem error) error {
+	k := Key{j.statePK(), "CONFLICT#" + src.PK + "|" + src.SK}
+	put := j.DB.Table(j.To).Put(migConflict{PK: k.PK, SK: k.SK, T: migType, Item: src.PK + " / " + src.SK, Problem: problem.Error()})
+	if err := leaseErr(Run(ctx, j.DB, []Op{PutOp(k, put, nil), j.fence()})); err != nil {
+		return err
+	}
+	j.mu.Lock()
+	j.conflicts[src] = true
+	j.mu.Unlock()
+	return nil
+}
+
+func (j *job) clearConflict(ctx context.Context, src Key) error {
+	j.mu.Lock()
+	known := j.conflicts[src]
+	j.mu.Unlock()
+	if !known {
+		return nil
+	}
+	k := Key{j.statePK(), "CONFLICT#" + src.PK + "|" + src.SK}
+	del := j.DB.Table(j.To).Delete(AttrPK, k.PK).Range(AttrSK, k.SK)
+	if err := leaseErr(Run(ctx, j.DB, []Op{DeleteOp(k, del, nil), j.fence()})); err != nil {
+		return err
+	}
+	j.mu.Lock()
+	delete(j.conflicts, src)
+	j.mu.Unlock()
+	return nil
+}
+
+// liveConflicts returns the conflicts whose source item still exists (and hasn't expired),
+// clearing the others: an item gone from the old table no longer needs copying.
+func (j *job) liveConflicts(ctx context.Context) ([]migConflict, error) {
+	cs, err := j.allConflicts(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var live []migConflict
+	for _, c := range cs {
+		src := conflictSource(c)
+		var raw dynamo.Item
+		found, err := GetOne(ctx, j.DB.Table(j.From), src, true, &raw)
+		if err != nil {
+			return nil, err
+		}
+		if !found || ExpiredItem(raw, j.TTLAttr) {
+			j.mu.Lock()
+			if j.conflicts == nil {
+				j.conflicts = map[Key]bool{}
+			}
+			j.conflicts[src] = true
+			j.mu.Unlock()
+			if err := j.clearConflict(ctx, src); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		live = append(live, c)
+	}
+	return live, nil
+}
+
+// tidy deletes the finished migration's checkpoints, leaving its state record.
+func (j *job) tidy(ctx context.Context) error {
+	var segs []migSegment
+	err := j.DB.Table(j.To).Get(AttrPK, j.statePK()).Range(AttrSK, dynamo.BeginsWith, "PASS#").Consistent(true).All(ctx, &segs)
+	if err != nil && !errors.Is(err, dynamo.ErrNotFound) {
+		return err
+	}
+	for _, s := range segs {
+		del := j.DB.Table(j.To).Delete(AttrPK, s.PK).Range(AttrSK, s.SK)
+		if err := leaseErr(Run(ctx, j.DB, []Op{DeleteOp(Key{s.PK, s.SK}, del, nil), j.fence()})); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// ItemType returns the entity or derived-item type (_t) of a stored item.
-func ItemType(raw dynamo.Item) string { return itemType(raw) }
-
-// ExpiredItem reports whether a stored item's TTL attribute has passed.
-func ExpiredItem(raw dynamo.Item, ttlAttr string) bool {
-	if n, ok := raw[ttlAttr].(*types.AttributeValueMemberN); ok {
-		var ttl int64
-		if _, err := fmt.Sscan(n.Value, &ttl); err == nil {
-			return Expired(ttl, Now())
-		}
+// report prints the conflicts, if any, and returns an error for them: a rollout must not go ahead
+// with items missing from the new table.
+func (j *job) report(ctx context.Context, command string) error {
+	cs, err := j.liveConflicts(ctx)
+	if err != nil {
+		return err
 	}
-	return false
-}
-
-func itemType(raw dynamo.Item) string {
-	if s, ok := raw[AttrType].(*types.AttributeValueMemberS); ok {
-		return s.Value
+	if len(cs) == 0 {
+		j.logf("%s: done", command)
+		return nil
 	}
-	return ""
+	sort.Slice(cs, func(a, b int) bool { return cs[a].Item < cs[b].Item })
+	for _, c := range cs {
+		j.logf("conflict: %s: %s", c.Item, c.Problem)
+	}
+	return fmt.Errorf("%w: %d items of %s were not copied; fix them in the old table and run %s again", ErrMigrationConflict, len(cs), j.From, command)
 }
 
 func (m *Migration) statePK() string { return "_DYNAGO#MIGRATION#" + m.From }
@@ -444,17 +727,9 @@ func (m *Migration) state(ctx context.Context) (migState, error) {
 	return st, err
 }
 
-// stateTable starts an update of the migration's state item.
-func (m *Migration) stateTable() *dynamo.Update {
+// stateUpdate starts an update of the migration's state item.
+func (m *Migration) stateUpdate() *dynamo.Update {
 	return m.DB.Table(m.To).Update(AttrPK, m.statePK()).Range(AttrSK, "STATE").Set(Path(AttrType), migType)
-}
-
-func (m *Migration) startPass(ctx context.Context, pass int, finishing bool) error {
-	return m.stateTable().Set("pass", pass).Set("passDone", false).Set("finishing", finishing).Run(ctx)
-}
-
-func (m *Migration) setPhase(ctx context.Context, phase string) error {
-	return m.stateTable().Set("phase", phase).Run(ctx)
 }
 
 // lease takes the migration's lease. finish waits for a lease another job holds; copy fails
@@ -468,7 +743,7 @@ func (m *Migration) lease(ctx context.Context, wait bool) (string, error) {
 	owner := host + "/" + hex.EncodeToString(b)
 	for {
 		now := time.Now()
-		err := m.stateTable().Set("leaseOwner", owner).Set("leaseUntil", now.Add(leaseFor).Unix()).
+		err := m.stateUpdate().Set("leaseOwner", owner).Set("leaseUntil", now.Add(m.LeaseFor).Unix()).
 			If("(attribute_not_exists($) OR $ < ?) AND (attribute_not_exists($) OR $ <> ?)", "leaseUntil", "leaseUntil", now.Unix(), "phase", "phase", "finished").
 			Run(ctx)
 		if err == nil {
@@ -496,79 +771,13 @@ func (m *Migration) lease(ctx context.Context, wait bool) (string, error) {
 	}
 }
 
-func (m *Migration) renew(ctx context.Context, owner string) error {
-	err := m.stateTable().Set("leaseUntil", time.Now().Add(leaseFor).Unix()).If("$ = ?", "leaseOwner", owner).Run(ctx)
-	if dynamo.IsCondCheckFailed(err) {
-		return fmt.Errorf("dynago migrate: lost the migration lease to another job")
-	}
-	return err
-}
-
-func (m *Migration) release(ctx context.Context, owner string) {
-	_ = m.DB.Table(m.To).Update(AttrPK, m.statePK()).Range(AttrSK, "STATE").
-		Remove("leaseOwner", "leaseUntil").If("$ = ?", "leaseOwner", owner).Run(ctx)
-}
-
-func (m *Migration) recordConflict(ctx context.Context, src Key, problem error) error {
-	return m.DB.Table(m.To).Put(migConflict{PK: m.statePK(), SK: "CONFLICT#" + src.PK + "|" + src.SK, T: migType,
-		Item: src.PK + " / " + src.SK, Problem: problem.Error()}).Run(ctx)
-}
-
-func (m *Migration) clearConflict(ctx context.Context, src Key) error {
-	return m.DB.Table(m.To).Delete(AttrPK, m.statePK()).Range(AttrSK, "CONFLICT#"+src.PK+"|"+src.SK).Run(ctx)
-}
-
-// liveConflicts returns the conflicts whose source item still exists, dropping the others: an item
-// deleted from the old table no longer needs copying.
-func (m *Migration) liveConflicts(ctx context.Context) ([]migConflict, error) {
-	cs, err := m.conflicts(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var live []migConflict
-	for _, c := range cs {
-		pk, sk, _ := strings.Cut(strings.TrimPrefix(c.SK, "CONFLICT#"), "|")
-		var probe struct{ PK string }
-		found, err := GetOne(ctx, m.DB.Table(m.From), Key{pk, sk}, true, &probe)
-		if err != nil {
-			return nil, err
-		}
-		if !found {
-			if err := m.clearConflict(ctx, Key{pk, sk}); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		live = append(live, c)
-	}
-	return live, nil
-}
-
-func (m *Migration) conflicts(ctx context.Context) ([]migConflict, error) {
+func (m *Migration) allConflicts(ctx context.Context) ([]migConflict, error) {
 	var out []migConflict
 	err := m.DB.Table(m.To).Get(AttrPK, m.statePK()).Range(AttrSK, dynamo.BeginsWith, "CONFLICT#").Consistent(true).All(ctx, &out)
 	if errors.Is(err, dynamo.ErrNotFound) {
 		err = nil
 	}
 	return out, err
-}
-
-// report prints the conflicts, if any, and returns an error for them: a rollout must not go ahead
-// with items missing from the new table.
-func (m *Migration) report(ctx context.Context, command string) error {
-	cs, err := m.liveConflicts(ctx)
-	if err != nil {
-		return err
-	}
-	if len(cs) == 0 {
-		m.logf("%s: done", command)
-		return nil
-	}
-	sort.Slice(cs, func(i, j int) bool { return cs[i].Item < cs[j].Item })
-	for _, c := range cs {
-		m.logf("conflict: %s: %s", c.Item, c.Problem)
-	}
-	return fmt.Errorf("%w: %d items of %s were not copied; fix them in the old table and run %s again", ErrMigrationConflict, len(cs), m.From, command)
 }
 
 func (m *Migration) status(ctx context.Context) error {
@@ -597,7 +806,7 @@ func (m *Migration) status(ctx context.Context) error {
 		}
 	}
 	m.logf("pass %d: %d segments done, %d copied, %d unchanged, %d removed, %d not copied (other types)", st.Pass, done, copied, same, removed, skipped)
-	cs, err := m.conflicts(ctx)
+	cs, err := m.allConflicts(ctx)
 	if err != nil {
 		return err
 	}
@@ -713,4 +922,10 @@ func ParseMigrate(args []string, base string) (command, table string, workers, p
 		return "", "", 0, 0, 0, fmt.Errorf("want one command\n\n%s", MigrateUsage)
 	}
 	return rest[0], table, workers, passes, rate, nil
+}
+
+// ItemKey returns a stored item's key.
+func ItemKey(raw dynamo.Item) Key {
+	k, _, _ := SourceOf(raw)
+	return k
 }

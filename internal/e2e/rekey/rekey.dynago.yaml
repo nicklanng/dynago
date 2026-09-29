@@ -1,0 +1,25 @@
+# yaml-language-server: $schema=../../../schema/dynago.schema.json
+#
+# A test-only schema. Generation 2 keys people by email instead of id, so a person whose email
+# changes in generation 1 while the migration runs must move in generation 2, not be duplicated.
+dynago: 1
+package: rekey
+table:
+  name: rekey
+  generation: 2
+  retain: [1]
+entities:
+  Person:
+    version: 2
+    fields:
+      personId: string
+      email: string
+      name: string
+    key: { pk: "E#{email}", sk: "PERSON" }
+    counters:
+      People: { pk: "PEOPLE", sk: "COUNT", values: { all: count } }
+    access:
+      Get: get
+      Count: { counter: People }
+    writes:
+      Add: create

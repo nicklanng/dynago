@@ -2973,7 +2973,7 @@ func NewMigration(db *dynamo.DB, base string) *dynago.Migration {
 	st := New(db, TableName(base))
 	return &dynago.Migration{DB: db, From: base + "-g1", To: TableName(base),
 		Types: map[string]bool{"Library": true, "Member": true, "Tool": true, "Loan": true, "Hold": true},
-		Copy:  st.migrateCopy, Remove: st.migrateRemove, Check: migrationCheck}
+		Copy:  st.migrateCopy, KeyOf: st.migrateKeyOf, Remove: st.migrateRemove, Check: migrationCheck, TTLAttr: "ttl"}
 }
 
 // LibraryG1 is a Library as generation 1 stored it: what the migration job reads.
@@ -3094,100 +3094,213 @@ func migrationCheck() error {
 	return nil // every entity carries over field by field
 }
 
-// migrateCopy converts one item of the previous generation and writes it into this one.
-func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item) error {
-	src, srcRev, err := dynago.SourceOf(raw)
-	if err != nil {
-		return err
+// convertLibrary converts a Library stored by generation 1 into this generation's.
+func convertLibrary(raw dynamo.Item) (Library, error) {
+	var old LibraryG1
+	if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+		return Library{}, err
 	}
+	if MigrateLibrary == nil {
+		return AutoMigrateLibrary(old), nil
+	}
+	e, err := MigrateLibrary(old)
+	if err != nil {
+		return Library{}, fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
+	}
+	return e, nil
+}
+
+// convertMember converts a Member stored by generation 1 into this generation's.
+func convertMember(raw dynamo.Item) (Member, error) {
+	var old MemberG1
+	if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+		return Member{}, err
+	}
+	if MigrateMember == nil {
+		return AutoMigrateMember(old), nil
+	}
+	e, err := MigrateMember(old)
+	if err != nil {
+		return Member{}, fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
+	}
+	return e, nil
+}
+
+// convertTool converts a Tool stored by generation 1 into this generation's.
+func convertTool(raw dynamo.Item) (Tool, error) {
+	var old ToolG1
+	if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+		return Tool{}, err
+	}
+	if MigrateTool == nil {
+		return AutoMigrateTool(old), nil
+	}
+	e, err := MigrateTool(old)
+	if err != nil {
+		return Tool{}, fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
+	}
+	return e, nil
+}
+
+// convertLoan converts a Loan stored by generation 1 into this generation's.
+func convertLoan(raw dynamo.Item) (Loan, error) {
+	var old LoanG1
+	if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+		return Loan{}, err
+	}
+	if MigrateLoan == nil {
+		return AutoMigrateLoan(old), nil
+	}
+	e, err := MigrateLoan(old)
+	if err != nil {
+		return Loan{}, fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
+	}
+	return e, nil
+}
+
+// convertHold converts a Hold stored by generation 1 into this generation's.
+func convertHold(raw dynamo.Item) (Hold, error) {
+	var old HoldG1
+	if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+		return Hold{}, err
+	}
+	if MigrateHold == nil {
+		return AutoMigrateHold(old), nil
+	}
+	e, err := MigrateHold(old)
+	if err != nil {
+		return Hold{}, fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
+	}
+	return e, nil
+}
+
+// migrateCopy converts one item of the previous generation and writes it into this one.
+func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
 	if dynago.ExpiredItem(raw, "ttl") {
 		return dynago.ErrUnchanged // expired: gone, even if DynamoDB hasn't deleted it yet
 	}
 	switch dynago.ItemType(raw) {
 	case "Library":
-		var old LibraryG1
-		if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+		e, err := convertLibrary(raw)
+		if err != nil {
 			return err
 		}
-		e := AutoMigrateLibrary(old)
-		if MigrateLibrary != nil {
-			if e, err = MigrateLibrary(old); err != nil {
-				return fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
-			}
+		src, srcRev, err := dynago.SourceOf(raw)
+		if err != nil {
+			return err
 		}
-		return s.Libraries.migrate(ctx, &e, src, srcRev)
+		return s.Libraries.migrate(ctx, &e, src, srcRev, fence)
 	case "Member":
-		var old MemberG1
-		if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+		e, err := convertMember(raw)
+		if err != nil {
 			return err
 		}
-		e := AutoMigrateMember(old)
-		if MigrateMember != nil {
-			if e, err = MigrateMember(old); err != nil {
-				return fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
-			}
+		src, srcRev, err := dynago.SourceOf(raw)
+		if err != nil {
+			return err
 		}
-		return s.Members.migrate(ctx, &e, src, srcRev)
+		return s.Members.migrate(ctx, &e, src, srcRev, fence)
 	case "Tool":
-		var old ToolG1
-		if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+		e, err := convertTool(raw)
+		if err != nil {
 			return err
 		}
-		e := AutoMigrateTool(old)
-		if MigrateTool != nil {
-			if e, err = MigrateTool(old); err != nil {
-				return fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
-			}
+		src, srcRev, err := dynago.SourceOf(raw)
+		if err != nil {
+			return err
 		}
-		return s.Tools.migrate(ctx, &e, src, srcRev)
+		return s.Tools.migrate(ctx, &e, src, srcRev, fence)
 	case "Loan":
-		var old LoanG1
-		if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+		e, err := convertLoan(raw)
+		if err != nil {
 			return err
 		}
-		e := AutoMigrateLoan(old)
-		if MigrateLoan != nil {
-			if e, err = MigrateLoan(old); err != nil {
-				return fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
-			}
+		src, srcRev, err := dynago.SourceOf(raw)
+		if err != nil {
+			return err
 		}
-		return s.Loans.migrate(ctx, &e, src, srcRev)
+		return s.Loans.migrate(ctx, &e, src, srcRev, fence)
 	case "Hold":
-		var old HoldG1
-		if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+		e, err := convertHold(raw)
+		if err != nil {
 			return err
 		}
-		e := AutoMigrateHold(old)
-		if MigrateHold != nil {
-			if e, err = MigrateHold(old); err != nil {
-				return fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
-			}
+		src, srcRev, err := dynago.SourceOf(raw)
+		if err != nil {
+			return err
 		}
-		return s.Holds.migrate(ctx, &e, src, srcRev)
+		return s.Holds.migrate(ctx, &e, src, srcRev, fence)
 	}
-	return nil
+	return dynago.ErrUnchanged
 }
 
-// migrateRemove deletes an entity copied from an item the previous generation no longer has.
-func (s *Store) migrateRemove(ctx context.Context, raw dynamo.Item) error {
+// migrateKeyOf returns the key an item of the previous generation converts to, or false if it
+// isn't copied.
+func (s *Store) migrateKeyOf(raw dynamo.Item) (dynago.Key, bool, error) {
+	if dynago.ExpiredItem(raw, "ttl") {
+		return dynago.Key{}, false, nil
+	}
 	switch dynago.ItemType(raw) {
 	case "Library":
-		return s.Libraries.migrateRemove(ctx, raw)
+		e, err := convertLibrary(raw)
+		if err != nil {
+			return dynago.Key{}, false, err
+		}
+		key, err := e.Key().dynamoKey()
+		return key, err == nil, err
 	case "Member":
-		return s.Members.migrateRemove(ctx, raw)
+		e, err := convertMember(raw)
+		if err != nil {
+			return dynago.Key{}, false, err
+		}
+		key, err := e.Key().dynamoKey()
+		return key, err == nil, err
 	case "Tool":
-		return s.Tools.migrateRemove(ctx, raw)
+		e, err := convertTool(raw)
+		if err != nil {
+			return dynago.Key{}, false, err
+		}
+		key, err := e.Key().dynamoKey()
+		return key, err == nil, err
 	case "Loan":
-		return s.Loans.migrateRemove(ctx, raw)
+		e, err := convertLoan(raw)
+		if err != nil {
+			return dynago.Key{}, false, err
+		}
+		key, err := e.Key().dynamoKey()
+		return key, err == nil, err
 	case "Hold":
-		return s.Holds.migrateRemove(ctx, raw)
+		e, err := convertHold(raw)
+		if err != nil {
+			return dynago.Key{}, false, err
+		}
+		key, err := e.Key().dynamoKey()
+		return key, err == nil, err
+	}
+	return dynago.Key{}, false, nil
+}
+
+// migrateRemove deletes an entity the migration copied, because its source is gone or now
+// converts to another key.
+func (s *Store) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
+	switch dynago.ItemType(raw) {
+	case "Library":
+		return s.Libraries.migrateRemove(ctx, raw, fence)
+	case "Member":
+		return s.Members.migrateRemove(ctx, raw, fence)
+	case "Tool":
+		return s.Tools.migrateRemove(ctx, raw, fence)
+	case "Loan":
+		return s.Loans.migrateRemove(ctx, raw, fence)
+	case "Hold":
+		return s.Holds.migrateRemove(ctx, raw, fence)
 	}
 	return nil
 }
 
 // migrate writes e, converted from the item at src in the previous generation (revision
 // srcRev), replacing what the new table holds for it, with its derived items.
-func (s *LibraryStore) migrate(ctx context.Context, e *Library, src dynago.Key, srcRev int64) error {
+func (s *LibraryStore) migrate(ctx context.Context, e *Library, src dynago.Key, srcRev int64, fence dynago.Op) error {
 	key, err := e.Key().dynamoKey()
 	if err != nil {
 		return err
@@ -3215,7 +3328,7 @@ func (s *LibraryStore) migrate(ctx context.Context, e *Library, src dynago.Key, 
 			if err != nil {
 				return err
 			}
-			before = libraryDerived(&it.Library, key)
+			before = dynago.Unbounded(libraryDerived(&it.Library, key))
 			rev = it.Rev + 1
 		}
 		item, err := dynago.MigrationItem(libraryToItem(e, key, rev), src, srcRev)
@@ -3226,8 +3339,8 @@ func (s *LibraryStore) migrate(ctx context.Context, e *Library, src dynago.Key, 
 		if found {
 			put = s.t.Put(item).If("$ = ?", "_rev", rev-1)
 		}
-		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}
-		derived, err := dynago.Diff(s.t, key, before, libraryDerived(e, key))
+		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale), fence}
+		derived, err := dynago.Diff(s.t, key, before, dynago.Unbounded(libraryDerived(e, key)))
 		if err != nil {
 			return err
 		}
@@ -3236,26 +3349,32 @@ func (s *LibraryStore) migrate(ctx context.Context, e *Library, src dynago.Key, 
 	})
 }
 
-// migrateRemove deletes an entity the migration copied, with its derived items, because its
-// source is gone.
-func (s *LibraryStore) migrateRemove(ctx context.Context, raw dynamo.Item) error {
-	it, err := libraryDecode(raw)
-	if err != nil {
-		return err
-	}
-	key := dynago.Key{PK: it.PK, SK: it.SK}
-	ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
-	derived, err := dynago.Diff(s.t, key, libraryDerived(&it.Library, key), nil)
-	if err != nil {
-		return err
-	}
-	ops = append(ops, derived...)
-	return dynago.Run(ctx, s.db, ops)
+// migrateRemove deletes an entity the migration copied, with its derived items.
+func (s *LibraryStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
+	return dynago.Retry(ctx, func() error {
+		var current dynamo.Item
+		found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)
+		if err != nil || !found {
+			return err
+		}
+		it, err := libraryDecode(current)
+		if err != nil {
+			return err
+		}
+		key := dynago.Key{PK: it.PK, SK: it.SK}
+		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
+		derived, err := dynago.Diff(s.t, key, dynago.Unbounded(libraryDerived(&it.Library, key)), nil)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		return dynago.Run(ctx, s.db, ops)
+	})
 }
 
 // migrate writes e, converted from the item at src in the previous generation (revision
 // srcRev), replacing what the new table holds for it, with its derived items.
-func (s *MemberStore) migrate(ctx context.Context, e *Member, src dynago.Key, srcRev int64) error {
+func (s *MemberStore) migrate(ctx context.Context, e *Member, src dynago.Key, srcRev int64, fence dynago.Op) error {
 	key, err := e.Key().dynamoKey()
 	if err != nil {
 		return err
@@ -3283,7 +3402,7 @@ func (s *MemberStore) migrate(ctx context.Context, e *Member, src dynago.Key, sr
 			if err != nil {
 				return err
 			}
-			before = memberDerived(&it.Member, key)
+			before = dynago.Unbounded(memberDerived(&it.Member, key))
 			rev = it.Rev + 1
 		}
 		item, err := dynago.MigrationItem(memberToItem(e, key, rev), src, srcRev)
@@ -3294,8 +3413,8 @@ func (s *MemberStore) migrate(ctx context.Context, e *Member, src dynago.Key, sr
 		if found {
 			put = s.t.Put(item).If("$ = ?", "_rev", rev-1)
 		}
-		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}
-		derived, err := dynago.Diff(s.t, key, before, memberDerived(e, key))
+		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale), fence}
+		derived, err := dynago.Diff(s.t, key, before, dynago.Unbounded(memberDerived(e, key)))
 		if err != nil {
 			return err
 		}
@@ -3304,26 +3423,32 @@ func (s *MemberStore) migrate(ctx context.Context, e *Member, src dynago.Key, sr
 	})
 }
 
-// migrateRemove deletes an entity the migration copied, with its derived items, because its
-// source is gone.
-func (s *MemberStore) migrateRemove(ctx context.Context, raw dynamo.Item) error {
-	it, err := memberDecode(raw)
-	if err != nil {
-		return err
-	}
-	key := dynago.Key{PK: it.PK, SK: it.SK}
-	ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
-	derived, err := dynago.Diff(s.t, key, memberDerived(&it.Member, key), nil)
-	if err != nil {
-		return err
-	}
-	ops = append(ops, derived...)
-	return dynago.Run(ctx, s.db, ops)
+// migrateRemove deletes an entity the migration copied, with its derived items.
+func (s *MemberStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
+	return dynago.Retry(ctx, func() error {
+		var current dynamo.Item
+		found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)
+		if err != nil || !found {
+			return err
+		}
+		it, err := memberDecode(current)
+		if err != nil {
+			return err
+		}
+		key := dynago.Key{PK: it.PK, SK: it.SK}
+		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
+		derived, err := dynago.Diff(s.t, key, dynago.Unbounded(memberDerived(&it.Member, key)), nil)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		return dynago.Run(ctx, s.db, ops)
+	})
 }
 
 // migrate writes e, converted from the item at src in the previous generation (revision
 // srcRev), replacing what the new table holds for it, with its derived items.
-func (s *ToolStore) migrate(ctx context.Context, e *Tool, src dynago.Key, srcRev int64) error {
+func (s *ToolStore) migrate(ctx context.Context, e *Tool, src dynago.Key, srcRev int64, fence dynago.Op) error {
 	key, err := e.Key().dynamoKey()
 	if err != nil {
 		return err
@@ -3351,7 +3476,7 @@ func (s *ToolStore) migrate(ctx context.Context, e *Tool, src dynago.Key, srcRev
 			if err != nil {
 				return err
 			}
-			before = toolDerived(&it.Tool, key)
+			before = dynago.Unbounded(toolDerived(&it.Tool, key))
 			rev = it.Rev + 1
 		}
 		item, err := dynago.MigrationItem(toolToItem(e, key, rev), src, srcRev)
@@ -3362,8 +3487,8 @@ func (s *ToolStore) migrate(ctx context.Context, e *Tool, src dynago.Key, srcRev
 		if found {
 			put = s.t.Put(item).If("$ = ?", "_rev", rev-1)
 		}
-		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}
-		derived, err := dynago.Diff(s.t, key, before, toolDerived(e, key))
+		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale), fence}
+		derived, err := dynago.Diff(s.t, key, before, dynago.Unbounded(toolDerived(e, key)))
 		if err != nil {
 			return err
 		}
@@ -3372,26 +3497,32 @@ func (s *ToolStore) migrate(ctx context.Context, e *Tool, src dynago.Key, srcRev
 	})
 }
 
-// migrateRemove deletes an entity the migration copied, with its derived items, because its
-// source is gone.
-func (s *ToolStore) migrateRemove(ctx context.Context, raw dynamo.Item) error {
-	it, err := toolDecode(raw)
-	if err != nil {
-		return err
-	}
-	key := dynago.Key{PK: it.PK, SK: it.SK}
-	ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
-	derived, err := dynago.Diff(s.t, key, toolDerived(&it.Tool, key), nil)
-	if err != nil {
-		return err
-	}
-	ops = append(ops, derived...)
-	return dynago.Run(ctx, s.db, ops)
+// migrateRemove deletes an entity the migration copied, with its derived items.
+func (s *ToolStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
+	return dynago.Retry(ctx, func() error {
+		var current dynamo.Item
+		found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)
+		if err != nil || !found {
+			return err
+		}
+		it, err := toolDecode(current)
+		if err != nil {
+			return err
+		}
+		key := dynago.Key{PK: it.PK, SK: it.SK}
+		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
+		derived, err := dynago.Diff(s.t, key, dynago.Unbounded(toolDerived(&it.Tool, key)), nil)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		return dynago.Run(ctx, s.db, ops)
+	})
 }
 
 // migrate writes e, converted from the item at src in the previous generation (revision
 // srcRev), replacing what the new table holds for it, with its derived items.
-func (s *LoanStore) migrate(ctx context.Context, e *Loan, src dynago.Key, srcRev int64) error {
+func (s *LoanStore) migrate(ctx context.Context, e *Loan, src dynago.Key, srcRev int64, fence dynago.Op) error {
 	key, err := e.Key().dynamoKey()
 	if err != nil {
 		return err
@@ -3431,7 +3562,7 @@ func (s *LoanStore) migrate(ctx context.Context, e *Loan, src dynago.Key, srcRev
 			if err != nil {
 				return err
 			}
-			before = loanDerived(&it.Loan, key, loanLimits{MemberLoansActive: dynago.Unlimited()})
+			before = dynago.Unbounded(loanDerived(&it.Loan, key, loanLimits{}))
 			rev = it.Rev + 1
 		}
 		item, err := dynago.MigrationItem(loanToItem(e, key, rev), src, srcRev)
@@ -3442,8 +3573,8 @@ func (s *LoanStore) migrate(ctx context.Context, e *Loan, src dynago.Key, srcRev
 		if found {
 			put = s.t.Put(item).If("$ = ?", "_rev", rev-1)
 		}
-		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}
-		derived, err := dynago.Diff(s.t, key, before, loanDerived(e, key, loanLimits{MemberLoansActive: dynago.Unlimited()}))
+		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale), fence}
+		derived, err := dynago.Diff(s.t, key, before, dynago.Unbounded(loanDerived(e, key, loanLimits{})))
 		if err != nil {
 			return err
 		}
@@ -3452,26 +3583,32 @@ func (s *LoanStore) migrate(ctx context.Context, e *Loan, src dynago.Key, srcRev
 	})
 }
 
-// migrateRemove deletes an entity the migration copied, with its derived items, because its
-// source is gone.
-func (s *LoanStore) migrateRemove(ctx context.Context, raw dynamo.Item) error {
-	it, err := loanDecode(raw)
-	if err != nil {
-		return err
-	}
-	key := dynago.Key{PK: it.PK, SK: it.SK}
-	ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
-	derived, err := dynago.Diff(s.t, key, loanDerived(&it.Loan, key, loanLimits{MemberLoansActive: dynago.Unlimited()}), nil)
-	if err != nil {
-		return err
-	}
-	ops = append(ops, derived...)
-	return dynago.Run(ctx, s.db, ops)
+// migrateRemove deletes an entity the migration copied, with its derived items.
+func (s *LoanStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
+	return dynago.Retry(ctx, func() error {
+		var current dynamo.Item
+		found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)
+		if err != nil || !found {
+			return err
+		}
+		it, err := loanDecode(current)
+		if err != nil {
+			return err
+		}
+		key := dynago.Key{PK: it.PK, SK: it.SK}
+		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
+		derived, err := dynago.Diff(s.t, key, dynago.Unbounded(loanDerived(&it.Loan, key, loanLimits{})), nil)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		return dynago.Run(ctx, s.db, ops)
+	})
 }
 
 // migrate writes e, converted from the item at src in the previous generation (revision
 // srcRev), replacing what the new table holds for it, with its derived items.
-func (s *HoldStore) migrate(ctx context.Context, e *Hold, src dynago.Key, srcRev int64) error {
+func (s *HoldStore) migrate(ctx context.Context, e *Hold, src dynago.Key, srcRev int64, fence dynago.Op) error {
 	key, err := e.Key().dynamoKey()
 	if err != nil {
 		return err
@@ -3521,20 +3658,26 @@ func (s *HoldStore) migrate(ctx context.Context, e *Hold, src dynago.Key, srcRev
 		if found {
 			put = s.t.Put(item).If("$ = ?", "_rev", rev-1)
 		}
-		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}
+		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale), fence}
 		_ = before
 		return dynago.Run(ctx, s.db, ops)
 	})
 }
 
-// migrateRemove deletes an entity the migration copied, with its derived items, because its
-// source is gone.
-func (s *HoldStore) migrateRemove(ctx context.Context, raw dynamo.Item) error {
-	it, err := holdDecode(raw)
-	if err != nil {
-		return err
-	}
-	key := dynago.Key{PK: it.PK, SK: it.SK}
-	ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
-	return dynago.Run(ctx, s.db, ops)
+// migrateRemove deletes an entity the migration copied, with its derived items.
+func (s *HoldStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
+	return dynago.Retry(ctx, func() error {
+		var current dynamo.Item
+		found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)
+		if err != nil || !found {
+			return err
+		}
+		it, err := holdDecode(current)
+		if err != nil {
+			return err
+		}
+		key := dynago.Key{PK: it.PK, SK: it.SK}
+		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
+		return dynago.Run(ctx, s.db, ops)
+	})
 }
