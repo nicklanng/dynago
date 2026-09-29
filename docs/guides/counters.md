@@ -136,7 +136,8 @@ to check: put them in a counter of their own.
 Existing items were never counted, so a new counter, a new value, or a changed definition needs a
 new table generation. The migration job copies every entity into the new table, and each copy
 adds its contribution, so the counter starts exact. See [Migrations](migrations.md). Removing a
-counter or value is compatible: its counts stay on the counter item, unused.
+counter or value needs a new generation too: during a rolling deploy or a rollback, a version that
+still has it would keep counting while the new one doesn't, and the count would drift.
 
 ## Caveats
 

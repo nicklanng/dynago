@@ -479,15 +479,29 @@ func toMap[T any](xs []T, key func(T) string) map[string]string {
 // field removed and later re-added with another type, or one attribute reused by a new field.
 // Existing items may still hold the old value.
 func reusedAttrs(h *History, gen int, now Shape) []Change {
+	// The versions whose items the table can hold: those recorded in this generation, and the
+	// last one before it (the shape the migration copied in, if the entity's version didn't
+	// change with the generation).
+	var versions []Version
+	for i, v := range h.Versions {
+		if v.gen() == gen || (v.gen() < gen && (i+1 == len(h.Versions) || h.Versions[i+1].gen() == gen)) {
+			versions = append(versions, v)
+		}
+	}
 	var out []Change
 	for _, f := range now.Fields {
-		for _, v := range h.Versions {
-			if v.gen() != gen {
-				continue
-			}
+		for _, v := range versions {
 			for _, old := range v.Shape.Fields {
-				if old.Attr == f.Attr && old.Type != f.Type {
+				switch {
+				case old.Attr != f.Attr:
+				case old.Type != f.Type:
 					out = append(out, Change{fmt.Sprintf("attribute %q of field %s held a %s (field %s at version %d) earlier in this generation, so existing items may still hold one", f.Attr, f.Name, old.Type, old.Name, v.Version), false})
+				case f.Type == string(schema.TypeEnum):
+					for _, val := range old.Values {
+						if !slices.Contains(f.Values, val) {
+							out = append(out, Change{fmt.Sprintf("attribute %q of enum %s held %q (field %s at version %d) earlier in this generation, which the enum no longer has", f.Attr, f.Name, val, old.Name, v.Version), false})
+						}
+					}
 				}
 			}
 		}

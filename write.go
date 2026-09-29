@@ -88,7 +88,7 @@ func Run(ctx context.Context, db *dynamo.DB, ops []Op) error {
 				return nil // our own create, repeated by an SDK retry after it had succeeded
 			}
 		}
-		return op.err
+		return &OpError{Key: op.key, Err: op.err}
 	}
 	seen := make(map[Key]bool, len(ops))
 	for _, o := range ops {
@@ -132,7 +132,7 @@ func mapTxError(err error, ops []Op) error {
 		switch *reason.Code {
 		case "ConditionalCheckFailed":
 			if i < len(ops) && ops[i].err != nil {
-				return ops[i].err
+				return &OpError{Key: ops[i].key, Err: ops[i].err}
 			}
 			return err
 		case "TransactionConflict", "ThrottlingError", "ProvisionedThroughputExceeded":
@@ -144,6 +144,17 @@ func mapTxError(err error, ops []Op) error {
 	}
 	return err
 }
+
+// OpError is a write's failed condition, carrying the key of the item whose condition failed.
+// It unwraps to the error registered for that item, so errors.Is works as with the bare error;
+// errors.As gives the key, which the migration job uses to find who holds a claim.
+type OpError struct {
+	Key Key
+	Err error
+}
+
+func (e *OpError) Error() string { return e.Err.Error() }
+func (e *OpError) Unwrap() error { return e.Err }
 
 // contention marks an error from a single-item write that collided with a transaction in progress
 // on the item, so Retry retries it like a cancelled transaction. The SDK does not retry it.

@@ -94,7 +94,11 @@ old table's traffic.
   with the sources of those copies.
 
 It writes only what changed. The job holds a lease, renewed as it runs, and every write it makes
-checks it. A job that loses the lease (a paused or partitioned pod) stops without writing more.
+checks it, on a fence item of its worker's own, so workers never contend. A job that loses the
+lease (a paused or partitioned pod) stops without writing more. The check makes every copy a
+transaction, including entities with no index, claim or counter, which would otherwise be a single
+write: copying those costs about twice as much, and one of a transaction's 100 items goes to the
+check.
 
 ### Conflicts
 
@@ -107,9 +111,10 @@ Some items can't be copied until someone fixes the data in the old table:
 
 The job copies everything else, lists these, and **exits with an error**, so a rollout gated on it
 waits. Order within a pass doesn't cause conflicts: items that conflicted are retried after the
-pass's removals. Say a member left and another joined with the same email; that's fine. Counter
-limits and minimums aren't checked while copying: the counts record what the old table holds, and
-a new limit applies to writes made after the cutover.
+pass's removals, and a claim held by a copy whose source has since changed is freed. So a member
+leaving while another joins with the same email is fine, and so are two libraries swapping slugs.
+Counter limits and minimums aren't checked while copying: the counts record what the old table
+holds, and a new limit applies to writes made after the cutover.
 
 Fix the data in the old table, then run the job again. Fixed items are copied, and conflicts for
 items deleted or expired meanwhile are dropped. Fix conflicts during `copy`, while the old version

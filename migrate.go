@@ -164,6 +164,14 @@ type migState struct {
 	Finishing  bool   `dynamo:"finishing"` // the pass in progress is the final one
 	LeaseOwner string `dynamo:"leaseOwner"`
 	LeaseUntil int64  `dynamo:"leaseUntil"`
+	Fences     int    `dynamo:"fences"` // how many fence items jobs have used
+}
+
+type migFence struct {
+	PK    string `dynamo:"PK"`
+	SK    string `dynamo:"SK"`
+	T     string `dynamo:"_t"`
+	Owner string `dynamo:"owner"`
 }
 
 type migSegment struct {
@@ -227,6 +235,9 @@ func (m *Migration) Run(ctx context.Context, command string) error {
 	defer cancel(nil)
 	go j.keepLease(jctx, cancel)
 	defer j.release(context.WithoutCancel(ctx))
+	if err := j.installFences(jctx); err != nil {
+		return err
+	}
 	err = j.run(jctx, command)
 	if cause := context.Cause(jctx); errors.Is(cause, ErrLeaseLost) {
 		return cause
@@ -381,9 +392,9 @@ func (j *job) segment(ctx context.Context, pass int, phase string, seg int, limi
 			return 0, err
 		}
 		if phase == "copy" {
-			err = j.copyItems(ctx, items, &cp, limit)
+			err = j.copyItems(ctx, items, &cp, limit, j.fence(seg))
 		} else {
-			err = j.removeItems(ctx, items, &cp, limit)
+			err = j.removeItems(ctx, items, &cp, limit, j.fence(seg))
 		}
 		if err != nil {
 			return 0, err
@@ -391,7 +402,7 @@ func (j *job) segment(ctx context.Context, pass int, phase string, seg int, limi
 		cp.Next = stringKey(next)
 		cp.Done = len(next) == 0
 		// The checkpoint is fenced too, so a job that lost the lease can't move it.
-		ops := []Op{PutOp(Key{cp.PK, cp.SK}, j.DB.Table(j.To).Put(cp), nil), j.fence()}
+		ops := []Op{PutOp(Key{cp.PK, cp.SK}, j.DB.Table(j.To).Put(cp), nil), j.fence(seg)}
 		if err := leaseErr(Run(ctx, j.DB, ops)); err != nil {
 			return 0, err
 		}
@@ -401,7 +412,7 @@ func (j *job) segment(ctx context.Context, pass int, phase string, seg int, limi
 	}
 }
 
-func (j *job) copyItems(ctx context.Context, items []dynamo.Item, cp *migSegment, limit *limiter) error {
+func (j *job) copyItems(ctx context.Context, items []dynamo.Item, cp *migSegment, limit *limiter, fence Op) error {
 	for _, raw := range items {
 		if !j.Types[ItemType(raw)] {
 			cp.Skipped++
@@ -410,7 +421,7 @@ func (j *job) copyItems(ctx context.Context, items []dynamo.Item, cp *migSegment
 		if err := limit.wait(ctx); err != nil {
 			return err
 		}
-		switch copied, err := j.copyOne(ctx, raw); {
+		switch copied, err := j.copyOne(ctx, raw, fence, 0); {
 		case err != nil:
 			return err
 		case copied:
@@ -424,28 +435,101 @@ func (j *job) copyItems(ctx context.Context, items []dynamo.Item, cp *migSegment
 
 // copyOne copies an item of the old table, recording a conflict if it can't be copied. It reports
 // whether it wrote anything.
-func (j *job) copyOne(ctx context.Context, raw dynamo.Item) (bool, error) {
+//
+// A claim taken by a stale copy (whose source has changed since, as when two libraries swap
+// slugs) is not a conflict: the stale copy is removed, this item copied, and the removed item's
+// source copied again straight away, which may in turn displace another stale copy (depth).
+func (j *job) copyOne(ctx context.Context, raw dynamo.Item, fence Op, depth int) (bool, error) {
 	src, _, err := SourceOf(raw)
 	if err != nil {
 		return false, err
 	}
-	err = j.patient(ctx, func() error { return j.Copy(ctx, raw, j.fence()) })
+	copyIt := func() error { return j.patient(ctx, func() error { return j.Copy(ctx, raw, fence) }) }
+	err = copyIt()
+	var displaced dynamo.Item
+	if errors.Is(err, ErrTaken) && depth < 10 {
+		holder, stale, ferr := j.staleClaimHolder(ctx, err)
+		if ferr != nil {
+			return false, ferr
+		}
+		if stale {
+			if rerr := j.patient(ctx, func() error { return j.Remove(ctx, holder, fence) }); rerr != nil {
+				return false, rerr
+			}
+			displaced = holder
+			err = copyIt()
+		}
+	}
+	var copied bool
 	switch {
 	case errors.Is(err, ErrLeaseLost):
 		return false, err
 	case errors.Is(err, ErrUnchanged):
-		return false, j.clearConflict(ctx, src)
+		err = j.clearConflict(ctx, src, fence)
 	case isConflict(err):
-		return false, j.recordConflict(ctx, src, err)
+		err = j.recordConflict(ctx, src, err, fence)
 	case err != nil:
 		return false, fmt.Errorf("copying %s / %s: %w", src.PK, src.SK, err)
+	default:
+		copied = true
+		err = j.clearConflict(ctx, src, fence)
 	}
-	return true, j.clearConflict(ctx, src)
+	if err != nil || displaced == nil {
+		return copied, err
+	}
+	// Copy the displaced item again, from its source as it is now.
+	ms, _ := migratedFrom(displaced)
+	var source dynamo.Item
+	found, err := GetOne(ctx, j.DB.Table(j.From), ms.src, true, &source)
+	if err != nil || !found || !j.Types[ItemType(source)] {
+		return copied, err
+	}
+	_, err = j.copyOne(ctx, source, fence, depth+1)
+	return copied, err
+}
+
+// staleClaimHolder finds the copy holding the claim a failed copy needed, and whether that copy
+// is stale: its source is gone, has changed since it was copied, or converts to another key.
+func (j *job) staleClaimHolder(ctx context.Context, taken error) (dynamo.Item, bool, error) {
+	var oe *OpError
+	if !errors.As(taken, &oe) {
+		return nil, false, nil
+	}
+	var claim Claim
+	found, err := GetOne(ctx, j.DB.Table(j.To), oe.Key, true, &claim)
+	if err != nil || !found {
+		return nil, false, err
+	}
+	var holder dynamo.Item
+	found, err = GetOne(ctx, j.DB.Table(j.To), Key{claim.OwnerPK, claim.OwnerSK}, true, &holder)
+	if err != nil || !found {
+		return nil, false, err
+	}
+	ms, ok := migratedFrom(holder)
+	if !ok {
+		return nil, false, nil
+	}
+	var source dynamo.Item
+	found, err = GetOne(ctx, j.DB.Table(j.From), ms.src, true, &source)
+	if err != nil {
+		return nil, false, err
+	}
+	if !found {
+		return holder, true, nil
+	}
+	if _, rev, err := SourceOf(source); err != nil || rev != ms.rev {
+		return holder, true, err
+	}
+	key, keep, err := j.KeyOf(source)
+	if err != nil || !keep || key != ItemKey(holder) {
+		return holder, true, nil
+	}
+	return nil, false, nil
 }
 
 func isConflict(err error) bool {
 	return errors.Is(err, ErrMigrationConflict) || errors.Is(err, ErrTaken) || errors.Is(err, ErrInvalidKey) ||
-		errors.Is(err, ErrFieldRequired) || errors.Is(err, ErrLimit)
+		errors.Is(err, ErrFieldRequired) || errors.Is(err, ErrLimit) || errors.Is(err, ErrTooManyItems)
 }
 
 // patient runs one item's write, retrying past the usual retry policy when other transactions
@@ -466,7 +550,7 @@ func (j *job) patient(ctx context.Context, fn func() error) error {
 
 // removeItems deletes the new table's copies whose source is gone from the old table, or now
 // converts to another key (its key fields changed while the old generation served).
-func (j *job) removeItems(ctx context.Context, items []dynamo.Item, cp *migSegment, limit *limiter) error {
+func (j *job) removeItems(ctx context.Context, items []dynamo.Item, cp *migSegment, limit *limiter, fence Op) error {
 	type copied struct {
 		raw dynamo.Item
 		key Key
@@ -518,7 +602,7 @@ func (j *job) removeItems(ctx context.Context, items []dynamo.Item, cp *migSegme
 		if err := limit.wait(ctx); err != nil {
 			return err
 		}
-		if err := j.patient(ctx, func() error { return j.Remove(ctx, c.raw, j.fence()) }); err != nil {
+		if err := j.patient(ctx, func() error { return j.Remove(ctx, c.raw, fence) }); err != nil {
 			if errors.Is(err, ErrLeaseLost) {
 				return err
 			}
@@ -545,7 +629,7 @@ func (j *job) retryConflicts(ctx context.Context, limit *limiter) (int64, error)
 			return n, err
 		}
 		if !found {
-			if err := j.clearConflict(ctx, src); err != nil {
+			if err := j.clearConflict(ctx, src, j.fence(0)); err != nil {
 				return n, err
 			}
 			continue
@@ -553,7 +637,7 @@ func (j *job) retryConflicts(ctx context.Context, limit *limiter) (int64, error)
 		if err := limit.wait(ctx); err != nil {
 			return n, err
 		}
-		copied, err := j.copyOne(ctx, raw)
+		copied, err := j.copyOne(ctx, raw, j.fence(0), 0)
 		if err != nil {
 			return n, err
 		}
@@ -564,10 +648,33 @@ func (j *job) retryConflicts(ctx context.Context, limit *limiter) (int64, error)
 	return n, nil
 }
 
-// fence is the op every write of the job includes: a check that this job still holds the lease.
-func (j *job) fence() Op {
-	k := Key{j.statePK(), "STATE"}
-	return CheckOp(k, j.DB.Table(j.To).Check(AttrPK, k.PK).Range(AttrSK, k.SK).If("$ = ?", "leaseOwner", j.owner), ErrLeaseLost)
+// fence is the op every write of worker w includes: a check that this job still holds the lease,
+// made on the worker's own fence item. A single item checked by every worker's transactions would
+// make them conflict with one another; with one per worker, they never do. Taking the lease
+// rewrites every fence item, so a job that lost it fails its next write whichever worker makes it.
+func (j *job) fence(w int) Op {
+	k := Key{j.statePK(), fmt.Sprintf("FENCE#%03d", w)}
+	return CheckOp(k, j.DB.Table(j.To).Check(AttrPK, k.PK).Range(AttrSK, k.SK).If("$ = ?", "owner", j.owner), ErrLeaseLost)
+}
+
+// installFences points every fence item, including any a previous job with more workers used, at
+// this job. Until it has, it writes nothing else.
+func (j *job) installFences(ctx context.Context) error {
+	st, err := j.state(ctx)
+	if err != nil {
+		return err
+	}
+	n := max(st.Fences, j.Workers)
+	for w := 0; w < n; w++ {
+		k := Key{j.statePK(), fmt.Sprintf("FENCE#%03d", w)}
+		put := j.DB.Table(j.To).Put(migFence{PK: k.PK, SK: k.SK, T: migType, Owner: j.owner})
+		state := Key{j.statePK(), "STATE"}
+		check := CheckOp(state, j.DB.Table(j.To).Check(AttrPK, state.PK).Range(AttrSK, state.SK).If("$ = ?", "leaseOwner", j.owner), ErrLeaseLost)
+		if err := leaseErr(Run(ctx, j.DB, []Op{PutOp(k, put, nil), check})); err != nil {
+			return err
+		}
+	}
+	return j.setState(ctx, "fences", n)
 }
 
 // leaseErr turns the failure of a lease-conditioned write into ErrLeaseLost.
@@ -579,17 +686,23 @@ func leaseErr(err error) error {
 }
 
 func (j *job) keepLease(ctx context.Context, cancel context.CancelCauseFunc) {
-	tick := time.NewTicker(j.LeaseFor / 3)
-	defer tick.Stop()
+	every := j.LeaseFor / 3
+	timer := time.NewTimer(every)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-tick.C:
-			err := j.stateUpdate().Set("leaseUntil", time.Now().Add(j.LeaseFor).Unix()).If("$ = ?", "leaseOwner", j.owner).Run(ctx)
-			if errors.Is(leaseErr(err), ErrLeaseLost) {
+		case <-timer.C:
+			err := leaseErr(j.stateUpdate().Set("leaseUntil", time.Now().Add(j.LeaseFor).Unix()).If("$ = ?", "leaseOwner", j.owner).Run(ctx))
+			switch {
+			case errors.Is(err, ErrLeaseLost):
 				cancel(ErrLeaseLost)
 				return
+			case err != nil:
+				timer.Reset(time.Second) // a transient failure: try again soon, well before expiry
+			default:
+				timer.Reset(every)
 			}
 		}
 	}
@@ -623,10 +736,10 @@ func conflictSource(c migConflict) Key {
 	return Key{pk, sk}
 }
 
-func (j *job) recordConflict(ctx context.Context, src Key, problem error) error {
+func (j *job) recordConflict(ctx context.Context, src Key, problem error, fence Op) error {
 	k := Key{j.statePK(), "CONFLICT#" + src.PK + "|" + src.SK}
 	put := j.DB.Table(j.To).Put(migConflict{PK: k.PK, SK: k.SK, T: migType, Item: src.PK + " / " + src.SK, Problem: problem.Error()})
-	if err := leaseErr(Run(ctx, j.DB, []Op{PutOp(k, put, nil), j.fence()})); err != nil {
+	if err := leaseErr(Run(ctx, j.DB, []Op{PutOp(k, put, nil), fence})); err != nil {
 		return err
 	}
 	j.mu.Lock()
@@ -635,7 +748,7 @@ func (j *job) recordConflict(ctx context.Context, src Key, problem error) error 
 	return nil
 }
 
-func (j *job) clearConflict(ctx context.Context, src Key) error {
+func (j *job) clearConflict(ctx context.Context, src Key, fence Op) error {
 	j.mu.Lock()
 	known := j.conflicts[src]
 	j.mu.Unlock()
@@ -644,7 +757,7 @@ func (j *job) clearConflict(ctx context.Context, src Key) error {
 	}
 	k := Key{j.statePK(), "CONFLICT#" + src.PK + "|" + src.SK}
 	del := j.DB.Table(j.To).Delete(AttrPK, k.PK).Range(AttrSK, k.SK)
-	if err := leaseErr(Run(ctx, j.DB, []Op{DeleteOp(k, del, nil), j.fence()})); err != nil {
+	if err := leaseErr(Run(ctx, j.DB, []Op{DeleteOp(k, del, nil), fence})); err != nil {
 		return err
 	}
 	j.mu.Lock()
@@ -675,7 +788,7 @@ func (j *job) liveConflicts(ctx context.Context) ([]migConflict, error) {
 			}
 			j.conflicts[src] = true
 			j.mu.Unlock()
-			if err := j.clearConflict(ctx, src); err != nil {
+			if err := j.clearConflict(ctx, src, j.fence(0)); err != nil {
 				return nil, err
 			}
 			continue
@@ -694,7 +807,7 @@ func (j *job) tidy(ctx context.Context) error {
 	}
 	for _, s := range segs {
 		del := j.DB.Table(j.To).Delete(AttrPK, s.PK).Range(AttrSK, s.SK)
-		if err := leaseErr(Run(ctx, j.DB, []Op{DeleteOp(Key{s.PK, s.SK}, del, nil), j.fence()})); err != nil {
+		if err := leaseErr(Run(ctx, j.DB, []Op{DeleteOp(Key{s.PK, s.SK}, del, nil), j.fence(0)})); err != nil {
 			return err
 		}
 	}

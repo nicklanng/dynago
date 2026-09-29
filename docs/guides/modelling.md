@@ -62,9 +62,10 @@ Either way:
   active loans only, so returned loans drop out of the overdue list with no filtering.
 - **Several entities can share a GSI** by using the same index name, when their sort keys are
   distinguishable by prefix. The index projects the union of their fields, but an item only carries
-  the attributes it has, so entities don't pay for each other's. The shared costs are the table's
-  budget of 100 projected attributes and the risk of two entities meaning different things by one
-  attribute name. Separate GSIs are usually clearer (up to 20 per table).
+  the attributes it has, so entities don't pay for each other's. Sharing uses less of the table's
+  budget of 100 projected attributes than separate GSIs would, since each attribute counts once.
+  The risks are two entities meaning different things by one attribute name, and one index serving
+  unrelated queries. Separate GSIs are usually clearer (up to 20 per table).
 
 A query that only needs a different **order within the same partition** can often use the sort
 key itself: pick the sort key for the most common order and an index for the rest.
@@ -137,8 +138,9 @@ and index names like `LSI3SK` that tell reviewers nothing. The spares also tend 
 unrelated features.
 
 Declare an LSI when a domain has a concrete, high-volume need for a consistent sort order within
-a partition, and no partition key value's items will come near 10 GB. Otherwise a GSI or a copy index is the
-lighter choice: neither caps partitions, and dropping one needs no new table.
+a partition, and no partition key value's items will come near 10 GB. Otherwise a GSI or a copy
+index is the lighter choice: neither caps partitions, and neither has to be decided when the table
+is created (though adding or dropping one still takes a new table generation).
 
 ## 4. Uniqueness: claims
 

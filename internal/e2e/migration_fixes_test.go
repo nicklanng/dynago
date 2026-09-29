@@ -54,8 +54,9 @@ func TestMigrationFollowsKeyChanges(t *testing.T) {
 	}
 }
 
-// A job that loses its lease (here, stolen outright; in life, a paused or partitioned pod) stops,
-// and writes nothing more: every write it makes is fenced by the lease.
+// A job that loses its lease (in life, a paused or partitioned pod whose lease another job takes
+// over) stops, and writes nothing more: every write it makes is fenced by the lease. Here the
+// takeover is done by hand, the way a new job does it: the lease, then every worker's fence.
 func TestLostLeaseStopsTheJob(t *testing.T) {
 	g := setupGenerations(t)
 	for i := 0; i < 40; i++ {
@@ -68,7 +69,9 @@ func TestLostLeaseStopsTheJob(t *testing.T) {
 	go func() { done <- m.Run(ctx, "copy") }()
 	time.Sleep(time.Second)
 	newTable := g.db.Table(toollibrary.TableName(g.base))
-	must(t, newTable.Update("PK", "_DYNAGO#MIGRATION#"+g.base+"-g1").Range("SK", "STATE").Set("leaseOwner", "another job").Run(ctx))
+	statePK := "_DYNAGO#MIGRATION#" + g.base + "-g1"
+	must(t, newTable.Update("PK", statePK).Range("SK", "STATE").Set("leaseOwner", "another job").Run(ctx))
+	must(t, newTable.Update("PK", statePK).Range("SK", "FENCE#000").Set("owner", "another job").Run(ctx))
 	stolenAt := count(t, newTable)
 	err := <-done
 	if !errors.Is(err, dynago.ErrLeaseLost) {
@@ -88,4 +91,46 @@ func count(t *testing.T, table dynamo.Table) int {
 	n, err := table.Scan().Consistent(true).Count(ctx)
 	must(t, err)
 	return n
+}
+
+// Libraries swap (and rotate) slugs in the old generation after the bulk copy. Each copy then
+// needs a claim a stale copy still holds; the job frees it rather than reporting data that is
+// valid as a conflict, so finish succeeds on the first run.
+func TestMigrationSwappedUniqueValues(t *testing.T) {
+	g := setupGenerations(t)
+	open := func(id, slug string) {
+		must(t, g.old.Libraries.Open(ctx, &toollibrary.Library{LibraryID: id, Name: id, Slug: slug, OpenedAt: time.Now()}))
+	}
+	for id, slug := range map[string]string{"l1": "aaaa", "l2": "bbbb", "r1": "red", "r2": "green", "r3": "blue"} {
+		open(id, slug)
+	}
+	must(t, g.run("copy"))
+	reslug := func(id, slug string) {
+		t.Helper()
+		lib, err := g.old.Libraries.Get(ctx, toollibrary.LibraryKey{LibraryID: id})
+		must(t, err)
+		must(t, g.old.Libraries.ChangeSlug(ctx, lib.Key(), toollibrary.LibraryChangeSlug{Slug: slug}, dynago.From(lib)))
+	}
+	// A swap through a spare slug...
+	reslug("l1", "tmp")
+	reslug("l2", "aaaa")
+	reslug("l1", "bbbb")
+	// ...and a rotation of three.
+	reslug("r1", "spare")
+	reslug("r3", "red")
+	reslug("r2", "blue")
+	reslug("r1", "green")
+
+	must(t, g.run("finish"))
+	for slug, want := range map[string]string{"aaaa": "l2", "bbbb": "l1", "red": "r3", "green": "r1", "blue": "r2"} {
+		lib, err := g.new.Libraries.GetBySlug(ctx, slug)
+		if err != nil || lib.LibraryID != want {
+			t.Errorf("slug %s: got %+v %v, want %s", slug, lib, err, want)
+		}
+	}
+	for _, slug := range []string{"tmp", "spare"} {
+		if _, err := g.new.Libraries.GetBySlug(ctx, slug); !errors.Is(err, toollibrary.ErrLibraryNotFound) {
+			t.Errorf("slug %s still claimed: %v", slug, err)
+		}
+	}
 }

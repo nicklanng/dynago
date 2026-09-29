@@ -229,3 +229,23 @@ func TestLocksFromBeforeGenerations(t *testing.T) {
 		t.Fatalf("upgraded lock = %+v", next)
 	}
 }
+
+// An entity carried into a new generation without a version bump keeps its record from the
+// previous generation, which is the shape its items were copied in with.
+func TestReusedAttributesAcrossAGenerationBump(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "      name: string\n", ""), empty())
+	l2 := apply(t, model(t, 2, 1, "      name: string\n", ""), l1) // new generation, entity unchanged
+	_, _, err := Apply(model(t, 2, 2, "      nick: { type: int, attr: name }\n", ""), l2, Options{})
+	if err == nil || !strings.Contains(err.Error(), `attribute "name" of field nick held a string`) {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestEnumReAddedWithFewerValues(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "      mood: { type: enum, values: [a, b, c] }\n", ""), empty())
+	l2 := apply(t, model(t, 1, 2, "", ""), l1)
+	_, _, err := Apply(model(t, 1, 3, "      mood: { type: enum, values: [a, b] }\n", ""), l2, Options{})
+	if err == nil || !strings.Contains(err.Error(), `held "c"`) {
+		t.Fatalf("got %v", err)
+	}
+}

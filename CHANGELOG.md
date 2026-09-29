@@ -52,10 +52,10 @@ First version.
 - A generated migration job (`RunMigration`, and a `main` package with `output.migrate_cmd`):
   `copy` makes a bulk pass and catch-up passes while the old generation serves, and `finish` a
   last pass with writes stopped. It is resumable, rate-limited and safe to run from several pods:
-  a lease, renewed as it runs, fences every write, so a job that lost it writes nothing more.
-  Copies follow key changes made while the old generation serves, and conflicts are retried after
-  each pass's removals.
-  It rebuilds derived items from the entities, and reports items it can't copy as conflicts. It
+  a lease, renewed as it runs, fences every write (on a fence item per worker, so workers don't
+  contend), and a job that lost it writes nothing more. Copies follow key changes made while the
+  old generation serves; conflicts are retried after each pass's removals, and a unique value held
+  by a stale copy is freed, so swapped or rotated values copy cleanly. It rebuilds derived items from the entities, and reports items it can't copy as conflicts. It
   converts entities field by field, or with a `Migrate<Entity>` function where fields don't carry
   over.
 - Model document with Mermaid diagrams, Terraform JSON (with point-in-time recovery, deletion
