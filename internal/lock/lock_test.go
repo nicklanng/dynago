@@ -85,8 +85,43 @@ func TestCompatibleChangesStayInTheGeneration(t *testing.T) {
 			t.Errorf("%s: %v", name, err)
 		}
 	}
-	if _, _, err := Apply(model(t, 1, 2, "      old: string\n", ""), l1, Options{}); err != nil {
-		t.Errorf("counter removed: %v", err)
+	// Dropping a derived item is not compatible: a version still running with it would keep
+	// maintaining it while this one doesn't.
+	if _, _, err := Apply(model(t, 1, 2, "      old: string\n", ""), l1, Options{}); err == nil || !strings.Contains(err.Error(), "counter value Kinds.a removed") {
+		t.Errorf("counter removed: got %v", err)
+	}
+}
+
+// Fields are compared by attribute across the generation, not only by name against the last
+// version: existing items may hold what any earlier version stored.
+func TestReusedAttributesNeedANewGeneration(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "      name: string\n", ""), empty())
+	// Directly: name is removed and its attribute taken by an int field.
+	_, _, err := Apply(model(t, 1, 2, "      nick: { type: int, attr: name }\n", ""), l1, Options{})
+	if err == nil || !strings.Contains(err.Error(), `attribute "name" of field nick held a string`) {
+		t.Fatalf("direct reuse: got %v", err)
+	}
+	// In two steps: name is removed (compatible), then re-added as an int.
+	l2 := apply(t, model(t, 1, 2, "", ""), l1)
+	_, _, err = Apply(model(t, 1, 3, "      name: int\n", ""), l2, Options{})
+	if err == nil || !strings.Contains(err.Error(), `attribute "name" of field name held a string`) {
+		t.Fatalf("two-step reuse: got %v", err)
+	}
+	// Re-adding it with its old type is fine: old values are still valid.
+	if _, _, err := Apply(model(t, 1, 3, "      name: string\n", ""), l2, Options{}); err != nil {
+		t.Fatalf("re-added with the same type: %v", err)
+	}
+}
+
+func TestMakingAFieldRequiredNeedsANewGeneration(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "      name: string\n", ""), empty())
+	_, _, err := Apply(model(t, 1, 2, "      name: { type: string, required: true }\n", ""), l1, Options{})
+	if err == nil || !strings.Contains(err.Error(), "field name made required") {
+		t.Fatalf("got %v", err)
+	}
+	// And the flag is part of the shape: changing it needs a version bump at all.
+	if _, _, err := Apply(model(t, 1, 1, "      name: { type: string, required: true }\n", ""), l1, Options{}); err == nil || !strings.Contains(err.Error(), "version: 2") {
+		t.Fatalf("without a version bump: got %v", err)
 	}
 }
 

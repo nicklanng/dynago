@@ -1,5 +1,6 @@
 {
   "dynago": 1,
+  "format": 2,
   "generation": 2,
   "tables": [
     {
@@ -149,7 +150,7 @@
         {
           "version": 1,
           "generation": 1,
-          "fingerprint": "05e37472cd3872a4",
+          "fingerprint": "7361ab9f23a22836",
           "shape": {
             "fields": [
               {
@@ -165,12 +166,14 @@
               {
                 "name": "memberId",
                 "attr": "memberId",
-                "type": "string"
+                "type": "string",
+                "required": true
               },
               {
                 "name": "codeHash",
                 "attr": "codeHash",
-                "type": "string"
+                "type": "string",
+                "required": true
               },
               {
                 "name": "createdAt",
@@ -180,7 +183,8 @@
               {
                 "name": "expiresAt",
                 "attr": "expiresAt",
-                "type": "time"
+                "type": "time",
+                "required": true
               }
             ],
             "pk": "LIB#{libraryId}#TOOL#{toolId}",
@@ -253,7 +257,7 @@
         {
           "version": 1,
           "generation": 1,
-          "fingerprint": "a63d3dff9a242916",
+          "fingerprint": "9787906b81c1b5eb",
           "shape": {
             "fields": [
               {
@@ -274,7 +278,8 @@
               {
                 "name": "memberId",
                 "attr": "memberId",
-                "type": "string"
+                "type": "string",
+                "required": true
               },
               {
                 "name": "toolName",
@@ -293,12 +298,14 @@
               {
                 "name": "borrowedAt",
                 "attr": "borrowedAt",
-                "type": "time"
+                "type": "time",
+                "required": true
               },
               {
                 "name": "dueAt",
                 "attr": "dueAt",
-                "type": "time"
+                "type": "time",
+                "required": true
               },
               {
                 "name": "returnedAt",

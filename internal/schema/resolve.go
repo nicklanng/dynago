@@ -672,7 +672,7 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 		r.errorf("%s: access names must be PascalCase", where)
 		return nil
 	}
-	a := &Access{Name: name, GoName: name, Entity: e, Doc: raw.Doc, Consistent: raw.Consistent, Rate: raw.Rate}
+	a := &Access{Name: name, GoName: name, Entity: e, Doc: raw.Doc, Consistent: raw.Consistent != nil && *raw.Consistent, Rate: raw.Rate}
 	kinds := 0
 	if raw.Get != nil {
 		kinds++
@@ -720,6 +720,10 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 			}
 			if a.Consistent && a.Index.Strategy == StrategyGSI {
 				r.errorf("%s: global secondary indexes cannot be read consistently", where)
+			}
+			// Read-your-writes is why an index is a copy: read it consistently unless told not to.
+			if a.Index.Strategy == StrategyCopy && raw.Consistent == nil {
+				a.Consistent = true
 			}
 		}
 		switch raw.Order {

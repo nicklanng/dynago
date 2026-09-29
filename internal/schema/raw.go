@@ -194,14 +194,15 @@ func (v *RawCounterValue) UnmarshalYAML(n *yaml.Node) error {
 
 // RawAccess declares a read. Short forms: `Get: get`.
 type RawAccess struct {
-	Get        *RawGet    `yaml:"get"`
-	Query      string     `yaml:"query"`
-	Counter    string     `yaml:"counter"`
-	Order      string     `yaml:"order"`
-	Page       int        `yaml:"page"`
-	MaxPage    int        `yaml:"max_page"`
-	Range      string     `yaml:"range"`
-	Consistent bool       `yaml:"consistent"`
+	Get     *RawGet `yaml:"get"`
+	Query   string  `yaml:"query"`
+	Counter string  `yaml:"counter"`
+	Order   string  `yaml:"order"`
+	Page    int     `yaml:"page"`
+	MaxPage int     `yaml:"max_page"`
+	Range   string  `yaml:"range"`
+	// Consistent is nil when not given: copy queries then default to consistent reads.
+	Consistent *bool      `yaml:"consistent"`
 	Project    RawProject `yaml:"project"`
 	Doc        string     `yaml:"doc"`
 	Rate       float64    `yaml:"rate"`

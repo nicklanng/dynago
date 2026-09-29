@@ -30,6 +30,9 @@ import (
 // File is the lock file.
 type File struct {
 	Dynago int `json:"dynago"`
+	// Format is the lock file's own format: 2 records whether each field is required. Older
+	// files are upgraded, taking what they didn't record from the schema.
+	Format int `json:"format,omitempty"`
 	// Generation is the table generation the schema was last generated at (0 in lock files
 	// written before generations existed, meaning 1).
 	Generation int `json:"generation,omitempty"`
@@ -76,11 +79,15 @@ type Shape struct {
 
 // FieldShape is a stored attribute.
 type FieldShape struct {
-	Name   string   `json:"name"`
-	Attr   string   `json:"attr"`
-	Type   string   `json:"type"`
-	Values []string `json:"values,omitempty"`
+	Name     string   `json:"name"`
+	Attr     string   `json:"attr"`
+	Type     string   `json:"type"`
+	Values   []string `json:"values,omitempty"`
+	Required bool     `json:"required,omitempty"`
 }
+
+// lockFormat is the format this code writes.
+const lockFormat = 2
 
 // IndexShape is an index definition.
 type IndexShape struct {
@@ -172,7 +179,7 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 	if prevGen == 0 && len(prev.Entities) > 0 {
 		prevGen = 1 // written before generations existed
 	}
-	next := &File{Dynago: 1, Generation: gen, Tables: slices.Clone(prev.Tables), Entities: map[string]*History{}}
+	next := &File{Dynago: 1, Format: lockFormat, Generation: gen, Tables: slices.Clone(prev.Tables), Entities: map[string]*History{}}
 	for name, h := range prev.Entities {
 		next.Entities[name] = &History{Versions: slices.Clone(h.Versions)}
 	}
@@ -209,6 +216,9 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 		// Compare shapes, not the stored fingerprint, so a lock written by an older dynago
 		// (another fingerprint, or fields it didn't record yet) stays valid. A matching entry is
 		// refreshed in the current format.
+		if prev.Format < 2 {
+			last.Shape = upgradeRequired(last.Shape, shape)
+		}
 		same := fingerprint(upgrade(last.Shape, shape)) == fp
 		switch {
 		case e.Version < last.Version:
@@ -220,6 +230,7 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 				e.Name, e.Version, e.Version+1, strings.Join(texts(Changes(last.Shape, shape, e)), "; ")))
 		default:
 			changes := Changes(last.Shape, shape, e)
+			changes = append(changes, reusedAttrs(h, gen, shape)...)
 			var misfits []string
 			for _, c := range changes {
 				if !c.Compatible {
@@ -306,7 +317,7 @@ func previous(m *schema.Model, f *File) *schema.Previous {
 func ShapeOf(e *schema.Entity, ttlAttr string) Shape {
 	s := Shape{PK: e.PK.Raw, SK: e.SK.Raw}
 	for _, f := range e.Fields {
-		s.Fields = append(s.Fields, FieldShape{Name: f.Name, Attr: f.Attr, Type: string(f.Type), Values: f.Enum})
+		s.Fields = append(s.Fields, FieldShape{Name: f.Name, Attr: f.Attr, Type: string(f.Type), Values: f.Enum, Required: f.Required})
 	}
 	if e.TTL != nil {
 		s.TTL, s.TTLAttr = e.TTL.Name, ttlAttr
@@ -393,6 +404,8 @@ func Changes(a, b Shape, e *schema.Entity) []Change {
 			add(false, "field %s added as required (existing items don't have it)", f.Name)
 		case !had:
 			add(true, "field %s added", f.Name)
+		case !old.Required && f.Required:
+			add(false, "field %s made required (existing items may not have it)", f.Name)
 		case old.Attr != f.Attr || old.Type != f.Type:
 			add(false, "field %s changed from %s %s to %s %s (existing items hold the old one)", f.Name, old.Type, old.Attr, f.Type, f.Attr)
 		case mustJSON(old.Values) != mustJSON(f.Values):
@@ -412,8 +425,9 @@ func Changes(a, b Shape, e *schema.Entity) []Change {
 	for _, name := range sortedKeys(oldFields) {
 		add(true, "field %s removed (existing items keep the attribute until the next generation)", name)
 	}
-	// Derived items: existing items have none of a new or changed one, but a dropped one does no
-	// harm (its entries, claims or counts stay, unused, until the next generation).
+	// Derived items: existing items have none of a new or changed one. A dropped one is no better:
+	// during a rolling deploy or after a rollback, the version that still has it keeps maintaining
+	// it while this one doesn't, so its counts drift and its claims stop protecting anything.
 	derived := func(kind string, a, b map[string]string) {
 		for _, name := range sortedKeys(b) {
 			switch av, had := a[name]; {
@@ -425,13 +439,12 @@ func Changes(a, b Shape, e *schema.Entity) []Change {
 		}
 		for _, name := range sortedKeys(a) {
 			if _, has := b[name]; !has {
-				add(true, "%s %s removed (what existing items have of it stays, unused, until the next generation)", kind, name)
+				add(false, "%s %s removed (a version that still has it would keep maintaining it while this one doesn't)", kind, name)
 			}
 		}
 	}
 	derived("index", toMap(a.Indexes, func(x IndexShape) string { return x.Name }), toMap(b.Indexes, func(x IndexShape) string { return x.Name }))
 	derived("unique claim", toMap(a.Uniques, func(x UniqueShape) string { return x.Name }), toMap(b.Uniques, func(x UniqueShape) string { return x.Name }))
-	// Counter values are compared one by one, so dropping a value is compatible.
 	counters := func(s Shape) map[string]string {
 		out := map[string]string{}
 		for _, c := range s.Counters {
@@ -460,6 +473,52 @@ func toMap[T any](xs []T, key func(T) string) map[string]string {
 		m[key(x)] = mustJSON(x)
 	}
 	return m
+}
+
+// reusedAttrs finds fields whose attribute held another type earlier in the table generation: a
+// field removed and later re-added with another type, or one attribute reused by a new field.
+// Existing items may still hold the old value.
+func reusedAttrs(h *History, gen int, now Shape) []Change {
+	var out []Change
+	for _, f := range now.Fields {
+		for _, v := range h.Versions {
+			if v.gen() != gen {
+				continue
+			}
+			for _, old := range v.Shape.Fields {
+				if old.Attr == f.Attr && old.Type != f.Type {
+					out = append(out, Change{fmt.Sprintf("attribute %q of field %s held a %s (field %s at version %d) earlier in this generation, so existing items may still hold one", f.Attr, f.Name, old.Type, old.Name, v.Version), false})
+				}
+			}
+		}
+	}
+	return dedupeChanges(out)
+}
+
+func dedupeChanges(cs []Change) []Change {
+	var out []Change
+	seen := map[string]bool{}
+	for _, c := range cs {
+		if !seen[c.Text] {
+			seen[c.Text] = true
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// upgradeRequired fills in whether each field was required, which lock files before format 2
+// didn't record, from the current shape: an absence there is not a change.
+func upgradeRequired(old, now Shape) Shape {
+	required := map[string]bool{}
+	for _, f := range now.Fields {
+		required[f.Name] = f.Required
+	}
+	old.Fields = slices.Clone(old.Fields)
+	for i := range old.Fields {
+		old.Fields[i].Required = required[old.Fields[i].Name]
+	}
+	return old
 }
 
 // upgrade fills in what a lock written by an older dynago didn't record, taking it from the

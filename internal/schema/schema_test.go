@@ -256,3 +256,21 @@ func TestProjectedAttributesAreCountedAcrossGSIs(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// A copy index exists for read-your-writes, so its queries read consistently unless told not to.
+func TestCopyQueriesDefaultToConsistent(t *testing.T) {
+	src := base + `    indexes:
+      ByName: { strategy: copy, pk: "N#{tenantId}", sk: "NAME#{name}#{thingId}", project: keys }
+    access:
+      Mine: { query: ByName }
+      Cheap: { query: ByName, consistent: false }
+`
+	m, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	access := m.Entities[0].Access
+	if !access[0].Consistent || access[1].Consistent {
+		t.Fatalf("Mine consistent=%t, Cheap consistent=%t", access[0].Consistent, access[1].Consistent)
+	}
+}
