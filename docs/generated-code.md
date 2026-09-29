@@ -196,7 +196,7 @@ The generator picks one of three shapes:
 | Shape | When | Requests |
 |---|---|---|
 | **Single update** | The changed fields feed no index key, `where`, copy, claim or counter, and the write has no `requires`. | One conditional UpdateItem. No read. (Only if the condition fails is the item read once, to report which condition failed.) |
-| **Read-free** | The counters and claims it changes depend only on key fields and fields its `when` pins, e.g. `Retire: { set: { status: retired }, when: { status: available } }`, and its `requires` use only fields known from the call. | One transaction: the conditional update plus the counter changes and `requires`, with no read. If the item isn't in the assumed state (or was written before a counter existed), it falls back to the read-first shape, which reports exactly why. `From` and `ReturnVersion` use read-first directly: they need the stored state. |
+| **Read-free** | It changes no field used in an index's keys or `where`, or projected into a copy; the counters and claims it changes depend only on key fields and fields its `when` pins, e.g. `Retire: { set: { status: retired }, when: { status: available } }`, and its `requires` use only fields known from the call. | One transaction: the conditional update plus the counter changes and `requires`, with no read. If the item isn't in the assumed state, it falls back to the read-first shape, which reports exactly why. `From` and `ReturnVersion` use read-first directly: they need the stored state. |
 | **Read-first** | Anything else. | A consistent GetItem (skipped with `dynago.From`), then a transaction (or a single PutItem if there are no derived items) conditioned on the revision read. |
 
 A `patch` update is decided per call as well: if every patch field that feeds something derived is
@@ -272,7 +272,8 @@ released in the same transaction.
 
 ## What the generated code does not do
 
-- It does not expose raw DynamoDB access, scans or filters. A read that is not declared does not
+- It does not expose raw DynamoDB access, scans or filters (the only filter is the one that drops
+  expired items, on entities with a `ttl`). A read that is not declared does not
   exist. Add an access pattern to the schema instead.
 - It does not change another entity in arbitrary ways: `requires` can set constants (or the
   writer's field values) on another entity and delete it, not compute new values from it.

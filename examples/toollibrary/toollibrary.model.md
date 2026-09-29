@@ -474,7 +474,7 @@ Every item that exists because of a Hold, and what keeps it up to date.
 
 | | Subject | Finding |
 |---|---|---|
-| ⚠️ warning | Tool | manual (p99 19.5 KB) makes every write cost up to 21 WRU, including writes that never change it: Relabel, Retire, Loan.Borrow, Loan.Return. Consider moving it to an entity of its own, written only when it changes. |
+| ⚠️ warning | Tool | manual (p99 19.5 KB) makes every write cost up to 21 WRU (42 in a transaction), including writes that never change it: Relabel, Retire, Loan.Borrow, Loan.Return. Consider moving it to an entity of its own, written only when it changes. |
 | ⚠️ warning | Loan.toolName | copies Tool.name. dynago keeps copies within one entity in sync, but not this one: when Tool.name changes, your code must rewrite every Loan that copied it. |
 
 | Entity | Items (assumed) | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
@@ -503,7 +503,7 @@ Assumptions:
 - **Key patterns** such as `LIB#{libraryId}#TOOL#{toolId}` show how keys are built: literal text plus field values. Times in keys are fixed-width UTC so they sort chronologically.
 - **Entities** are the domain types. Each is stored as one item, plus the items listed under *Stored items*: index entries, copies, uniqueness claims and counters. The generated code writes and deletes the copies, claims and counters in the same transaction as the item; DynamoDB maintains the GSI entries itself.
 - **Global secondary indexes (GSIs)** re-key the same items so they can be queried another way. DynamoDB keeps them up to date asynchronously, so reads through them are eventually consistent (usually well under a second behind). An entity only appears in an index while every text or time field its index keys use is set, and its `where` holds, so an index can hold a subset (a *sparse* index).
-- **Copies** are an alternative to a GSI: separate items written in the same transaction as the entity. They cost a transaction on every write but can be read back immediately.
+- **Copies** are an alternative to a GSI: separate items written in the same transaction as the entity. They cost a transaction on every write that changes what they hold, but can be read back immediately.
 - **Claims** make a value unique: creating the entity also creates an item keyed by the value, conditional on it not existing.
 - **Counters** are items updated with atomic ADD in the same transaction as the entity, so counts never drift from the items they count. A limit on a counter value turns into a condition, which is how capacity is enforced without races.
 - **Access patterns** are the only reads the code can do: each is one request (or two for a lookup by a unique value). A query nobody declared does not exist as a method, so every new way of reading data shows up in review as a schema change.

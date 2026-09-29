@@ -681,8 +681,8 @@ func largeFieldFindings(r *Report, m *schema.Model, e *schema.Entity, er *Entity
 		verb, them = "make", "them"
 	}
 	r.Findings = append(r.Findings, Finding{Warn, e.Name, fmt.Sprintf(
-		"%s %s every write cost up to %.0f WRU, including writes that never change %s: %s. Consider moving %s to an entity of its own, written only when %s changes.",
-		strings.Join(names, ", "), verb, wru(er.Item.P99), them, strings.Join(others, ", "), them, them)})
+		"%s %s every write cost up to %.0f WRU (%.0f in a transaction), including writes that never change %s: %s. Consider moving %s to an entity of its own, written only when %s changes.",
+		strings.Join(names, ", "), verb, wru(er.Item.P99), 2*wru(er.Item.P99), them, strings.Join(others, ", "), them, them)})
 }
 
 // clears reports whether the write sets one of fields to a zero constant, which releases a claim

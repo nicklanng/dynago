@@ -44,7 +44,8 @@ table isn't touched, so rolling back means pointing the old version at it again.
    ```
 
    Needing a conversion is decided field by field: a new required field; a field whose type
-   changed; enum values that went away; or a field that's gone. A field that's gone might have been
+   changed (other than between `string_set` and `string_list`, which both hold `[]string`); enum
+   values that went away; or a field that's gone. A field that's gone might have been
    renamed, and only you know which. The generated doc comment on `Migrate<Entity>` lists the
    reasons, and so does the job's error.
 
@@ -90,15 +91,18 @@ old table's traffic.
 **Cost of a pass.** Every pass reads:
 - the whole old table;
 - for each entity, its copy in the new table;
-- the whole new table, to find copies whose source is gone or now converts to another key, along
-  with the sources of those copies.
+- the whole new table and, for every copy in it, its source in the old table (a second read of
+  every entity, by key), to find copies whose source is gone or now converts to another key.
+
+Every read is strongly consistent.
 
 It writes only what changed. The job holds a lease, renewed as it runs, and every write it makes
-checks it, on a fence item of its worker's own, so workers never contend. A job that loses the
-lease (a paused or partitioned pod) stops without writing more. The check makes every copy a
-transaction, including entities with no index, claim or counter, which would otherwise be a single
-write: copying those costs about twice as much, and one of a transaction's 100 items goes to the
-check.
+checks it, on a fence item of its worker's own, so workers never contend on the check. A job that
+loses the lease (a paused or partitioned pod) stops without writing more. The check makes every
+copy a transaction, including entities with no copy index, claim or counter, which would otherwise
+be a single write. Such a copy costs 2 WRU per KB plus 2 WRU for the check, instead of 1 WRU per
+KB: four times as much for an item up to 1 KB. Every other copy pays 2 WRU more for the check, and
+one of a transaction's 100 items goes to it.
 
 ### Conflicts
 
@@ -107,6 +111,8 @@ Some items can't be copied until someone fixes the data in the old table:
 - a key value the new schema can't take;
 - an empty required field;
 - two old items converting to the same new key;
+- an entity whose copy would touch more than 100 items (with its claims, copies, counters and the
+  check);
 - an error your conversion returns.
 
 The job copies everything else, lists these, and **exits with an error**, so a rollout gated on it

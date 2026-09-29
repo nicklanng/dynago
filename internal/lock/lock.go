@@ -4,7 +4,7 @@
 // The storage shape is everything that decides what items look like: fields and attribute names,
 // key templates, indexes, uniqueness claims and counters. Changing it requires bumping the
 // entity's version. Within one table generation, a version may only change the shape in ways
-// existing items still fit: add an optional field, remove a field, or drop a derived item. Any
+// existing items still fit, such as adding an optional field or removing a field. Any
 // other change needs a new generation: a new table, filled by the generated migration job, with
 // the old one kept for rollback. The history tells the generator what the previous generation
 // stored, so the job can read it.

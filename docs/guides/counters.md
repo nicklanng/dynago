@@ -47,7 +47,8 @@ An update changing what a counter depends on normally needs the "before" state. 
 avoid reading it:
 
 - **Read-free writes.** If every input of the changed counters is a key field or pinned by `when`,
-  the change is known from the call itself. `Retire: { set: { status: retired }, when: { status:
+  and the write changes no field used in an index's keys or `where`, or projected into a copy, the
+  change is known from the call itself. `Retire: { set: { status: retired }, when: { status:
   available } }` always moves exactly one tool from `available` to `retired`, so it runs as one
   transaction of conditional writes with no read. If the tool isn't available after all, the
   conditions fail and the write falls back to reading, which reports the precondition error.

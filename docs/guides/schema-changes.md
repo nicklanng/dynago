@@ -14,11 +14,11 @@ and reviewable. There are two kinds of change:
 Every entity has a `version` (default 1), and every item stores the version it was written at
 (`_v`). An entity's **storage shape** is everything that decides what its items look like:
 
-- fields, their attribute names and types;
+- fields: their attribute names, types, enum values, and whether they're required;
 - the key templates and TTL field;
 - indexes (keys, projection, `where`, strategy);
 - uniqueness claims;
-- counters and their values.
+- counters, their values and shard counts.
 
 Docs, sizes, examples, access patterns, writes, rates and limits are not part of the shape.
 Changing them never needs a version bump.

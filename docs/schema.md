@@ -386,7 +386,8 @@ How an update runs is decided from the schema:
 
 - If it changes nothing that feeds an index key, a `where`, a copy, a claim or a counter, it is
   **one conditional UpdateItem** with no read.
-- If the counters and claims it changes depend only on key fields and fields its `when` pins (for
+- If it changes no field used in an index's keys or `where`, or projected into a copy, and the
+  counters and claims it changes depend only on key fields and fields its `when` pins (for
   example `Retire: { set: { status: retired }, when: { status: available } }` moves the tool
   from the `available` count to the `retired` count), it is **read-free**: conditional writes in one transaction,
   with no read. If the item turns out not to be in the assumed state, it falls back to the next

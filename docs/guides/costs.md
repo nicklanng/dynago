@@ -12,9 +12,9 @@ Loan (v1)  item 464 B / 1.9 KB  storage 2.68 GB ($0.67/month)
   write  Borrow       tx 8 items               23/61 WRU  $74.52/month
   write  Return       tx 6 items + read        19/57 WRU
 
-warning: Tool: manual (p99 19.5 KB) makes every write cost up to 21 WRU, including writes that
-never change it: Relabel, Retire, Loan.Borrow, Loan.Return. Consider moving it to an entity of its
-own, written only when it changes.
+warning: Tool: manual (p99 19.5 KB) makes every write cost up to 21 WRU (42 in a
+transaction), including writes that never change it: Relabel, Retire, Loan.Borrow, Loan.Return.
+Consider moving it to an entity of its own, written only when it changes.
 ```
 
 The warning is worth reading closely: marking the tool on loan rewrites the whole tool item, so a
