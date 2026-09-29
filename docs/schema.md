@@ -19,7 +19,8 @@ version bumps); they are listed with each section below.
 Contents: [File](#file) · [Table](#table) · [Output](#output) · [Entities](#entities) ·
 [Fields](#fields) · [Keys](#keys) · [Indexes](#indexes) · [Uniqueness](#unique) ·
 [Counters](#counters) · [Access patterns](#access) · [Writes](#writes) · [Requires](#requires) · [Predicates](#predicates) ·
-[Estimates](#estimate) · [Names](#names) · [Rules across the file](#rules-across-the-file)
+[Volume](#volume) · [Workload](#workload) · [Accepting findings](#accept) · [Names](#names) ·
+[Rules across the file](#rules-across-the-file)
 
 ## File
 
@@ -37,6 +38,7 @@ entities:
 | `package` | yes | Go package name for the generated code: lower-case letters and digits, starting with a letter. |
 | `table` | yes | The physical table. See [Table](#table). |
 | `output` | no | Where generated files go. See [Output](#output). |
+| `workload` | no | Table-wide workload assumptions for the analysis. See [Workload](#workload). |
 | `entities` | yes | At least one entity, keyed by PascalCase name. See [Entities](#entities). |
 
 Every table has the same base key: `PK` (partition key) and `SK` (sort key), both strings. Billing
@@ -51,6 +53,7 @@ is on-demand. Several entities can share a table; dynago checks they can never b
 | `ttl_attribute` | no | `ttl` | Attribute DynamoDB's TTL reads (epoch seconds). Only enabled if an entity declares `ttl`. |
 | `generation` | no | `1` | The table generation. Changes existing items don't fit need a new generation: a new table, filled by the generated migration job. See [Migrations](guides/migrations.md). |
 | `retain` | no | | Older generations whose tables stay in the Terraform, for rollback: `[2]`. To delete one, turn off its deletion protection outside the Terraform (the generated Terraform always enables it), then remove it here. |
+| `accept` | no | | Findings about the table as a whole recorded as deliberate. See [Accepting findings](#accept). |
 
 ## Output
 
@@ -81,7 +84,8 @@ entities:
     counters: { ... }
     access: { ... }
     writes: { ... }
-    estimate: { items: 2000000 }
+    volume: { typical: 20, max: 500 }   # loans per tool
+    accept: { large-field: "..." }
 ```
 
 | Key | Required | Default | Meaning |
@@ -96,11 +100,13 @@ entities:
 | `counters` | no | | Counters maintained from the entity's writes. See [Counters](#counters). |
 | `access` | no | | The reads the store offers. See [Access patterns](#access). |
 | `writes` | no | | The writes the store offers. See [Writes](#writes). |
-| `estimate` | no | | Volume assumptions for the cost report. See [Estimates](#estimate). |
+| `volume` | no | | How many items to expect: a total, or typical and max per parent. See [Volume](#volume). |
+| `accept` | no | | Findings about the entity recorded as deliberate. See [Accepting findings](#accept). |
 
-Every item also stores three bookkeeping attributes: `_t` (entity name), `_v` (schema version it
-was written at) and `_rev` (revision, used for optimistic concurrency). Field attributes cannot use
-these names, `PK`, `SK`, or the table's TTL attribute.
+Every item also stores bookkeeping attributes: `_t` (entity name), `_v` (schema version it was
+written at), `_rev` (revision, used for optimistic concurrency), and `_created` and `_updated`
+(when dynago first wrote the item and last changed it; see [Generated code](generated-code.md#timestamps)).
+Field attributes cannot use these names, `PK`, `SK`, or the table's TTL attribute.
 
 ## Fields
 
@@ -110,7 +116,8 @@ fields:
   status: { type: enum, values: [active, returned] }
   manual: { type: string, size: 2000/20000, doc: Care and safety notes. }
   dueAt: { type: time, required: true, example: "2026-10-12T17:00:00Z" }
-  toolName: { type: string, copy_of: Tool.name }
+  toolName: { type: string, snapshot_of: Tool.name }  # the name when borrowed
+  borrowerId: { type: string, ref: Member }          # holds a Member's memberId
   shortName: { type: string, attr: sn }              # stored as "sn"
 ```
 
@@ -126,7 +133,10 @@ Field names are camelCase. Each becomes an exported Go field (`libraryId` → `L
 | `example` | no | Example value, used to render example keys in the model document. Times accept RFC 3339 or `YYYY-MM-DD`. |
 | `values` | enum only | The allowed values of an `enum`. Required for enums, not allowed otherwise. |
 | `required` | no | `true` makes writes refuse the field's zero value with `dynago.ErrFieldRequired`: creates must set it, updates (`update`, `patch`) may not clear it, and `set` may not set it to zero. Key fields are always required. Use it for fields the model depends on, such as a hold's expiry. |
-| `copy_of` | no | `Entity.field` this field copies from another entity (e.g. a tool's name on each loan, so "my loans" can show it without reading the tool). dynago keeps copies **within** an entity in sync but not this one; declaring it documents that your code must rewrite the copies, shows it in the model document, and makes `dynago check` warn. Types must match. |
+| `copy_of` | no | `Entity.field` this field copies from another entity and must **stay equal to**. dynago keeps copies within an entity in sync but not this one: declaring it documents that your code must rewrite the copies when the source changes, and `dynago check` warns (`copy-drift`), saying how many items one change fans out to and whether one transaction could hold them. Types must match. |
+| `snapshot_of` | no | `Entity.field` whose value this field takes when the item is written, and **deliberately keeps**: a tool's name at the time of a loan, a price at the time of an order. Documented, not warned about. Exclusive with `copy_of`. |
+| `ref` | no | The entity whose key this field holds, when its name doesn't match that entity's key field (`borrowerId` holding a `Member`'s `memberId`, `userId` holding a `User`'s `id`). Fields with matching names link without it. The field supplies the key field no same-named field can, or else the entity's last key field (a `stewardId` beside `memberId` refers to another `Member`); the other key fields come from fields of the same name. A `ref` is the link `volume` (`per`, `by`), parents and the analysis follow to that entity, ahead of any match by name. |
+| `accept` | no | Findings about the field recorded as deliberate. See [Accepting findings](#accept). |
 
 | Type | Go type | Stored as | In keys | Empty means absent | Default size p50/p99 |
 |---|---|---|---|---|---|
@@ -148,8 +158,10 @@ value remove the attribute.
 An enum `status` on entity `Loan` generates `type LoanStatus string` and constants such as
 `LoanStatusActive`.
 
-A field may not be called `key` or `version` (the entity's generated `Key()` and `Version()`
-methods), nor `pk`, `sk`, `t`, `v`, `rev` or `ttl` (the stored item's own attributes).
+A field may not be called `key`, `version` or `timestamps` (the entity's generated `Key()`,
+`Version()` and `Timestamps()` methods), nor `pk`, `sk`, `t`, `v`, `rev`, `ttl`, `dynagoCreated` or
+`dynagoUpdated` (the stored item's own attributes). A field called `createdAt` is fine: dynago's
+own timestamps don't use that name.
 
 ## Keys
 
@@ -197,9 +209,9 @@ indexes:
     sk: "{dueAt}#{loanId}"
     where: { status: active }
     project: [memberId]
-  ByMember:                                     # a member's current loans, soonest due first,
-    strategy: copy                              # read-your-writes (on Loan)
-    pk: "LIB#{libraryId}#MEMBER#{memberId}"
+  ByMember:                                     # a member's current loans, soonest due first
+    pk: "LIB#{libraryId}#MEMBER#{memberId}"     # (on Loan); a copy, because a read through it
+                                                # declares freshness: immediate
     sk: "MYLOAN#{dueAt}#{toolId}#{loanId}"
     where: { status: active }
     project: [toolName, dueAt]
@@ -209,12 +221,13 @@ An index is another key for the same entity. Index names are PascalCase.
 
 | Key | Required | Default | Meaning |
 |---|---|---|---|
-| `strategy` | no | `gsi` | `gsi`: a global secondary index, maintained by DynamoDB, read eventually consistently. `copy`: copy items written by the generated code in the same transaction as the entity, readable strongly consistently. See [Choosing a structure](guides/modelling.md). |
+| `strategy` | no | from the reads | `gsi`: a global secondary index, maintained by DynamoDB, read eventually consistently. `copy`: copy items written by the generated code in the same transaction as the entity, readable strongly consistently. Left out, dynago chooses: `copy` if a read through the index declares `freshness: immediate`, `gsi` otherwise, and the model document says why. See [Modelling](guides/modelling.md). |
 | `pk` | yes | | Partition key template. |
 | `sk` | gsi: no; copy: yes | | Sort key template. A copy's `sk` must start with literal text. |
 | `project` | yes | | What the index holds: `all` (every field), `keys` (key fields only), or a list of fields. Key fields are always included. |
 | `where` | no | | Only index the entity while these [predicates](#predicates) hold (a sparse index). |
 | `doc` | no | | Shown in the model document and on the generated method. |
+| `accept` | no | | Findings about the index recorded as deliberate. See [Accepting findings](#accept). |
 
 Behaviour:
 
@@ -259,6 +272,7 @@ Names are PascalCase.
 | `pk` | no | `UNIQUE#<Entity>.<Name>#{field1}#{field2}…` | Claim partition key. Must use exactly the unique fields (with `sk`). |
 | `sk` | no | `UNIQUE` | Claim sort key. |
 | `doc` | no | | Shown in the model document. |
+| `accept` | no | | Findings about the constraint recorded as deliberate. See [Accepting findings](#accept). |
 
 Behaviour:
 
@@ -303,6 +317,7 @@ the stored attribute names.
 | `shards` | no | `1` | Spread the counter over this many items (1–100) to raise its write throughput; a read sums them with a BatchGetItem. Bounded values cannot be sharded. |
 | `values` | yes | | At least one value. |
 | `doc` | no | | Shown in the model document and on the Go type. |
+| `accept` | no | | Findings about the counter recorded as deliberate. See [Accepting findings](#accept). |
 
 Each value is `count` (short form) or a mapping:
 
@@ -326,27 +341,33 @@ access:
   GetConsistent: { get: key, consistent: true }
   GetByEmail: { get: { unique: Email } }
   History: { query: key, order: desc, page: 20, project: [memberId, status, dueAt] }
-  Overdue: { query: Overdue, range: dueAt, rate: 1 }
+  Overdue: { query: Overdue, range: dueAt, freshness: eventual, rate: 1 }
+  MyLoans: { query: ByMember, freshness: immediate }
   ActiveLoans: { counter: MemberLoans }
+  Export: { scan: true, reason: "The nightly warehouse export reads every loan." }
 ```
 
 Access patterns are the **only** reads the generated store offers: one method each. Names are
-PascalCase and must be unique across `access` and `writes`. Declare exactly one of `get`, `query`
-and `counter`.
+PascalCase and must be unique across `access` and `writes`. Declare exactly one of `get`, `query`,
+`counter` and `scan`.
 
 | Key | Applies to | Default | Meaning |
 |---|---|---|---|
 | `get` | | | `key`: one GetItem by primary key (short form: `Name: get`). `{ unique: Name }`: find the entity holding a unique value — a consistent read of the claim, then of the item. |
 | `query` | | | `key`: query the entity's own partition (items matched by its sort key prefix). An index name: query that index. Exactly one Query request per page. |
 | `counter` | | | Read a counter: one GetItem, or a BatchGetItem over its shards. The counter may belong to any entity of the table, so a library can offer its member counts. |
+| `scan` | | | `true`: read every item of the entity, one page of the **whole table** per call (a Scan filtered to the entity's items, so a page can hold few or none and still have a next cursor). A declared exception for exports and backfills, never for a request path: `dynago check` notes its full-pass cost, and a policy can forbid it. Needs `reason`. |
+| `reason` | scan | | Why a scan is needed. Shown in the model document and on the method. |
+| `freshness` | all | | What the reader needs. `immediate`: it must see writes that just happened (read-your-writes), so the read is strongly consistent, and an index it reads without a declared `strategy` becomes a copy; through a GSI it's an error. `eventual`: a moment's lag is fine, and the read is eventually consistent (half the cost). Left out, the read is as `consistent` says, and the model document marks it "not stated". |
 | `order` | query | `asc` | `asc` or `desc`, by sort key. |
-| `page` | query | `50` | Default page size (items evaluated per request). |
-| `max_page` | query | `max(100, page)` | Largest page a caller may ask for (≤ 1000). |
+| `page` | query, scan | `50` | Default page size (items evaluated per request). |
+| `max_page` | query, scan | `max(100, page)` | Largest page a caller may ask for (≤ 1000). |
 | `range` | query | | A field that directly follows the sort key's literal prefix. Adds optional inclusive `From` / `To` bounds to the query. |
-| `consistent` | get, query, counter | `false`; `true` for a query through a `copy` index | Strongly consistent read (twice the cost). Not allowed on a `gsi` index. A copy index is read consistently unless it says `consistent: false`: read-your-writes is why it's a copy. |
+| `consistent` | get, query, counter, scan | `false`; `true` for a query through a `copy` index | Strongly consistent read (twice the cost). Not allowed on a `gsi` index. A copy index is read consistently unless it says `consistent: false` or `freshness: eventual`: read-your-writes is why it's a copy. Prefer `freshness`, which states the need rather than the mechanism; the two may not contradict each other. |
 | `project` | `query: key` | all fields | Read only these fields (plus key fields): `[name, status]`, or `keys`. Returns a generated `<Entity><Access>Item` type. Saves bandwidth and keeps other fields (secrets, large text) from callers; **DynamoDB still bills the whole item**, so for cheaper lists use an index with a narrow projection. |
 | `doc` | all | | Shown in the model document and on the method. |
-| `rate` | all | | Average calls per second, for the monthly cost estimate. |
+| `rate` | all | | Average calls per second, for the monthly cost estimate and the partition analysis. |
+| `accept` | all | | Findings about the read recorded as deliberate. See [Accepting findings](#accept). |
 
 ## Writes
 
@@ -379,8 +400,9 @@ Declare exactly one kind:
 | `requires` | all | Conditions on other items, checked **in the same transaction**, and changes to them: see [Requires](#requires). |
 | `versioned` | update, delete | `optional` (default) or `required`. Required writes refuse to run without a version from `dynago.From` or `dynago.IfVersion`. See [Concurrency](guides/concurrency.md). |
 | `doc` | all | Shown in the model document and on the method. |
-| `rate` | all | Average calls per second, for the monthly cost estimate. |
-| `hot_key_rate` | all | Peak calls per second against one partition key, for hot-partition warnings. |
+| `rate` | all | Average calls per second, for the monthly cost estimate and the partition analysis. |
+| `hot_key_rate` | all | Peak calls per second against one partition key. Without it, the analysis estimates each partition's share of `rate` from the volumes; with it, this number is used for every partition the write touches. |
+| `accept` | all | Findings about the write recorded as deliberate. See [Accepting findings](#accept). |
 
 How an update runs is decided from the schema:
 
@@ -469,14 +491,76 @@ integer for `int`, a number for `float`, a string for `string`, one of the decla
 `enum`. Fields of other types cannot be compared. A condition on a zero value (`false`, `0`, `""`)
 also matches an absent attribute, since zero values are not stored.
 
-## Estimate
+## Volume
+
+How many items of the entity to expect, at the point in time `workload.horizon` names. Either a
+total, for an entity at the top:
+
+```yaml
+Library:
+  volume: 2000
+```
+
+or a number per item of its **parent**, for everything below:
+
+```yaml
+Member:
+  volume: { typical: 20, max: 2000 }        # per Library: most are small, the biggest has 2,000
+Loan:
+  volume:
+    typical: 20                             # per Tool
+    max: 500
+    by: { Member: { typical: 60, max: 400 } }
+Hold:
+  volume: { typical: 0.02 }                 # per Tool: at most one, and few tools have one
+```
 
 | Key | Meaning |
 |---|---|
-| `items` | Expected number of items of the entity, for the storage estimate. |
+| `per` | The parent the numbers count against. Left out, it is the entity whose partition this one's nests in: its partition key is a prefix of this entity's, and this entity holds its key (by field name, or `ref`). If several entities qualify equally, the one declared first. |
+| `typical` | Items per parent item, typically. Fractions are fine (0.02 holds per tool). |
+| `max` | Items per parent item, at most: the biggest parent. Skew lives here, and so do hot partitions: a partition's largest size and traffic follow from it. Left out, unknown (or 1, when this entity's key is its parent's key). |
+| `by` | How the items spread over other entities whose keys they hold: `{ Member: { typical, max } }` is how many loans one member has. Partitions keyed by that entity's key (a copy or GSI keyed by `memberId`, a counter per member) are counted with it. Without it, the items are assumed to spread evenly, with no known maximum. |
 
-Together with `size` on fields and `rate` / `hot_key_rate` on access patterns and writes, these are
-the assumptions behind the cost report. See [Costs](guides/costs.md).
+Totals multiply down: 2,000 libraries × 60 tools × 20 loans is 2.4 million loans. From the volumes
+and the key templates, `dynago check` and the model document estimate every partition's item
+count, size and busiest key. Counts are approximate by design: declare the order of magnitude and
+the skew you expect, not a forecast. See [Analysis](guides/analysis.md).
+
+## Workload
+
+```yaml
+workload: { horizon: 3 years, peak: 5 }
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `horizon` | | When the volumes are expected ("3 years"). Shown to readers, so everyone argues about the same point in time. |
+| `peak` | `1` | Peak traffic as a multiple of the declared average `rate`s. The partition analysis estimates the busiest key at peak; the monthly cost uses the averages. |
+
+## Accept
+
+```yaml
+Hold:
+  indexes:
+    ByCode:
+      pk: "HOLDCODE#{codeHash}"
+      project: [memberId]
+      accept:
+        unenforced-unique: "Codes are HMACs under a server-side secret: collisions are negligible."
+```
+
+`dynago check` reports findings, each with a rule id and the schema object it is about. `accept`
+records one as deliberate, on the object it is about (the table, an entity, a field, an index, a
+constraint, a counter, a read or a write), with the reason: rule id → reason. An accepted finding
+is listed with its reason in the model document and doesn't fail the build.
+
+- Only warnings and notes can be accepted. An error is a limit or a certain failure: fix the design,
+  or the assumption behind the estimate.
+- An acceptance must match a finding: naming an unknown rule, or a finding the object doesn't have
+  (it was fixed, or moved), is an error, so acceptances don't outlive their reasons.
+- A policy can turn a rule off, or make it an error, for every schema at once. See
+  [Analysis](guides/analysis.md) for every rule and the policy file.
 
 ## Names
 
@@ -520,8 +604,13 @@ Checked by `dynago` beyond the JSON Schema:
   twice. Changes to one counter item from several entities are merged into one update.
 - **TTL.** Items past their `ttl` time are treated as absent by every read and write, even before
   DynamoDB deletes them (which can take days); a create may replace an expired item.
-- **Consistency.** `consistent: true` is not allowed on a GSI query.
-- **Transactions.** `dynago check` reports writes that could exceed 100 items.
+- **Consistency.** `consistent: true` and `freshness: immediate` are not allowed on a GSI query;
+  `freshness` and `consistent` may not contradict each other.
+- **Relations and volumes.** `ref`, `volume.per` and `volume.by` must name entities whose key this
+  entity holds (fields linked by name, or through a `ref` field). A `per`-parent volume needs a
+  parent; volumes must not count per each other in a circle.
+- **Analysis.** Beyond validity, `dynago check` reports findings (limits, hot partitions, risky
+  shapes); errors stop `dynago generate`. See [Analysis](guides/analysis.md).
 - **Versions and generations.** Changing an entity's storage shape (fields and their attributes
   and types, keys, TTL, indexes, claims, counters) requires a higher `version`. A change existing
   items don't fit also needs a new `table.generation`, filled by the migration job; see

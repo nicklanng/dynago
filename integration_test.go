@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/nicklanng/dynago"
-	"github.com/nicklanng/dynago/dynagotest"
+	"github.com/nicklanng/dynago/internal/testdb"
 )
 
 type item struct {
@@ -17,8 +17,8 @@ type item struct {
 // If the SDK retries a create whose first attempt succeeded, the retry must report success, not
 // "already exists": the random revision tells our own item apart from someone else's.
 func TestCreateSurvivesRetryOfItself(t *testing.T) {
-	db := dynagotest.DB(t)
-	tbl := db.Table(dynagotest.Table(t, db, dynago.TableSpec{}))
+	db := testdb.DB(t)
+	tbl := db.Table(testdb.Table(t, db, dynago.TableSpec{}))
 	exists := errors.New("exists")
 	create := func(rev int64) error {
 		put := tbl.Put(item{PK: "A", SK: "A", Rev: rev}).If("attribute_not_exists($)", "PK")

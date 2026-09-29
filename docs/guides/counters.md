@@ -123,9 +123,10 @@ for members without one.
 Every write to a counter serialises on one item. A single item takes at most ~1,000 WRU/s, and
 transactions touching it at the same moment conflict. The generated code retries with backoff
 (about half a second in total by default; see `dynago.SetRetries`), then returns `dynago.ErrConflict`. Declare
-`hot_key_rate` on writes and `dynago check` estimates the load on each counter item. It warns when
+`rate` on writes and volumes on entities, and `dynago check` estimates the load on the busiest
+counter item at peak (or declare `hot_key_rate`, the peak rate on one key, directly). It warns when
 transactions on one item are frequent enough for conflicts to be routine (about 20 a second), and
-suggests a shard count.
+suggests a shard count. See [Analysis](analysis.md).
 
 For counters written very often (every loan across a library, say), set `shards: N`. Writes spread
 over N items (each entity always lands on the same shard), and reads sum them with one

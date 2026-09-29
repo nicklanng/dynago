@@ -2,7 +2,7 @@ DYNAMODB_PORT ?= 8691
 DYNAMODB_CONTAINER ?= dynago-dynamodb-local
 export DYNAGO_TEST_ENDPOINT ?= http://127.0.0.1:$(DYNAMODB_PORT)
 
-.PHONY: test test-unit generate dynamodb-up dynamodb-down lint
+.PHONY: test test-unit test-aws aws-sweep generate dynamodb-up dynamodb-down lint
 
 ## test: run every test, including the examples against DynamoDB Local
 test: dynamodb-up
@@ -11,6 +11,17 @@ test: dynamodb-up
 ## test-unit: run tests that need no DynamoDB (integration tests skip themselves)
 test-unit:
 	DYNAGO_TEST_ENDPOINT= go test ./...
+
+## test-aws: maintainer only: run every test against real tables in the AWS account whose id is in
+## DYNAGO_TEST_AWS, with the default AWS credentials and region. Creates and deletes on-demand tables.
+## To watch it: make test-aws GOTESTFLAGS=-v PKGS=./internal/e2e/
+test-aws:
+	@test -n "$(DYNAGO_TEST_AWS)" || { echo "set DYNAGO_TEST_AWS to the test account's id" >&2; exit 1; }
+	DYNAGO_TEST_ENDPOINT= DYNAGO_REQUIRE_DB=1 go test -count=1 -timeout 60m $(GOTESTFLAGS) $(or $(PKGS),./...)
+
+## aws-sweep: delete test tables an AWS run left behind (older than an hour); -n lists them only
+aws-sweep:
+	go run ./internal/testdb/sweep $(ARGS)
 
 ## generate: regenerate the examples
 generate:

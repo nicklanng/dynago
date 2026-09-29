@@ -54,6 +54,7 @@ type Person struct {
 	Name     string `dynamo:"name,omitempty"`
 
 	loaded *personLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
 }
 
 // personLoaded remembers the stored state an entity was read at, so a write passed the entity
@@ -74,6 +75,11 @@ func (e *Person) Version() string {
 	}
 	return dynago.FormatVersion(e.loaded.rev)
 }
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Person) Timestamps() dynago.Timestamps { return e.stamps }
 
 // clone copies e, including its slices and maps, without its loaded state.
 func (e *Person) clone() Person {
@@ -114,20 +120,24 @@ const personVersion = 2
 
 type personItem struct {
 	Person
-	PK  string `dynamo:"PK"`
-	SK  string `dynamo:"SK"`
-	T   string `dynamo:"_t"`
-	V   int    `dynamo:"_v"`
-	Rev int64  `dynamo:"_rev"`
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
 
 	raw dynamo.Item // as read, for writes to keep attributes this code doesn't know
 }
 
 // personKnown is every attribute this code writes on Person items.
-var personKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "personId": true, "email": true, "name": true}
+var personKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "personId": true, "email": true, "name": true}
 
-func personToItem(e *Person, key dynago.Key, rev int64) *personItem {
-	it := &personItem{Person: *e, PK: key.PK, SK: key.SK, T: "Person", V: personVersion, Rev: rev}
+// personToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func personToItem(e *Person, key dynago.Key, rev int64, created, updated string) *personItem {
+	it := &personItem{Person: *e, PK: key.PK, SK: key.SK, T: "Person", V: personVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
 	return it
 }
 
@@ -179,6 +189,7 @@ func personDecode(raw dynamo.Item) (*personItem, error) {
 		return nil, err
 	}
 	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
 	it.loaded = &personLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
@@ -226,9 +237,11 @@ func (s *PersonStore) Add(ctx context.Context, e *Person) error {
 	if err := e.checkKeyParts(); err != nil {
 		return err
 	}
-	rev := dynago.NewRev()
-	return dynago.Retry(ctx, func() error {
-		put := s.t.Put(personToItem(e, key, rev)).If("attribute_not_exists($)", "PK")
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		put := s.t.Put(personToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
 		ops := []dynago.Op{dynago.CreateOp(key, put, ErrPersonExists, rev)}
 		changes := []dynago.Change{{Owner: key, After: personDerived(e, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
@@ -242,6 +255,10 @@ func (s *PersonStore) Add(ctx context.Context, e *Person) error {
 		e.loaded = &personLoaded{rev: rev, v: personVersion, snapshot: e.clone()}
 		return nil
 	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
 }
 
 // ---- migration ----
@@ -317,6 +334,7 @@ func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item, fence dynago.O
 		if err != nil {
 			return err
 		}
+		e.stamps = dynago.StampsOf(raw)
 		src, srcRev, err := dynago.SourceOf(raw)
 		if err != nil {
 			return err
@@ -385,7 +403,8 @@ func (s *PersonStore) migrate(ctx context.Context, e *Person, src dynago.Key, sr
 			before = dynago.Unbounded(personDerived(&it.Person, key))
 			rev = it.Rev + 1
 		}
-		item, err := dynago.MigrationItem(personToItem(e, key, rev), src, srcRev)
+		// The copy keeps the source's timestamps: moving to a new table doesn't change the item.
+		item, err := dynago.MigrationItem(personToItem(e, key, rev, dynago.FmtStamp(e.stamps.Created), dynago.FmtStamp(e.stamps.Updated)), src, srcRev)
 		if err != nil {
 			return err
 		}

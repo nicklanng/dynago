@@ -18,22 +18,22 @@ import (
 	"github.com/guregu/dynamo/v2"
 
 	"github.com/nicklanng/dynago"
-	"github.com/nicklanng/dynago/dynagotest"
 	"github.com/nicklanng/dynago/examples/toollibrary"
+	"github.com/nicklanng/dynago/internal/testdb"
 )
 
 var ctx = context.Background()
 
 type env struct {
 	st      *toollibrary.Store
-	counter *dynagotest.Requests
+	counter *testdb.Requests
 	table   dynamo.Table
 }
 
 func setup(t *testing.T) env {
 	t.Helper()
-	db, reads := dynagotest.CountingDB(t)
-	name := dynagotest.Table(t, db, toollibrary.TableSpec)
+	db, reads := testdb.CountingDB(t)
+	name := testdb.Table(t, db, toollibrary.TableSpec)
 	return env{st: toollibrary.New(db, name), counter: reads, table: db.Table(name)}
 }
 

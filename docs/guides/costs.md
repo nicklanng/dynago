@@ -1,20 +1,20 @@
-# Costs and risks
+# Costs
 
 `dynago check` prints, and the model document includes, an estimate of every access pattern's and
-write's cost, the table's storage, and a list of design risks. It exists so a design can be
-reviewed on numbers before it ships, and so the numbers are argued about as assumptions, not
-opinions.
+write's cost and the table's storage. It exists so a design can be reviewed on numbers before it
+ships, and so the numbers are argued about as assumptions, not opinions. The same numbers feed
+the [partition analysis and findings](analysis.md).
 
 ```
-Loan (v1)  item 464 B / 1.9 KB  storage 2.68 GB ($0.67/month)
-  read   Overdue      Query                    2.5/5 RRU
+Loan (v1)  item 464 B / 1.9 KB  2,400,000 items  storage 3.22 GB ($0.80/month)
+  read   Overdue      Query                    2.5/5 RRU  $0.01/month
   read   Totals       BatchGetItem (4 shards)  2 RRU
   write  Borrow       tx 8 items               23/61 WRU  $74.52/month
-  write  Return       tx 6 items + read        19/57 WRU
+  write  Return       tx 6 items + read        19/57 WRU  $62.21/month
 
-warning: Tool: manual (p99 19.5 KB) makes every write cost up to 21 WRU (42 in a
-transaction), including writes that never change it: Relabel, Retire, Loan.Borrow, Loan.Return.
-Consider moving it to an entity of its own, written only when it changes.
+warning [large-field] entity Tool: manual (p99 19.5 KB) makes every write cost up to 21 WRU (42
+in a transaction), including writes that never change it: Relabel, Retire, Loan.Borrow,
+Loan.Return. Consider moving it to an entity of its own, written only when it changes.
 ```
 
 The warning is worth reading closely: marking the tool on loan rewrites the whole tool item, so a
@@ -26,9 +26,9 @@ they change the tool through `requires`.
 | Input | Where | Used for |
 |---|---|---|
 | Field sizes | `size: p50/p99` on fields (defaults per type) | Item and index entry sizes |
-| Item counts | `estimate: { items: N }` on entities | Storage |
-| Call rates | `rate:` on access patterns and writes (average per second) | Monthly throughput cost |
-| Peak per key | `hot_key_rate:` on writes | Hot partition and hot counter warnings |
+| Volumes | `volume` on entities: a total, or typical and max per parent ([Volume](../schema.md#volume)) | Storage, and the partition analysis |
+| Call rates | `rate:` on access patterns and writes (average per second) | Monthly throughput cost, and each partition's busiest key |
+| Peak | `workload.peak`, and `hot_key_rate:` on writes | Hot partition and hot counter findings |
 | Prices | `-prices wru,rru,gb` (default: us-east-1 on-demand, Standard table class, as published in September 2026: $0.625/M WRU, $0.125/M RRU, $0.25/GB-month) | Dollars. The defaults are fixed figures, so check them against the current price list and your region. The free tier (25 GB of storage a month) and the Standard-IA table class aren't modelled. |
 
 Anything not declared is not costed; the report lists its assumptions.
@@ -51,24 +51,12 @@ needs a transaction, whether an index entry moves, whether it reads first (read-
 attribute names and declared value sizes, assuming every field is present. Empty fields aren't
 stored, so real items are usually smaller.
 
-## Risks it flags
+## Findings
 
-| Severity | Finding |
-|---|---|
-| error | An item's p99 size exceeds DynamoDB's 400 KB limit |
-| error | A write can touch more than 100 items (the transaction limit; transactions are also limited to 4 MB in total, which isn't estimated) |
-| error | A counter item would take more than a partition's ~1,000 WRU/s |
-| warning | A counter item is written by more than ~20 transactions a second: conflicts become routine (suggests a shard count) |
-| warning | A partition key takes more than half its ~1,000 WRU/s |
-| warning | An item's p99 size exceeds 100 KB (every read and write of it is expensive) |
-| warning | A large field (≥ 8 KB at p99) on an entity with writes that never change it: each of those writes still pays for it |
-| warning | A `copy_of` field: another entity's value that your code must keep in sync |
-| warning | TTL on an entity with counters, claims or copies (expiry doesn't release them) |
-| note | A counter item written by several transactions a second (occasional retried conflicts) |
-| note | A GSI projecting ALL (every write stores the item twice) |
-| note | A GSI shared by several entities |
-
-`dynago generate` refuses to write output while there are errors.
+The risks the estimates reveal (items over the size limits, transactions over 100 items, hot
+counters and partitions, large fields rewritten by unrelated writes) are findings with rule ids,
+listed in [Analysis](analysis.md#findings). `dynago generate` refuses to write output while the
+design has errors (or whatever a policy fails on).
 
 ## How far to trust it
 

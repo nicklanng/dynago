@@ -441,13 +441,30 @@ func (j *job) segment(ctx context.Context, pass int, phase string, seg, segments
 }
 
 func (j *job) copyItems(ctx context.Context, items []dynamo.Item, cp *migSegment, limit *limiter, fence Op) error {
-	for _, raw := range items {
+	current, err := j.copiedAlready(ctx, items)
+	if err != nil {
+		return err
+	}
+	for i, raw := range items {
 		if !j.Types[ItemType(raw)] {
 			cp.Skipped++
 			continue
 		}
 		if err := limit.wait(ctx); err != nil {
 			return err
+		}
+		if current[i] {
+			// Already copied at this revision (or not to be copied): nothing to write, as Copy
+			// would find, but without its read.
+			src, _, err := SourceOf(raw)
+			if err == nil {
+				err = j.clearConflict(ctx, src, fence)
+			}
+			if err != nil {
+				return err
+			}
+			cp.Same++
+			continue
 		}
 		switch copied, err := j.copyOne(ctx, raw, fence, 0); {
 		case err != nil:
@@ -459,6 +476,64 @@ func (j *job) copyItems(ctx context.Context, items []dynamo.Item, cp *migSegment
 		}
 	}
 	return nil
+}
+
+// copiedAlready reports which items of a page need no copy: the new table already holds their copy
+// at their current revision, or they aren't copied (expired). It reads the copies with one
+// consistent BatchGetItem for the page, where Copy would read each item's copy on its own: on a
+// catch-up pass, and on the final one while writes are stopped, most items are like this.
+func (j *job) copiedAlready(ctx context.Context, items []dynamo.Item) ([]bool, error) {
+	current := make([]bool, len(items))
+	targets := make([]Key, len(items))
+	var keys []dynamo.Keyed
+	seen := map[Key]bool{}
+	for i, raw := range items {
+		if !j.Types[ItemType(raw)] {
+			continue
+		}
+		key, ok, err := j.KeyOf(raw)
+		switch {
+		case err != nil:
+			continue // Copy reports it
+		case !ok:
+			current[i] = true // expired, or not an entity of this generation
+			continue
+		}
+		targets[i] = key
+		if !seen[key] {
+			seen[key] = true
+			keys = append(keys, dynamo.Keys{key.PK, key.SK})
+		}
+	}
+	if len(keys) == 0 {
+		return current, nil
+	}
+	var copies []dynamo.Item
+	err := j.DB.Table(j.To).Batch(AttrPK, AttrSK).Get(keys...).Consistent(true).All(ctx, &copies)
+	if err != nil && !errors.Is(err, dynamo.ErrNotFound) {
+		return nil, err
+	}
+	byKey := map[Key]dynamo.Item{}
+	for _, c := range copies {
+		k, _, err := SourceOf(c)
+		if err != nil {
+			return nil, err
+		}
+		byKey[k] = c
+	}
+	for i, raw := range items {
+		c, ok := byKey[targets[i]]
+		if current[i] || !ok {
+			continue
+		}
+		src, rev, err := SourceOf(raw)
+		if err != nil {
+			continue // Copy reports it
+		}
+		same, _ := MigratedFrom(c, src, rev)
+		current[i] = same
+	}
+	return current, nil
 }
 
 // copyOne copies an item of the old table, recording a conflict if it can't be copied. It reports

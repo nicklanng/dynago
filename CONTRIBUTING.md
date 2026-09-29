@@ -13,7 +13,11 @@ send; pull requests are welcome too.
 | `internal/schema/` | YAML parsing (`raw.go`), resolution and validation into a model (`resolve.go`, `model.go`). |
 | `internal/keytmpl/` | Key template parsing. |
 | `internal/lock/` | Storage shapes, the lock file, version rules. |
-| `internal/cost/` | Size, capacity and cost estimates and findings. |
+| `internal/cost/` | Size, capacity and cost estimates, per call and per item touched. |
+| `internal/analysis/` | The design analysis: partitions, traffic, lifecycles, guarantees, GSI/copy alternatives, findings and their rules, acceptance, policy. |
+| `internal/arch/` | The analysed design as a snapshot (`check -json`) and the architecture diff (`dynago diff`). |
+| `internal/vet/` | `dynago vet`: DynamoDB calls outside generated code. |
+| `internal/testdb/` | The DynamoDB this repository's tests use: DynamoDB Local, or real tables in a test AWS account (`make test-aws`). |
 | `internal/gen/gocode/` | Go generator. |
 | `internal/gen/docs/` | Model document generator. |
 | `internal/gen/infra/` | Terraform and CreateTable JSON. |
@@ -31,7 +35,24 @@ make lint        # gofmt, go vet and golangci-lint, generated code included
 ```
 
 `make test` runs a container named `dynago-dynamodb-local` on port 8691; `make dynamodb-down`
-removes it. Tests that need DynamoDB read `DYNAGO_TEST_ENDPOINT` and skip without it, unless
+removes it.
+
+### Against real DynamoDB (maintainers)
+
+DynamoDB Local differs from the service where dynago makes promises: transaction cancellation
+reasons, retried transactions, GSIs that lag a write. Before a release, run the suite against real
+tables in a test AWS account:
+
+```sh
+DYNAGO_TEST_AWS=123456789012 make test-aws    # the account id; credentials and region from your AWS config
+DYNAGO_TEST_AWS=123456789012 make aws-sweep   # delete tables a run left behind (ARGS=-n to list only)
+```
+
+The tests refuse to run if the credentials belong to another account. Each test creates an
+on-demand table named `dynagotest-…`, tagged with its creation time, and deletes it when it ends;
+the sweeper deletes only tables with that prefix and tag. A run costs cents. Tests use the
+internal `internal/testdb` package for this; `dynagotest`, for users' own tests, stays DynamoDB
+Local only. Tests that need DynamoDB read `DYNAGO_TEST_ENDPOINT` and skip without it, unless
 `DYNAGO_REQUIRE_DB` is set (as `make test` does), in which case they fail. CI
 (`.github/workflows/ci.yml`) runs `make lint` and `make test`.
 

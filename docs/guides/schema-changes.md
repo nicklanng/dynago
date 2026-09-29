@@ -20,8 +20,10 @@ Every entity has a `version` (default 1), and every item stores the version it w
 - uniqueness claims;
 - counters, their values and shard counts.
 
-Docs, sizes, examples, access patterns, writes, rates and limits are not part of the shape.
-Changing them never needs a version bump.
+Docs, sizes, examples, volumes, workload, access patterns, writes, rates, limits and accepted
+findings are not part of the shape. Changing them never needs a version bump, with one exception:
+a read's `freshness` decides the strategy of an index that doesn't declare one, so changing it can
+turn a GSI into a copy (or back), which is a shape change. `dynago diff` shows it.
 
 **Changing the shape requires a higher version.** `dynago generate` refuses otherwise, and names the
 change:

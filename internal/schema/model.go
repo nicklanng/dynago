@@ -15,6 +15,9 @@ const (
 	AttrType = "_t"
 	AttrVer  = "_v"
 	AttrRev  = "_rev"
+	// AttrCreated and AttrUpdated hold when dynago first wrote an item and last changed it.
+	AttrCreated = "_created"
+	AttrUpdated = "_updated"
 )
 
 // Model is a validated, resolved schema file.
@@ -27,6 +30,138 @@ type Model struct {
 	GSIs     []*GSI
 	// Previous is the generation the migration job copies from, set by the lock.
 	Previous *Previous
+	Workload Workload
+	// Relations are the links between entities: partition nesting, references, requires.
+	Relations []*Relation
+	// Accepts are findings the schema records as deliberate, each with its reason.
+	Accepts []*Acceptance
+}
+
+// Entity returns the named entity, or nil.
+func (m *Model) Entity(name string) *Entity {
+	for _, e := range m.Entities {
+		if e.Name == name {
+			return e
+		}
+	}
+	return nil
+}
+
+// Workload holds the table-wide workload assumptions.
+type Workload struct {
+	// Peak multiplies every declared (average) rate to give the peak rate. 1 when not declared.
+	Peak         float64
+	PeakDeclared bool
+	// Horizon says when the declared volumes are expected (free text), or "".
+	Horizon string
+}
+
+// SubjectKind is the kind of schema object a finding is about.
+type SubjectKind string
+
+// Subject kinds.
+const (
+	SubjectTable   SubjectKind = "table"
+	SubjectEntity  SubjectKind = "entity"
+	SubjectField   SubjectKind = "field"
+	SubjectIndex   SubjectKind = "index"
+	SubjectUnique  SubjectKind = "unique"
+	SubjectCounter SubjectKind = "counter"
+	SubjectAccess  SubjectKind = "access"
+	SubjectWrite   SubjectKind = "write"
+)
+
+// Subject names a schema object: the table, an entity, or something declared on an entity.
+type Subject struct {
+	Kind   SubjectKind
+	Entity string
+	Name   string
+}
+
+// String renders the subject as people write it: "table", "Loan", "Loan.Borrow".
+func (s Subject) String() string {
+	switch {
+	case s.Kind == SubjectTable:
+		return "table"
+	case s.Name == "":
+		return s.Entity
+	}
+	return s.Entity + "." + s.Name
+}
+
+// Acceptance records a finding as a deliberate decision.
+type Acceptance struct {
+	Subject Subject
+	Rule    string
+	Reason  string
+	Line    int
+}
+
+// RelationKind says how a relation between two entities is known.
+type RelationKind string
+
+// Relation kinds.
+const (
+	// RelNests: the From items live in (or under) the To item's partition.
+	RelNests RelationKind = "nests"
+	// RelRef: a field of From declares `ref: To`.
+	RelRef RelationKind = "ref"
+	// RelRequires: a write of From requires a To item.
+	RelRequires RelationKind = "requires"
+	// RelVolume: From's volume is given per To (volume.per or volume.by).
+	RelVolume RelationKind = "volume"
+)
+
+// Relation links items of one entity (From) to the item of another (To) whose key they hold.
+type Relation struct {
+	From, To *Entity
+	// Key maps each key field of To (Target) to the From field holding its value (Source).
+	Key []RequireKey
+	// Kinds lists how the relation is known, in the order found.
+	Kinds []RelationKind
+	// Writes are the From writes whose requires reach To.
+	Writes []*Write
+}
+
+// Is reports whether the relation is known in the given way.
+func (r *Relation) Is(k RelationKind) bool {
+	for _, x := range r.Kinds {
+		if x == k {
+			return true
+		}
+	}
+	return false
+}
+
+// OneToOne reports whether each To item has at most one From item: From's key is To's key.
+func (r *Relation) OneToOne() bool {
+	fromKey := map[*Field]bool{}
+	for _, f := range r.From.KeyFields() {
+		fromKey[f] = true
+	}
+	for _, k := range r.Key {
+		delete(fromKey, k.Source)
+	}
+	return len(fromKey) == 0
+}
+
+// Volume is how many items of an entity to expect.
+type Volume struct {
+	Declared bool
+	// Total is the number of items in the table, when given as one number.
+	Total float64
+	// Per is the parent the per-parent numbers count against (nil with a Total).
+	Per *Relation
+	// Typical and Max are items per parent item; Max is 0 when unknown.
+	Typical, Max float64
+	// By gives the spread over other entities the items refer to.
+	By []*VolumeBy
+}
+
+// VolumeBy is how many items of an entity each item of a related entity has.
+type VolumeBy struct {
+	Relation     *Relation
+	Typical, Max float64
 }
 
 // Output holds the paths of generated files, relative to the schema file's directory.
@@ -108,6 +243,14 @@ type Field struct {
 	CopyOf       *Field
 	CopyOfEntity *Entity
 	copyOfRaw    string
+	// SnapshotOf is the field of another entity whose value this field takes when written
+	// (snapshot_of), deliberately never updated after.
+	SnapshotOf       *Field
+	SnapshotOfEntity *Entity
+	snapshotOfRaw    string
+	// Ref is the entity whose key this field holds (ref), or nil.
+	Ref    *Entity
+	refRaw string
 	// Required fields may not be written with their zero value.
 	Required bool
 }
@@ -159,9 +302,15 @@ type Entity struct {
 	Counters []*Counter
 	Access   []*Access
 	Writes   []*Write
-	Items    int64
+	Volume   Volume
+	// Count is the expected number of items in the table, from the volumes; 0 when unknown.
+	Count float64
+	// Parent is the relation to the entity the volume counts against, or that the entity's
+	// partition nests in; nil for a top-level entity.
+	Parent *Relation
 
 	fieldsByName map[string]*Field
+	rawVolume    RawVolume
 }
 
 // Field returns the named field, or nil.
@@ -263,6 +412,10 @@ type Index struct {
 	Where      []*Pred
 	Doc        string
 	GSI        *GSI
+	// StrategyInferred is true when the schema left strategy out and dynago chose it from the
+	// freshness its reads need; StrategyReason says why.
+	StrategyInferred bool
+	StrategyReason   string
 	// PKAttr and SKAttr are the attribute names holding the rendered keys: the GSI's key
 	// attributes, or PK/SK for copy items.
 	PKAttr, SKAttr string
@@ -362,6 +515,20 @@ const (
 	AccessGetUnique AccessKind = "get_unique"
 	AccessQuery     AccessKind = "query"
 	AccessCounter   AccessKind = "counter"
+	AccessScan      AccessKind = "scan"
+)
+
+// Freshness is how up to date a read must be.
+type Freshness string
+
+// Freshness requirements.
+const (
+	// FreshnessUnstated: the schema doesn't say.
+	FreshnessUnstated Freshness = ""
+	// FreshnessImmediate: a caller must see its own writes (read-your-writes).
+	FreshnessImmediate Freshness = "immediate"
+	// FreshnessEventual: a moment's lag is fine.
+	FreshnessEventual Freshness = "eventual"
 )
 
 // Access is a declared read.
@@ -378,6 +545,9 @@ type Access struct {
 	MaxPage    int
 	Range      *Field
 	Consistent bool
+	Freshness  Freshness
+	// Reason says why a scan is needed.
+	Reason string
 	// Project lists the fields a query on the entity's own partition reads (empty: all).
 	Project []*Field
 	Doc     string

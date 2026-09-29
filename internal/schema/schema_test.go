@@ -142,6 +142,22 @@ func TestValidationErrors(t *testing.T) {
 		{"create false", "    writes:\n      W: { create: false, set: { name: x } }\n", "create: false is not meaningful"},
 		{"requires its own item", "    writes:\n      W: { update: [name], requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, when: { count: 1 } } } }\n", "that is the item being written"},
 		{"requires a counter it updates", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, when: { n: 1 } } } }\n", "also updates counter C"},
+		{"freshness on a GSI", "    indexes:\n      ByName: { strategy: gsi, pk: \"N#{tenantId}\", sk: \"N#{thingId}\", project: keys }\n    access:\n      L: { query: ByName, freshness: immediate }\n", "freshness: immediate needs read-your-writes, but ByName is a GSI"},
+		{"freshness contradicts consistent", "    access:\n      G: { get: key, freshness: eventual, consistent: true }\n", "contradicts freshness: eventual"},
+		{"immediate but not consistent", "    access:\n      G: { get: key, freshness: immediate, consistent: false }\n", "needs a consistent read"},
+		{"unknown freshness", "    access:\n      G: { get: key, freshness: soon }\n", "freshness must be immediate or eventual"},
+		{"inferred copy with bad keys", "    indexes:\n      ByName: { pk: \"N#{tenantId}\", sk: \"{name}\", project: keys }\n    access:\n      L: { query: ByName, freshness: immediate }\n", "(a copy, because L needs immediate freshness)"},
+		{"scan without reason", "    access:\n      All: { scan: true }\n", "give the reason it is needed"},
+		{"reason on a query", "    access:\n      L: { query: key, reason: because }\n", "reason applies to scans"},
+		{"scan with order", "    access:\n      All: { scan: true, reason: export, order: desc }\n", "a scan takes page and max_page"},
+		{"copy and snapshot", "      other: { type: string, copy_of: Thing.name, snapshot_of: Thing.name }\n", "copy_of and snapshot_of are exclusive"},
+		{"accept without reason", "    accept: { unused-index: \"\" }\n", "give the reason the finding is acceptable"},
+		{"volume without typical", "    volume: { max: 5 }\n", "give typical"},
+		{"volume max under typical", "    volume: { per: Thing, typical: 5, max: 2 }\n", "need 0 <= typical <= max"},
+		{"volume per unknown", "    volume: { per: Nope, typical: 5 }\n", "per: Nope is not an entity"},
+		{"volume with nothing to count per", "    volume: { typical: 5 }\n", "doesn't nest in another entity's"},
+		{"ref to unknown entity", "      owner: { type: string, ref: Nope }\n", "ref: Nope is not an entity"},
+		{"ref that can't key", "      owner: { type: int, ref: Thing }\n", "Thing's key needs"},
 		{"requires unknown counter value", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, when: { m: 0 } } } }\n", "m is not a value of counter C"},
 	}
 	for _, c := range cases {
@@ -272,5 +288,142 @@ func TestCopyQueriesDefaultToConsistent(t *testing.T) {
 	access := m.Entities[0].Access
 	if !access[0].Consistent || access[1].Consistent {
 		t.Fatalf("Mine consistent=%t, Cheap consistent=%t", access[0].Consistent, access[1].Consistent)
+	}
+}
+
+// A read needing immediate freshness makes an index without a strategy a copy; otherwise it is a
+// GSI. Both are recorded as chosen, with the reason.
+func TestFreshnessChoosesTheStrategy(t *testing.T) {
+	src := base + `    indexes:
+      Mine: { pk: "N#{tenantId}", sk: "MINE#{name}#{thingId}", project: keys }
+      Theirs: { pk: "N#{tenantId}", sk: "{name}#{thingId}", project: keys }
+    access:
+      L: { query: Mine, freshness: immediate }
+      M: { query: Theirs, freshness: eventual }
+`
+	m, err := Parse([]byte(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mine, theirs := m.Entities[0].Indexes[0], m.Entities[0].Indexes[1]
+	if mine.Strategy != StrategyCopy || !mine.StrategyInferred || mine.StrategyReason != "L needs immediate freshness" {
+		t.Errorf("Mine = %s (%s)", mine.Strategy, mine.StrategyReason)
+	}
+	if theirs.Strategy != StrategyGSI || !theirs.StrategyInferred {
+		t.Errorf("Theirs = %s", theirs.Strategy)
+	}
+	if a := m.Entities[0].Access; !a[0].Consistent || a[1].Consistent {
+		t.Error("immediate reads must be consistent, eventual ones not")
+	}
+}
+
+// A ref field supplies the key field no same-named field can: with a generic id, the target's id;
+// next to a same-named reference, the target's last key field.
+func TestRefBesideSameNamedFields(t *testing.T) {
+	m, err := Parse([]byte(`
+dynago: 1
+package: blog
+table: { name: blog }
+entities:
+  User:
+    fields: { id: string }
+    key: { pk: "USER#{id}", sk: "USER" }
+    volume: 100
+  Post:
+    fields: { id: string, userId: { type: string, ref: User } }
+    key: { pk: "POST#{id}", sk: "POST" }
+    volume: { per: User, typical: 5, max: 50 }
+  Member:
+    fields: { libraryId: string, memberId: string }
+    key: { pk: "LIB#{libraryId}", sk: "MEMBER#{memberId}" }
+  Loan:
+    fields: { libraryId: string, loanId: string, memberId: string, stewardId: { type: string, ref: Member } }
+    key: { pk: "LIB#{libraryId}", sk: "LOAN#{loanId}" }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	post := m.Entity("Post")
+	if p := post.Parent; p == nil || p.To.Name != "User" || p.Key[0].Source.Name != "userId" || p.OneToOne() {
+		t.Fatalf("Post's parent = %+v", post.Parent)
+	}
+	var steward *Relation
+	for _, r := range m.Relations {
+		if r.From.Name == "Loan" && r.To.Name == "Member" && r.Is(RelRef) {
+			steward = r
+		}
+	}
+	if steward == nil || steward.Key[0].Source.Name != "libraryId" || steward.Key[1].Source.Name != "stewardId" {
+		t.Fatalf("Loan → Member by stewardId = %+v", steward)
+	}
+}
+
+// Parents come from partition nesting, counts multiply down from totals, and ref links a field
+// to another entity's key.
+func TestRelationsAndVolumes(t *testing.T) {
+	m, err := Parse([]byte(`
+dynago: 1
+package: shop
+table: { name: shop }
+entities:
+  Shop:
+    fields: { shopId: string }
+    key: { pk: "SHOP#{shopId}", sk: "SHOP" }
+    volume: 50
+  Customer:
+    fields: { shopId: string, customerId: string }
+    key: { pk: "SHOP#{shopId}", sk: "CUST#{customerId}" }
+    volume: { typical: 200, max: 10000 }
+  Order:
+    fields: { shopId: string, orderId: string, buyer: { type: string, ref: Customer } }
+    key: { pk: "SHOP#{shopId}#ORDER#{orderId}", sk: "ORDER" }
+    volume: { typical: 1000, by: { Customer: { typical: 5, max: 300 } } }
+  Note:
+    fields: { shopId: string, orderId: string }
+    key: { pk: "SHOP#{shopId}#ORDER#{orderId}", sk: "NOTE" }
+    volume: { typical: 0.1 }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := func(name string) string {
+		if p := m.Entity(name).Parent; p != nil {
+			return p.To.Name
+		}
+		return ""
+	}
+	for e, want := range map[string]string{"Shop": "", "Customer": "Shop", "Order": "Shop", "Note": "Order"} {
+		if got := parent(e); got != want {
+			t.Errorf("%s's parent = %q, want %q", e, got, want)
+		}
+	}
+	if c := m.Entity("Order").Count; c != 50000 {
+		t.Errorf("orders = %v", c)
+	}
+	if !m.Entity("Note").Parent.OneToOne() || m.Entity("Note").Volume.Max != 1 {
+		t.Error("a note keyed like its order is at most one per order")
+	}
+	var ref *Relation
+	for _, r := range m.Relations {
+		if r.From.Name == "Order" && r.To.Name == "Customer" {
+			ref = r
+		}
+	}
+	if ref == nil || !ref.Is(RelRef) || !ref.Is(RelVolume) || ref.Key[1].Source.Name != "buyer" {
+		t.Errorf("Order → Customer = %+v", ref)
+	}
+	// Workload peaks below 1 aren't peaks.
+	if _, err := Parse([]byte(strings.Replace(base, "table: { name: things }", "table: { name: things }\nworkload: { peak: 0.5 }", 1))); err == nil || !strings.Contains(err.Error(), "must be 1 or more") {
+		t.Errorf("peak 0.5: %v", err)
+	}
+}
+
+func TestNumber(t *testing.T) {
+	for f, want := range map[float64]string{
+		0: "0", 2000000: "2,000,000", 1234.5: "1,234.5", 0.02: "0.02", 0.004: "0.004", 0.001: "0.001", -1500: "-1,500", 12.345: "12.35", 0.999: "1", 999.999: "1,000",
+	} {
+		if got := Number(f); got != want {
+			t.Errorf("Number(%v) = %q, want %q", f, got, want)
+		}
 	}
 }

@@ -92,7 +92,8 @@ old table's traffic.
 
 **Cost of a pass.** Every pass reads:
 - the whole old table;
-- for each entity, its copy in the new table;
+- for each entity, its copy in the new table, a page of 100 at a time (one BatchGetItem), to
+  skip what is already copied at its current revision;
 - the whole new table and, for every copy in it, its source in the old table (a second read of
   every entity, by key), to find copies whose source is gone or now converts to another key.
 

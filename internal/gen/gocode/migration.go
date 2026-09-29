@@ -257,6 +257,7 @@ func (g *gen) migrationDispatch() {
 		g.p("if err != nil {")
 		g.p("return err")
 		g.p("}")
+		g.p("e.stamps = dynago.StampsOf(raw)")
 		g.p("src, srcRev, err := dynago.SourceOf(raw)")
 		g.p("if err != nil {")
 		g.p("return err")
@@ -362,7 +363,8 @@ func (g *gen) migrateEntity(e *schema.Entity) {
 	}
 	g.p("rev = it.Rev + 1")
 	g.p("}")
-	g.p("item, err := dynago.MigrationItem(%sToItem(e, key, rev), src, srcRev)", lo)
+	g.p("// The copy keeps the source's timestamps: moving to a new table doesn't change the item.")
+	g.p("item, err := dynago.MigrationItem(%sToItem(e, key, rev, dynago.FmtStamp(e.stamps.Created), dynago.FmtStamp(e.stamps.Updated)), src, srcRev)", lo)
 	g.p("if err != nil {")
 	g.p("return err")
 	g.p("}")

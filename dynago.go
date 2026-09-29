@@ -80,6 +80,10 @@ const (
 	AttrType = "_t"
 	AttrVer  = "_v"
 	AttrRev  = "_rev"
+	// AttrCreated and AttrUpdated hold when dynago first wrote an item and when it last changed
+	// it, in TimeLayout. Items written before dynago kept them lack them until rewritten.
+	AttrCreated = "_created"
+	AttrUpdated = "_updated"
 )
 
 // Key is a table primary key.

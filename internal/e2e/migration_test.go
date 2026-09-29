@@ -11,8 +11,8 @@ import (
 	"github.com/guregu/dynamo/v2"
 
 	"github.com/nicklanng/dynago"
-	"github.com/nicklanng/dynago/dynagotest"
 	"github.com/nicklanng/dynago/examples/toollibrary"
+	"github.com/nicklanng/dynago/internal/testdb"
 )
 
 // generations sets up a migration: the previous generation's table (written with the current
@@ -28,10 +28,10 @@ type generations struct {
 
 func setupGenerations(t *testing.T) *generations {
 	t.Helper()
-	db := dynagotest.DB(t)
-	g := &generations{db: db, base: dynagotest.UniqueName(t, "migrate")}
-	dynagotest.TableNamed(t, db, g.base+"-g1", toollibrary.TableSpec)
-	dynagotest.TableNamed(t, db, toollibrary.TableName(g.base), toollibrary.TableSpec)
+	db := testdb.DB(t)
+	g := &generations{db: db, base: testdb.UniqueName(t, "migrate")}
+	testdb.TableNamed(t, db, g.base+"-g1", toollibrary.TableSpec)
+	testdb.TableNamed(t, db, toollibrary.TableName(g.base), toollibrary.TableSpec)
 	g.old = toollibrary.New(db, g.base+"-g1")
 	g.new = toollibrary.New(db, toollibrary.TableName(g.base))
 	g.oldTable = db.Table(g.base + "-g1")
@@ -112,8 +112,16 @@ func TestMigrationCopiesAndCatchesUp(t *testing.T) {
 	if c, _ := nu.Libraries.ToolStats(ctx, toollibrary.ToolCountsKey{LibraryID: "lib1"}); c != (toollibrary.ToolCounts{Available: 2, OnLoan: 1}) {
 		t.Fatalf("tool counts rebuilt as %+v", c)
 	}
+	// Copies keep their source's timestamps: moving tables doesn't change an item.
+	oldT3, err := old.Tools.Get(ctx, toollibrary.ToolKey{LibraryID: "lib1", ToolID: "t3"})
+	must(t, err)
+	newT3, err := nu.Tools.Get(ctx, toollibrary.ToolKey{LibraryID: "lib1", ToolID: "t3"})
+	must(t, err)
+	if oldT3.Timestamps().Created.IsZero() || newT3.Timestamps() != oldT3.Timestamps() {
+		t.Fatalf("migrated timestamps %+v, source %+v", newT3.Timestamps(), oldT3.Timestamps())
+	}
 	// Each copy records where it came from.
-	if it := dynagotest.RawItem(t, g.db.Table(toollibrary.TableName(g.base)), "LIB#lib1#TOOL#t1", "TOOL"); it["_msrcPK"] != "LIB#lib1#TOOL#t1" {
+	if it := testdb.RawItem(t, g.db.Table(toollibrary.TableName(g.base)), "LIB#lib1#TOOL#t1", "TOOL"); it["_msrcPK"] != "LIB#lib1#TOOL#t1" {
 		t.Fatalf("copied tool = %v", it)
 	}
 

@@ -178,6 +178,7 @@ func (g *gen) entity(e *schema.Entity) {
 	}
 	g.p("")
 	g.p("loaded *%sLoaded // set when the store returns the entity", lowerFirst(e.GoName))
+	g.p("stamps dynago.Timestamps")
 	g.p("}")
 	g.p("")
 	g.p("// %sLoaded remembers the stored state an entity was read at, so a write passed the entity", lowerFirst(e.GoName))
@@ -198,6 +199,11 @@ func (g *gen) entity(e *schema.Entity) {
 	g.p("}")
 	g.p("return dynago.FormatVersion(e.loaded.rev)")
 	g.p("}")
+	g.p("")
+	g.p("// Timestamps says when the stored item was first written and last changed, by the writing")
+	g.p("// server's clock. It is zero for an entity the store didn't return or create, and a time is")
+	g.p("// zero if the item was written before dynago kept it.")
+	g.p("func (e *%s) Timestamps() dynago.Timestamps { return e.stamps }", e.GoName)
 	g.p("")
 	g.clone(e)
 	g.checkKeyParts(e)
@@ -238,6 +244,8 @@ func (g *gen) entity(e *schema.Entity) {
 	g.p("T string `dynamo:\"_t\"`")
 	g.p("V int `dynamo:\"_v\"`")
 	g.p("Rev int64 `dynamo:\"_rev\"`")
+	g.p("DynagoCreated string `dynamo:\"_created,omitempty\"`")
+	g.p("DynagoUpdated string `dynamo:\"_updated,omitempty\"`")
 	g.p("")
 	g.p("raw dynamo.Item // as read, for writes to keep attributes this code doesn't know")
 	for _, ix := range e.Indexes {
@@ -255,8 +263,10 @@ func (g *gen) entity(e *schema.Entity) {
 	g.p("}")
 	g.p("")
 	g.knownAttrs(e)
-	g.p("func %sToItem(e *%s, key dynago.Key, rev int64) *%sItem {", lo, e.GoName, lo)
-	g.p("it := &%sItem{%s: *e, PK: key.PK, SK: key.SK, T: %q, V: %sVersion, Rev: rev}", lo, e.GoName, e.Name, lo)
+	g.p("// %sToItem is e as stored, created and last updated at the given times (TimeLayout, or \"\" if", lo)
+	g.p("// unknown).")
+	g.p("func %sToItem(e *%s, key dynago.Key, rev int64, created, updated string) *%sItem {", lo, e.GoName, lo)
+	g.p("it := &%sItem{%s: *e, PK: key.PK, SK: key.SK, T: %q, V: %sVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}", lo, e.GoName, e.Name, lo)
 	for _, ix := range e.Indexes {
 		if ix.Strategy != schema.StrategyGSI {
 			continue
@@ -322,6 +332,7 @@ func (g *gen) entity(e *schema.Entity) {
 	g.p("return nil, err")
 	g.p("}")
 	g.p("it.raw = raw")
+	g.p("it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}")
 	g.p("it.loaded = &%sLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}", lo)
 	g.p("return &it, nil")
 	g.p("}")
@@ -599,7 +610,7 @@ func (g *gen) derived(e *schema.Entity) {
 			}
 			inner = fmt.Sprintf("%s%s: %s%s{%s}", e.GoName, ix.GoName, e.GoName, ix.GoName, strings.Join(fs, ", "))
 		}
-		g.p("d = append(d, dynago.Derived{Kind: dynago.KindCopy, Key: k, Type: %q, Item: &%s%sCopy{%s, PK: k.PK, SK: k.SK, T: %q, V: %sVersion}})",
+		g.p("d = append(d, dynago.Derived{Kind: dynago.KindCopy, Key: k, Type: %q, Item: &%s%sCopy{%s, PK: k.PK, SK: k.SK, T: %q, V: %sVersion}, Created: dynago.FmtStamp(e.stamps.Created)})",
 			e.Name+"."+ix.Name, lo, ix.GoName, inner, e.Name+"."+ix.Name, lo)
 		g.p("}")
 	}
@@ -633,7 +644,37 @@ func (g *gen) access(a *schema.Access) {
 		g.query(a)
 	case schema.AccessCounter:
 		g.counterRead(a)
+	case schema.AccessScan:
+		g.scan(a)
 	}
+}
+
+func (g *gen) scan(a *schema.Access) {
+	e := a.Entity
+	g.docComment(a.GoName, a.Doc, fmt.Sprintf("returns the %s items of one page of the whole table, with exactly one %s Scan (default %d, max %d items evaluated). A page evaluates items of every kind and keeps the %s ones, so it can hold few or none and still have a next cursor. It returns the cursor for the next page, or \"\" once the whole table has been read. Declared as a scan because: %s",
+		e.Name, consistency(a.Consistent), a.Page, a.MaxPage, e.Name, a.Reason))
+	g.p("func (s *%sStore) %s(ctx context.Context, page dynago.Page) ([]%s, string, error) {", e.GoName, a.GoName, e.GoName)
+	spec := []string{
+		fmt.Sprintf("Scope: %q", fmt.Sprintf("%s.%s@v%d", e.Name, a.Name, e.Version)),
+		fmt.Sprintf("Type: %q", e.Name),
+		fmt.Sprintf("PageSize: %d", a.Page),
+		fmt.Sprintf("MaxPage: %d", a.MaxPage),
+	}
+	if a.Consistent {
+		spec = append(spec, "Consistent: true")
+	}
+	if e.TTL != nil {
+		spec = append(spec, fmt.Sprintf("TTLAttr: %q", g.m.Table.TTLAttr))
+	}
+	g.p("var raws []dynamo.Item")
+	g.p("next, err := dynago.Scan(ctx, s.t, dynago.ScanSpec{%s}, page, &raws)", strings.Join(spec, ", "))
+	g.p("if err != nil {")
+	g.p("return nil, \"\", err")
+	g.p("}")
+	g.p("out, err := %sDecodeAll(raws)", lowerFirst(e.GoName))
+	g.p("return out, next, err")
+	g.p("}")
+	g.p("")
 }
 
 func (g *gen) getUnique(a *schema.Access) {
@@ -951,16 +992,18 @@ func (g *gen) create(w *schema.Write) {
 	g.p("if err := e.checkKeyParts(); err != nil {")
 	g.p("return err")
 	g.p("}")
-	g.p("rev := dynago.NewRev()")
-	g.p("return dynago.Retry(ctx, func() error {")
+	g.p("rev, stamp := dynago.NewRev(), dynago.NewStamp()")
+	g.p("// Known before the write, so the copies it writes carry the entity's creation time.")
+	g.p("e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}")
+	g.p("err = dynago.Retry(ctx, func() error {")
 	tw := hasTargetWrites(w)
 	if tw {
 		g.p("err := dynago.ReadIfNeeded(func(read bool) error {")
 	}
 	if e.TTL != nil {
-		g.p("put := s.t.Put(%sToItem(e, key, rev)).If(\"attribute_not_exists($) OR $ <= ?\", \"PK\", %q, dynago.Now())", lo, g.m.Table.TTLAttr)
+		g.p("put := s.t.Put(%sToItem(e, key, rev, stamp, stamp)).If(\"attribute_not_exists($) OR $ <= ?\", \"PK\", %q, dynago.Now())", lo, g.m.Table.TTLAttr)
 	} else {
-		g.p("put := s.t.Put(%sToItem(e, key, rev)).If(\"attribute_not_exists($)\", \"PK\")", lo)
+		g.p("put := s.t.Put(%sToItem(e, key, rev, stamp, stamp)).If(\"attribute_not_exists($)\", \"PK\")", lo)
 	}
 	g.p("ops := []dynago.Op{dynago.CreateOp(key, put, Err%sExists, rev)}", e.GoName)
 	own := ""
@@ -980,6 +1023,10 @@ func (g *gen) create(w *schema.Write) {
 	g.p("e.loaded = &%sLoaded{rev: rev, v: %sVersion, snapshot: e.clone()}", lo, lo)
 	g.p("return nil")
 	g.p("})")
+	g.p("if err != nil {")
+	g.p("e.stamps = dynago.Timestamps{} // not created")
+	g.p("}")
+	g.p("return err")
 	g.p("}")
 	g.p("")
 }
@@ -1245,7 +1292,7 @@ func (g *gen) update(w *schema.Write) {
 	g.applyChanges(w)
 	g.changedKeyPartChecks(w)
 	g.p("// Keep attributes this code doesn't know: a newer compatible version may have written them.")
-	g.p("item, err := dynago.KeepUnknown(it.raw, %sKnown, %sToItem(&after, key, it.Rev+1))", lo, lo)
+	g.p("item, err := dynago.KeepUnknown(it.raw, %sKnown, %sToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))", lo, lo)
 	g.p("if err != nil {")
 	g.p("return err")
 	g.p("}")
@@ -1719,7 +1766,7 @@ func (g *gen) versionHelpers(e *schema.Entity) {
 // knownAttrs emits the attributes this code writes on an entity's items. Rewrites keep any others:
 // a newer compatible version of the code may have written them.
 func (g *gen) knownAttrs(e *schema.Entity) {
-	attrs := []string{schema.AttrPK, schema.AttrSK, schema.AttrType, schema.AttrVer, schema.AttrRev}
+	attrs := []string{schema.AttrPK, schema.AttrSK, schema.AttrType, schema.AttrVer, schema.AttrRev, schema.AttrCreated, schema.AttrUpdated}
 	for _, f := range e.Fields {
 		attrs = append(attrs, f.Attr)
 	}

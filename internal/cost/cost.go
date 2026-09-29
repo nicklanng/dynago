@@ -1,13 +1,11 @@
-// Package cost estimates item sizes, capacity units and monthly cost for a schema, and flags
-// design risks. Every number is derived from declared assumptions (field sizes, item counts,
-// request rates), which the report lists alongside the results.
+// Package cost estimates item sizes, capacity units and monthly cost for a schema. Every number is
+// derived from declared assumptions (field sizes, volumes, request rates), which the report lists
+// alongside the results. The analysis package turns these numbers into findings.
 package cost
 
 import (
 	"fmt"
 	"math"
-	"sort"
-	"strings"
 
 	"github.com/nicklanng/dynago/internal/schema"
 )
@@ -22,15 +20,20 @@ type Prices struct {
 // DefaultPrices are DynamoDB Standard on-demand list prices in us-east-1.
 var DefaultPrices = Prices{WRUPerMillion: 0.625, RRUPerMillion: 0.125, GBMonth: 0.25}
 
+// DynamoDB's limits and accounting constants.
 const (
-	// indexOverhead is the per-item overhead DynamoDB adds to index and item storage.
-	indexOverhead = 100
-	// partitionWCU is the write throughput of one partition.
-	partitionWCU    = 1000
+	// IndexOverhead is the per-item overhead DynamoDB adds to index and item storage.
+	IndexOverhead = 100
+	// PartitionWCU and PartitionRCU are the throughput of one partition per second.
+	PartitionWCU = 1000
+	PartitionRCU = 3000
+	// MaxItemSize is DynamoDB's item size limit.
+	MaxItemSize = 400 * 1024
+	// MaxTxItems and MaxTxBytes are DynamoDB's transaction limits.
+	MaxTxItems = 100
+	MaxTxBytes = 4 * 1024 * 1024
+
 	secondsPerMonth = 30 * 24 * 3600
-	// conflictRate is the rate of transactions per item above which conflicts become routine.
-	conflictRate = 20
-	maxItemSize  = 400 * 1024
 )
 
 // Size is an estimated size in bytes at the median and 99th percentile.
@@ -43,21 +46,48 @@ type Units struct{ P50, P99 float64 }
 
 func (u Units) add(o Units) Units { return Units{u.P50 + o.P50, u.P99 + o.P99} }
 
-// Severity of a finding.
-type Severity string
+// Count is how many items of one kind a write touches, typically (P50) and at worst (P99).
+type Count struct{ P50, P99 int }
 
-// Severities.
-const (
-	Error Severity = "error"
-	Warn  Severity = "warning"
-	Info  Severity = "note"
+var (
+	once  = Count{1, 1}
+	twice = Count{2, 2}
 )
 
-// Finding is a risk or design note.
-type Finding struct {
-	Severity Severity
-	Subject  string
-	Message  string
+// TargetKind is a kind of stored item.
+type TargetKind string
+
+// Target kinds.
+const (
+	TargetItem    TargetKind = "item"
+	TargetGSI     TargetKind = "gsi"
+	TargetCopy    TargetKind = "copy"
+	TargetClaim   TargetKind = "claim"
+	TargetCounter TargetKind = "counter"
+)
+
+// Target names a family of stored items: an entity's items, its entries in an index, its copies,
+// its claims, or a counter's items.
+type Target struct {
+	Kind    TargetKind
+	Entity  *schema.Entity
+	Index   *schema.Index
+	Unique  *schema.Unique
+	Counter *schema.Counter
+}
+
+// Touch is one family of items a write puts, updates, deletes or checks.
+type Touch struct {
+	Target Target
+	Label  string
+	// Check marks a condition check: billed as a write of the item, but nothing changes.
+	Check bool
+	// Async marks GSI entries, which DynamoDB writes after the write, outside any transaction.
+	Async bool
+	Size  Size
+	Count Count
+	// Units is the WRU the touch costs, before the transaction doubling.
+	Units Units
 }
 
 // ItemCost describes one family of stored items.
@@ -74,42 +104,67 @@ type ReadCost struct {
 	RoundTrips int
 	RRU        Units
 	Monthly    float64
+	// Reads are the item families the call reads.
+	Reads []Target
+	// FullPassRRU is, for a scan, the RRU of reading the whole table once.
+	FullPassRRU float64
 }
 
 // WriteCost is the estimated cost of one write call.
 type WriteCost struct {
 	Write         *schema.Write
 	Items         []string
+	Touches       []Touch
 	ReadFirst     bool
 	Transactional bool
 	MaxTxItems    int
-	WRU           Units
-	RRU           float64
-	Monthly       float64
+	// TxBytes is the p99 size of everything the write's own request writes.
+	TxBytes int
+	WRU     Units
+	RRU     float64
+	Monthly float64
 }
 
 // EntityReport is the estimate for one entity.
 type EntityReport struct {
-	Entity     *schema.Entity
-	Item       Size
-	Indexes    map[string]Size
-	Items      []ItemCost
-	Reads      []ReadCost
-	Writes     []WriteCost
-	StorageGB  float64
-	StorageUSD float64
+	Entity  *schema.Entity
+	Item    Size
+	Indexes map[string]Size
+	Items   []ItemCost
+	Reads   []ReadCost
+	Writes  []WriteCost
+	// StorageBytes counts the entity's items, index entries and claims at the declared volume.
+	StorageBytes float64
+	// BaseBytes and BaseItems count what the entity puts in the base table (items, copies and
+	// claims, without GSI entries or storage overhead): what a Scan reads.
+	BaseBytes, BaseItems float64
+	StorageGB            float64
+	StorageUSD           float64
 }
 
 // Report is the estimate for a whole schema.
 type Report struct {
 	Prices      Prices
 	Entities    []*EntityReport
-	Findings    []Finding
 	Assumptions []string
-	MonthlyUSD  float64
+	// StorageBytes is the whole table, from the entities with a known volume.
+	StorageBytes float64
+	// BaseBytes and BaseItems are the base table's items (without GSIs): what a Scan reads.
+	BaseBytes, BaseItems float64
+	MonthlyUSD           float64
 }
 
-// Analyze estimates costs and collects findings.
+// Entity returns the report of an entity.
+func (r *Report) Entity(e *schema.Entity) *EntityReport {
+	for _, er := range r.Entities {
+		if er.Entity == e {
+			return er
+		}
+	}
+	return &EntityReport{Entity: e, Indexes: map[string]Size{}}
+}
+
+// Analyze estimates sizes, capacity per call and monthly costs.
 func Analyze(m *schema.Model, p Prices) *Report {
 	r := &Report{Prices: p}
 	r.Assumptions = append(r.Assumptions,
@@ -120,10 +175,25 @@ func Analyze(m *schema.Model, p Prices) *Report {
 		"GSI and copy writes are counted as one index write per entry; an index key change is a delete plus a put.",
 		fmt.Sprintf("Prices: $%.3f per million WRU, $%.3f per million RRU, $%.2f per GB-month (on-demand).", p.WRUPerMillion, p.RRUPerMillion, p.GBMonth),
 		"Monthly figures use each access pattern's and write's declared average rate (rate:, per second); patterns without a rate are not costed.",
+		"Storage counts each entity's items, index entries and claims at its declared volume, plus 100 bytes of overhead per item. A scan reads the base table's items, copies and claims, without GSI entries or overhead; counter items aren't counted.",
 	)
 	for _, e := range m.Entities {
 		er := analyzeEntity(r, m, e)
 		r.Entities = append(r.Entities, er)
+		r.StorageBytes += er.StorageBytes
+		r.BaseBytes += er.BaseBytes
+		r.BaseItems += er.BaseItems
+	}
+	// A scan's full pass reads the whole table, which is known once every entity is.
+	for _, er := range r.Entities {
+		for i := range er.Reads {
+			rc := &er.Reads[i]
+			if rc.Access.Kind == schema.AccessScan {
+				rc.FullPassRRU = math.Ceil(r.BaseBytes/4096) * readFactor(rc.Access)
+			}
+		}
+	}
+	for _, er := range r.Entities {
 		r.MonthlyUSD += er.StorageUSD
 		for _, rc := range er.Reads {
 			r.MonthlyUSD += rc.Monthly
@@ -132,42 +202,11 @@ func Analyze(m *schema.Model, p Prices) *Report {
 			r.MonthlyUSD += wc.Monthly
 		}
 	}
-	for _, g := range m.GSIs {
-		if len(g.Users) > 1 {
-			var names []string
-			for _, ix := range g.Users {
-				names = append(names, ix.Entity.Name)
-			}
-			r.Findings = append(r.Findings, Finding{Info, "GSI " + g.Name,
-				fmt.Sprintf("shared by %s; its projection is the union of what each needs, so every entity pays for the others' projected attributes.", strings.Join(names, ", "))})
-		}
-	}
-	sort.SliceStable(r.Findings, func(i, j int) bool { return rank(r.Findings[i].Severity) < rank(r.Findings[j].Severity) })
 	return r
 }
 
-func rank(s Severity) int {
-	switch s {
-	case Error:
-		return 0
-	case Warn:
-		return 1
-	}
-	return 2
-}
-
-// HasErrors reports whether any finding is an error.
-func (r *Report) HasErrors() bool {
-	for _, f := range r.Findings {
-		if f.Severity == Error {
-			return true
-		}
-	}
-	return false
-}
-
-// sizes estimates the sizes of an entity's item, index entries, claims and counters.
-func sizes(m *schema.Model, e *schema.Entity) *EntityReport {
+// EntitySizes estimates the sizes of an entity's item, index entries, claims and counters.
+func EntitySizes(m *schema.Model, e *schema.Entity) *EntityReport {
 	er := &EntityReport{Entity: e, Indexes: map[string]Size{}}
 	item := ItemSize(m, e)
 	er.Item = item
@@ -178,12 +217,14 @@ func sizes(m *schema.Model, e *schema.Entity) *EntityReport {
 	for _, ix := range e.Indexes {
 		var s Size
 		switch {
-		case ix.Strategy == schema.StrategyGSI && ix.GSI.Projection == schema.ProjectAll:
+		case ix.Strategy == schema.StrategyGSI && ix.Projection == schema.ProjectAll:
 			s = item.add(indexKeysSize(ix))
 		case ix.Strategy == schema.StrategyGSI:
 			s = keys.add(indexKeysSize(ix)).add(fieldsSize(ix.ProjectedFields())).add(meta)
+		case ix.Projection == schema.ProjectAll: // a copy of the whole item
+			s = attrSize(schema.AttrPK, templateSize(ix.PK)).add(attrSize(schema.AttrSK, templateSize(ix.SK))).add(fieldsSize(e.Fields)).add(meta).add(stampsSize)
 		default: // copy
-			s = attrSize(schema.AttrPK, templateSize(ix.PK)).add(attrSize(schema.AttrSK, templateSize(ix.SK))).add(fieldsSize(ix.ProjectedFields())).add(meta)
+			s = attrSize(schema.AttrPK, templateSize(ix.PK)).add(attrSize(schema.AttrSK, templateSize(ix.SK))).add(fieldsSize(ix.ProjectedFields())).add(meta).add(stampsSize)
 		}
 		er.Indexes[ix.Name] = s
 		kind := "gsi"
@@ -198,11 +239,7 @@ func sizes(m *schema.Model, e *schema.Entity) *EntityReport {
 		er.Items = append(er.Items, ItemCost{Name: e.Name + "." + u.Name, Kind: "claim", Size: s})
 	}
 	for _, c := range e.Counters {
-		s := attrSize(schema.AttrPK, templateSize(c.PK)).add(attrSize(schema.AttrSK, templateSize(c.SK))).
-			add(attrSize("_t", Size{len(c.Name), len(c.Name)}))
-		for _, v := range c.Values {
-			s = s.add(attrSize(v.Attr, Size{8, 11}))
-		}
+		s := CounterSize(c)
 		er.Items = append(er.Items, ItemCost{Name: c.Name, Kind: "counter", Size: s})
 		if c.Shards > 1 {
 			er.Items[len(er.Items)-1].Name += fmt.Sprintf(" (×%d shards)", c.Shards)
@@ -211,95 +248,97 @@ func sizes(m *schema.Model, e *schema.Entity) *EntityReport {
 	return er
 }
 
+// CounterSize estimates the size of one counter item.
+func CounterSize(c *schema.Counter) Size {
+	s := attrSize(schema.AttrPK, templateSize(c.PK)).add(attrSize(schema.AttrSK, templateSize(c.SK))).
+		add(attrSize("_t", Size{len(c.Name), len(c.Name)})).add(stampsSize)
+	for _, v := range c.Values {
+		s = s.add(attrSize(v.Attr, Size{8, 11}))
+	}
+	return s
+}
+
 func analyzeEntity(r *Report, m *schema.Model, e *schema.Entity) *EntityReport {
-	er := sizes(m, e)
-	item := er.Item
-
-	// Findings about the item itself.
-	switch {
-	case item.P99 > maxItemSize:
-		r.Findings = append(r.Findings, Finding{Error, e.Name, fmt.Sprintf("p99 item size is %s, over DynamoDB's 400 KB limit; move large fields to S3 or split the item.", human(item.P99))})
-	case item.P99 > 100*1024:
-		r.Findings = append(r.Findings, Finding{Warn, e.Name, fmt.Sprintf("p99 item size is %s; every write and every read of it costs %0.f+ units. Consider splitting rarely-read fields into a separate item.", human(item.P99), math.Ceil(float64(item.P99)/1024))})
-	}
-	if e.TTL != nil {
-		// TTL deletes bypass the generated code, so nothing releases what the item contributed.
-		if len(e.Counters) > 0 {
-			r.Findings = append(r.Findings, Finding{Warn, e.Name, fmt.Sprintf("expires by TTL (%s) and feeds counters: an expired item is never subtracted, so the counters only ever count items created, not items that currently exist.", e.TTL.Name)})
-		}
-		if len(e.Uniques) > 0 {
-			r.Findings = append(r.Findings, Finding{Warn, e.Name, fmt.Sprintf("expires by TTL (%s) but holds unique claims: an expired item's claims stay behind and keep the value taken.", e.TTL.Name)})
-		}
-		for _, ix := range e.Indexes {
-			if ix.Strategy == schema.StrategyCopy {
-				r.Findings = append(r.Findings, Finding{Warn, e.Name + "." + ix.Name, fmt.Sprintf("copies of a TTL-expiring %s outlive it; give the copies their own expiry or use a GSI.", e.Name)})
-			}
-		}
-	}
-	for _, ix := range e.Indexes {
-		if ix.Strategy == schema.StrategyGSI && ix.GSI.Projection == schema.ProjectAll {
-			r.Findings = append(r.Findings, Finding{Info, e.Name + "." + ix.Name,
-				fmt.Sprintf("projects ALL: every write of a %s stores and writes the whole item (%s) a second time. List fields only (project: [...]) usually suffice.", e.Name, human(item.P50))})
-		}
-	}
-
+	er := EntitySizes(m, e)
 	for _, a := range e.Access {
-		rc := readCost(a, er)
+		rc := ReadCostOf(a, er)
 		if a.Rate > 0 {
 			rc.Monthly = (rc.RRU.P50 * a.Rate * secondsPerMonth / 1e6) * r.Prices.RRUPerMillion
 		}
 		er.Reads = append(er.Reads, rc)
 	}
 	for _, w := range e.Writes {
-		wc := writeCost(m, e, w, er)
+		wc := WriteCostOf(m, e, w, w.ReadFirst && !w.Transition, er)
 		if w.Rate > 0 {
 			wc.Monthly = (wc.WRU.P50*r.Prices.WRUPerMillion + wc.RRU*r.Prices.RRUPerMillion) * w.Rate * secondsPerMonth / 1e6
 		}
 		er.Writes = append(er.Writes, wc)
-		writeFindings(r, er, w, wc)
 	}
-
-	largeFieldFindings(r, m, e, er)
-	for _, f := range e.Fields {
-		if f.CopyOf != nil {
-			r.Findings = append(r.Findings, Finding{Warn, e.Name + "." + f.Name, fmt.Sprintf(
-				"copies %s.%s. dynago keeps copies within one entity in sync, but not this one: when %s.%s changes, your code must rewrite every %s that copied it.",
-				f.CopyOfEntity.Name, f.CopyOf.Name, f.CopyOfEntity.Name, f.CopyOf.Name, e.Name)})
-		}
-	}
-	if e.Items > 0 {
-		bytes := float64(e.Items) * float64(item.P50+indexOverhead)
+	if n := e.Count; n > 0 {
+		bytes := n * float64(er.Item.P50+IndexOverhead)
+		er.BaseBytes, er.BaseItems = n*float64(er.Item.P50), n
 		for _, ix := range e.Indexes {
-			bytes += float64(e.Items) * float64(er.Indexes[ix.Name].P50+indexOverhead)
+			bytes += n * float64(er.Indexes[ix.Name].P50+IndexOverhead)
+			if ix.Strategy == schema.StrategyCopy {
+				er.BaseBytes += n * float64(er.Indexes[ix.Name].P50)
+				er.BaseItems += n
+			}
 		}
-		bytes += float64(e.Items) * float64(len(e.Uniques)) * float64(claimSize.P50+indexOverhead)
+		for _, u := range e.Uniques {
+			claims := 1.0
+			if u.Set != nil {
+				claims = float64(setElements(u.Set).P50)
+			}
+			bytes += n * claims * float64(claimSize.P50+IndexOverhead)
+			er.BaseBytes += n * claims * float64(claimSize.P50)
+			er.BaseItems += n * claims
+		}
+		er.StorageBytes = bytes
 		er.StorageGB = bytes / (1 << 30)
 		er.StorageUSD = er.StorageGB * r.Prices.GBMonth
 	}
 	return er
 }
 
-func readCost(a *schema.Access, er *EntityReport) ReadCost {
-	rc := ReadCost{Access: a, RoundTrips: 1}
-	factor := 0.5
+func readFactor(a *schema.Access) float64 {
 	if a.Consistent {
-		factor = 1
+		return 1
 	}
+	return 0.5
+}
+
+// ReadCostOf estimates one call of an access pattern.
+func ReadCostOf(a *schema.Access, er *EntityReport) ReadCost {
+	rc := ReadCost{Access: a, RoundTrips: 1}
+	factor := readFactor(a)
+	e := a.Entity
 	switch a.Kind {
 	case schema.AccessGet:
 		rc.Requests = "GetItem"
 		rc.RRU = Units{rru(er.Item.P50, factor), rru(er.Item.P99, factor)}
+		rc.Reads = []Target{{Kind: TargetItem, Entity: e}}
 	case schema.AccessGetUnique:
 		rc.Requests = "GetItem (claim) → GetItem"
 		rc.RoundTrips = 2
 		rc.RRU = Units{1 + rru(er.Item.P50, 1), 1 + rru(er.Item.P99, 1)}
+		rc.Reads = []Target{{Kind: TargetClaim, Entity: e, Unique: a.Unique}, {Kind: TargetItem, Entity: e}}
 	case schema.AccessQuery:
 		entry := er.Item
+		t := Target{Kind: TargetItem, Entity: e}
 		if a.Index != nil {
 			entry = er.Indexes[a.Index.Name]
+			t = Target{Kind: TargetGSI, Entity: e, Index: a.Index}
+			if a.Index.Strategy == schema.StrategyCopy {
+				t.Kind = TargetCopy
+			}
 		}
 		rc.Requests = "Query"
 		rc.RRU = Units{rru(entry.P50*a.Page, factor), rru(entry.P99*a.Page, factor)}
+		rc.Reads = []Target{t}
+	case schema.AccessScan:
+		rc.Requests = "Scan (one page)"
+		rc.RRU = Units{rru(er.Item.P50*a.Page, factor), rru(er.Item.P99*a.Page, factor)}
+		rc.Reads = []Target{{Kind: TargetItem, Entity: e}}
 	case schema.AccessCounter:
 		if a.Counter.Shards > 1 {
 			rc.Requests = fmt.Sprintf("BatchGetItem (%d shards)", a.Counter.Shards)
@@ -308,27 +347,35 @@ func readCost(a *schema.Access, er *EntityReport) ReadCost {
 		}
 		n := float64(a.Counter.Shards) * factor
 		rc.RRU = Units{n, n}
+		rc.Reads = []Target{{Kind: TargetCounter, Entity: a.Counter.Entity, Counter: a.Counter}}
 	}
 	return rc
 }
 
-func writeCost(m *schema.Model, e *schema.Entity, w *schema.Write, er *EntityReport) WriteCost {
-	wc := WriteCost{Write: w, ReadFirst: w.ReadFirst && !w.Transition}
+// WriteCostOf estimates one call of a write of e (which may be a variant of w.Entity with other
+// indexes, for comparing designs). readFirst says whether the write reads the item first.
+func WriteCostOf(m *schema.Model, e *schema.Entity, w *schema.Write, readFirst bool, er *EntityReport) WriteCost {
+	wc := WriteCost{Write: w, ReadFirst: readFirst}
 	// gsi holds index entries DynamoDB writes asynchronously, outside any transaction. own holds
 	// the items the write itself puts, updates, deletes or checks.
 	var gsi, own Units
 	ops := 0
-	write := func(async bool, name string, s Size, n Count) {
+	write := func(t Target, check, async bool, name string, s Size, n Count) {
 		dst := &own
 		if async {
 			dst = &gsi
 		} else {
 			ops += n.P99
+			if !check {
+				wc.TxBytes += n.P99 * s.P99
+			}
 		}
-		*dst = dst.add(Units{float64(n.P50) * wru(s.P50), float64(n.P99) * wru(s.P99)})
+		u := Units{float64(n.P50) * wru(s.P50), float64(n.P99) * wru(s.P99)}
+		*dst = dst.add(u)
 		wc.Items = append(wc.Items, name)
+		wc.Touches = append(wc.Touches, Touch{Target: t, Label: name, Check: check, Async: async, Size: s, Count: n, Units: u})
 	}
-	write(false, e.Name, er.Item, once)
+	write(Target{Kind: TargetItem, Entity: e}, false, false, e.Name, er.Item, once)
 	derivedWrites(e, w, er, "", write)
 	if wc.ReadFirst {
 		wc.RRU = rru(er.Item.P50, 1)
@@ -337,21 +384,21 @@ func writeCost(m *schema.Model, e *schema.Entity, w *schema.Write, er *EntityRep
 		switch {
 		case rq.Counter != nil:
 			// A condition check on another item is billed as a transactional write of that item.
-			write(false, "check counter "+rq.Counter.Name, counterSize, once)
+			write(Target{Kind: TargetCounter, Entity: rq.Counter.Entity, Counter: rq.Counter}, true, false, "check counter "+rq.Counter.Name, CounterSize(rq.Counter), once)
 		case rq.Writes():
-			ter := sizes(m, rq.Target)
+			ter := EntitySizes(m, rq.Target)
 			tw := rq.TargetWrite()
 			label := rq.Name + " (" + rq.Effect(e.Name) + ")"
 			if rq.Consume {
 				tw = &schema.Write{Name: "requires", Entity: rq.Target, Kind: schema.WriteDelete}
 			}
-			write(false, label, ter.Item, once)
+			write(Target{Kind: TargetItem, Entity: rq.Target}, false, false, label, ter.Item, once)
 			derivedWrites(rq.Target, tw, ter, rq.Name+"'s ", write)
 			if !rq.Fast {
 				wc.RRU += rru(ter.Item.P50, 1)
 			}
 		default:
-			write(false, "check "+rq.Name, ItemSize(m, rq.Target), once)
+			write(Target{Kind: TargetItem, Entity: rq.Target}, true, false, "check "+rq.Name, ItemSize(m, rq.Target), once)
 		}
 	}
 	wc.MaxTxItems = ops
@@ -363,17 +410,9 @@ func writeCost(m *schema.Model, e *schema.Entity, w *schema.Write, er *EntityRep
 	return wc
 }
 
-// writeFunc records one item a write touches: async marks GSI entries, which DynamoDB writes
-// outside the transaction.
-type writeFunc func(async bool, name string, s Size, n Count)
-
-// Count is how many items of one kind a write touches, typically (P50) and at worst (P99).
-type Count struct{ P50, P99 int }
-
-var (
-	once  = Count{1, 1}
-	twice = Count{2, 2}
-)
+// writeFunc records one family of items a write touches: check marks condition checks, async
+// marks GSI entries, which DynamoDB writes outside the transaction.
+type writeFunc func(t Target, check, async bool, name string, s Size, n Count)
 
 // setElementBytes is the assumed size of one element of a string set, for estimating how many
 // claims a set makes from the set's declared size.
@@ -409,26 +448,29 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 		moved, projected := touches(keyFields), ix.Projection == schema.ProjectAll || touches(ix.ProjectedFields())
 		size := er.Indexes[ix.Name]
 		if ix.Strategy == schema.StrategyGSI {
+			t := Target{Kind: TargetGSI, Entity: e, Index: ix}
 			switch {
 			case all:
-				write(true, owner+"GSI "+ix.Name+" entry", size, once)
+				write(t, false, true, owner+"GSI "+ix.Name+" entry", size, once)
 			case moved:
-				write(true, owner+"GSI "+ix.Name+" entry (moved: delete + put)", size, twice)
+				write(t, false, true, owner+"GSI "+ix.Name+" entry (moved: delete + put)", size, twice)
 			case projected:
-				write(true, owner+"GSI "+ix.Name+" entry", size, once)
+				write(t, false, true, owner+"GSI "+ix.Name+" entry", size, once)
 			}
 			continue
 		}
+		t := Target{Kind: TargetCopy, Entity: e, Index: ix}
 		switch {
 		case all:
-			write(false, owner+"copy "+ix.Name, size, once)
+			write(t, false, false, owner+"copy "+ix.Name, size, once)
 		case moved:
-			write(false, owner+"copy "+ix.Name+" (moved: put + delete)", size, twice)
-		case touches(ix.ProjectedFields()):
-			write(false, owner+"copy "+ix.Name, size, once)
+			write(t, false, false, owner+"copy "+ix.Name+" (moved: put + delete)", size, twice)
+		case projected:
+			write(t, false, false, owner+"copy "+ix.Name, size, once)
 		}
 	}
 	for _, c := range e.Counters {
+		t := Target{Kind: TargetCounter, Entity: e, Counter: c}
 		in := [][]*schema.Field{c.KeyFields()}
 		for _, v := range c.Values {
 			in = append(in, predFields(v.Where))
@@ -436,88 +478,48 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 				in = append(in, []*schema.Field{v.Sum})
 			}
 		}
+		size := CounterSize(c)
 		switch {
 		case all:
-			write(false, owner+"counter "+c.Name, counterSize, once)
+			write(t, false, false, owner+"counter "+c.Name, size, once)
 		case touches(c.KeyFields()):
-			write(false, owner+"counter "+c.Name+" (moved: two counter items)", counterSize, twice)
+			write(t, false, false, owner+"counter "+c.Name+" (moved: two counter items)", size, twice)
 		case touches(in...):
-			write(false, owner+"counter "+c.Name, counterSize, once)
+			write(t, false, false, owner+"counter "+c.Name, size, once)
 		}
 	}
 	for _, u := range e.Uniques {
+		t := Target{Kind: TargetClaim, Entity: e, Unique: u}
 		if u.Set != nil {
 			// One claim per element: all of them on a create or delete. An update claims the
 			// elements it adds and releases those it drops: typically one of each, at worst all.
 			n := setElements(u.Set)
 			switch {
 			case all:
-				write(false, fmt.Sprintf("%sclaims %s (one per %s element)", owner, u.Name, u.Set.Name), claimSize, n)
+				write(t, false, false, fmt.Sprintf("%sclaims %s (one per %s element)", owner, u.Name, u.Set.Name), claimSize, n)
 			case touches(u.Fields):
-				write(false, fmt.Sprintf("%sclaims %s (added and dropped %s elements)", owner, u.Name, u.Set.Name), claimSize, Count{2, 2 * n.P99})
+				write(t, false, false, fmt.Sprintf("%sclaims %s (added and dropped %s elements)", owner, u.Name, u.Set.Name), claimSize, Count{2, 2 * n.P99})
 			}
 			continue
 		}
 		switch {
 		case all:
-			write(false, owner+"claim "+u.Name, claimSize, once)
+			write(t, false, false, owner+"claim "+u.Name, claimSize, once)
 		case touches(u.Fields) && clears(w, u.Fields):
-			write(false, owner+"claim "+u.Name+" (released)", claimSize, once)
+			write(t, false, false, owner+"claim "+u.Name+" (released)", claimSize, once)
 		case touches(u.Fields):
-			write(false, owner+"claim "+u.Name+" (moved: put + delete)", claimSize, twice)
+			write(t, false, false, owner+"claim "+u.Name+" (moved: put + delete)", claimSize, twice)
 		}
 	}
 }
 
-var (
-	counterSize = Size{100, 100}
-	claimSize   = Size{150, 150}
-)
+// ClaimSize is the size of one uniqueness claim item: its keys, type, owner's key and timestamps.
+var ClaimSize = Size{230, 230}
 
-func writeFindings(r *Report, er *EntityReport, w *schema.Write, wc WriteCost) {
-	e := er.Entity
-	subject := e.Name + "." + w.Name
-	if wc.MaxTxItems > 100 {
-		r.Findings = append(r.Findings, Finding{Error, subject, fmt.Sprintf("can touch %d items, over the 100-item transaction limit.", wc.MaxTxItems)})
-	}
-	if w.HotKeyRate <= 0 {
-		return
-	}
-	tx := 1.0
-	if wc.Transactional {
-		tx = 2
-	}
-	for _, c := range e.Counters {
-		touched := false
-		for _, it := range wc.Items {
-			touched = touched || strings.HasPrefix(it, "counter "+c.Name)
-		}
-		if !touched {
-			continue
-		}
-		perItem := w.HotKeyRate / float64(c.Shards)
-		wruPerItem := perItem * tx
-		suggest := int(math.Ceil(w.HotKeyRate / 10))
-		switch {
-		case wruPerItem > partitionWCU:
-			r.Findings = append(r.Findings, Finding{Error, subject, fmt.Sprintf(
-				"at %.0f writes/s to one %s key, each counter item takes %.0f WRU/s, over a partition's %d: it will throttle. Set shards: %d or more.",
-				w.HotKeyRate, c.Name, wruPerItem, partitionWCU, suggest)})
-		case wc.Transactional && perItem > conflictRate:
-			r.Findings = append(r.Findings, Finding{Warn, subject, fmt.Sprintf(
-				"at %.0f writes/s to one %s key, each counter item is written by ~%.0f transactions/s. Transactions touching the same item at once conflict and retry (about half a second by default; see dynago.SetRetries), so expect latency and ErrConflict under bursts. Set shards: %d (about 10 transactions/s per item)%s.",
-				w.HotKeyRate, c.Name, perItem, suggest, boundedNote(c))})
-		case perItem >= 5:
-			r.Findings = append(r.Findings, Finding{Info, subject, fmt.Sprintf(
-				"at %.0f writes/s to one %s key, each counter item takes ~%.0f transactions/s: occasional conflicts, retried.",
-				w.HotKeyRate, c.Name, perItem)})
-		}
-	}
-	perKey := w.HotKeyRate * tx * wru(er.Item.P50)
-	if perKey > partitionWCU/2 {
-		r.Findings = append(r.Findings, Finding{Warn, subject, fmt.Sprintf("at %.0f writes/s to one partition key the partition takes about %.0f WRU/s of its %d.", w.HotKeyRate, perKey, partitionWCU)})
-	}
-}
+var claimSize = ClaimSize
+
+// stampsSize is the two timestamps dynago stores on every item it writes.
+var stampsSize = attrSize(schema.AttrCreated, Size{30, 30}).add(attrSize(schema.AttrUpdated, Size{30, 30}))
 
 func predFields(ps []*schema.Pred) []*schema.Field {
 	var out []*schema.Field
@@ -531,7 +533,7 @@ func predFields(ps []*schema.Pred) []*schema.Field {
 // the bookkeeping attributes.
 func ItemSize(m *schema.Model, e *schema.Entity) Size {
 	s := attrSize(schema.AttrPK, templateSize(e.PK)).add(attrSize(schema.AttrSK, templateSize(e.SK)))
-	s = s.add(metaSize(e)).add(attrSize(schema.AttrRev, Size{3, 5}))
+	s = s.add(metaSize(e)).add(attrSize(schema.AttrRev, Size{3, 5})).add(stampsSize)
 	s = s.add(fieldsSize(e.Fields))
 	for _, ix := range e.Indexes {
 		if ix.Strategy == schema.StrategyGSI {
@@ -595,6 +597,9 @@ func templateSize(t schema.Template) Size {
 	return s
 }
 
+// WRU is the write units of writing an item of the given size.
+func WRU(bytes int) float64 { return wru(bytes) }
+
 func wru(bytes int) float64 { return math.Max(1, math.Ceil(float64(bytes)/1024)) }
 
 func rru(bytes int, factor float64) float64 {
@@ -614,75 +619,19 @@ func human(b int) string {
 // Human formats a byte count.
 func Human(b int) string { return human(b) }
 
-func boundedNote(c *schema.Counter) string {
-	for _, v := range c.Values {
-		if v.Limited() || v.HasMin {
-			return ", or move bounded values (which cannot be sharded) to a counter of their own"
-		}
+// HumanBytes formats a large byte count: 3.1 GB, 540 MB.
+func HumanBytes(b float64) string {
+	switch {
+	case b >= 1<<40:
+		return fmt.Sprintf("%.1f TB", b/(1<<40))
+	case b >= 1<<30:
+		return fmt.Sprintf("%.1f GB", b/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.0f MB", b/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.0f KB", b/(1<<10))
 	}
-	return ""
-}
-
-// largeFieldFindings flags entities whose big fields make every write expensive, including writes
-// that never change them: DynamoDB bills a write by the size of the whole item.
-func largeFieldFindings(r *Report, m *schema.Model, e *schema.Entity, er *EntityReport) {
-	var big []*schema.Field
-	for _, f := range e.Fields {
-		if f.SizeP99 >= 8*1024 {
-			big = append(big, f)
-		}
-	}
-	if len(big) == 0 {
-		return
-	}
-	var others []string
-	for _, w := range e.Writes {
-		if w.Kind != schema.WriteUpdate {
-			continue
-		}
-		touches := false
-		for _, f := range w.Changed() {
-			for _, b := range big {
-				touches = touches || f == b
-			}
-		}
-		if !touches {
-			others = append(others, w.Name)
-		}
-	}
-	// Other entities' writes that change this one through requires rewrite it too.
-	for _, oe := range m.Entities {
-		for _, w := range oe.Writes {
-			for _, rq := range w.Requires {
-				if rq.Target != e || len(rq.Sets) == 0 {
-					continue
-				}
-				touches := false
-				for _, st := range rq.Sets {
-					for _, b := range big {
-						touches = touches || st.Field == b
-					}
-				}
-				if !touches {
-					others = append(others, oe.Name+"."+w.Name)
-				}
-			}
-		}
-	}
-	if len(others) == 0 {
-		return
-	}
-	var names []string
-	for _, f := range big {
-		names = append(names, fmt.Sprintf("%s (p99 %s)", f.Name, human(f.SizeP99)))
-	}
-	verb, them := "makes", "it"
-	if len(big) > 1 {
-		verb, them = "make", "them"
-	}
-	r.Findings = append(r.Findings, Finding{Warn, e.Name, fmt.Sprintf(
-		"%s %s every write cost up to %.0f WRU (%.0f in a transaction), including writes that never change %s: %s. Consider moving %s to an entity of its own, written only when %s changes.",
-		strings.Join(names, ", "), verb, wru(er.Item.P99), 2*wru(er.Item.P99), them, strings.Join(others, ", "), them, them)})
+	return fmt.Sprintf("%.0f B", b)
 }
 
 // clears reports whether the write sets one of fields to a zero constant, which releases a claim

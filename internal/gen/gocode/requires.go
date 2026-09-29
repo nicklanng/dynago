@@ -254,7 +254,7 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		if te.HasDerived() {
 			ch = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(before, key%s), After: %sDerived(&after, key%s)}", tlo, limits, tlo, limits)
 		}
-		g.p("item, err := dynago.KeepUnknown(it.raw, %sKnown, %sToItem(&after, key, it.Rev+1))", tlo, tlo)
+		g.p("item, err := dynago.KeepUnknown(it.raw, %sKnown, %sToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))", tlo, tlo)
 		g.p("if err != nil {")
 		g.p("return nil, dynago.Change{}, err")
 		g.p("}")

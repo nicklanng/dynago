@@ -39,10 +39,24 @@ Keep in mind:
   partition and a query for one kind never returns another.
 - Times in keys are rendered fixed-width in UTC, so they sort chronologically.
 
+Then say how many items to expect, and how uneven they are:
+
+```yaml
+Library: { ..., volume: 2000 }
+Tool:    { ..., volume: { typical: 60, max: 5000 } }    # per library
+Loan:    { ..., volume: { typical: 20, max: 500 } }     # per tool: its whole history
+```
+
+dynago works out which items share a partition, how big each partition key value gets, whether it
+grows forever, and how close its busiest value comes to a partition's throughput. `max` matters
+most: trouble comes from the biggest tenant. See [Analysis](analysis.md).
+
 ## 3. Other ways in: GSI, copy, or neither
 
 When a question needs a different partition or order ("a member's loans across tools"), add an
-**index**. There are two strategies, and switching is one line (`strategy:`):
+**index**. There are two strategies. Rather than choosing one, declare what each read needs,
+`freshness: immediate` or `eventual`, and dynago chooses (and the model document shows what the
+other would cost); `strategy:` overrides it:
 
 | | `gsi` (default) | `copy` |
 |---|---|---|
@@ -51,7 +65,7 @@ When a question needs a different partition or order ("a member's loans across t
 | Write cost | about +1 WRU per index entry written; no transaction | every write touching copied fields becomes a transaction (2× every item) |
 | Half-finished writes | impossible: DynamoDB maintains it | impossible: same transaction |
 | One source item can appear | once | once per copy index |
-| Choose when | a listing can lag a moment; you want the cheapest writes | the user must see their own change immediately in the list |
+| Chosen when | every read through it is fine with `freshness: eventual` (or doesn't say) | a read through it declares `freshness: immediate`: the user must see their own change in the list |
 
 Either way:
 
@@ -98,7 +112,7 @@ access:
   sort by that, or use a search engine.
 - **A filter goes in the partition key.** The catalogue's `LIB#{libraryId}#CAT#{category}` lists one
   category, sorted by name.
-- **Read-your-writes?** Make it `strategy: copy`.
+- **Read-your-writes?** Declare `freshness: immediate` on the read: the index becomes a copy.
 - **Small bounded lists** (a member's handful of active loans) can be read with the query you
   already have and sorted in Go.
 - **An order by a value that lives elsewhere** ("most borrowed tools") isn't a field of the item,
@@ -213,10 +227,18 @@ leave the tool held forever.
 ## 7. Denormalise deliberately
 
 Copying a field onto another item (a tool's name onto each loan, so "my loans" shows it without
-reading the tool) is normal in DynamoDB. Be clear about who keeps the copy up to date. Within one
-entity, dynago does it: indexes and copies are recomputed on every write. **Across entities**, you
-do: if a tool is renamed, its loans' `toolName` must be rewritten by your code. Declare it with
-`copy_of: Tool.name`, and the model document and `dynago check` say so to reviewers.
+reading the tool) is normal in DynamoDB. First decide what the copy means:
+
+- **A snapshot**: the value when the item was written, deliberately kept. A loan records the name
+  the tool had when it was borrowed; an order records the price it was placed at. Nothing needs
+  updating. Declare `snapshot_of: Tool.name`, and the model document says so.
+- **A copy that must stay equal** to its source. Within one entity, dynago does it: indexes and
+  copies are recomputed on every write. **Across entities**, your code must: if a tool is renamed,
+  its loans' `toolName` must be rewritten. Declare `copy_of: Tool.name`, and `dynago check` warns
+  (`copy-drift`), saying how many items one change fans out to: a few can be updated in one
+  transaction, thousands need a background job and can't change atomically.
+
+Most copies turn out to be snapshots. Saying which removes the question for every reviewer.
 
 ## 8. Edits: update or patch
 
@@ -234,7 +256,11 @@ on-demand billing there is no capacity reason to merge unrelated domains into on
 
 ## 10. Check the design
 
-Run `dynago check` and read the model document. For each access pattern, it shows the key
-condition, consistency and cost; for each write, the items it touches, whether it reads first,
-whether it is a transaction and what it costs. The risks section flags oversized items,
-transactions near 100 items, hot partitions, full projections and TTL interactions.
+Run `dynago check` and read the model document. For each read, it shows what serves it, its
+freshness, how many items it returns and what it costs; for each write, what it checks, the items it
+touches, whether it reads first, whether it is a transaction and what it costs. It lists the
+guarantees the code enforces, each status field's lifecycle, every partition's size, growth and
+busiest key, and findings: oversized items, transactions near their limits, hot partitions and
+counters, keys with too few values, indexes that silently drop items or that nothing reads, and
+TTL interactions. Accept a finding that's deliberate, with the reason (`accept:`). See
+[Analysis](analysis.md) and [Reviewing designs and changes](review.md).

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/guregu/dynamo/v2"
 )
 
@@ -46,8 +47,10 @@ type Derived struct {
 	// Claim.
 	TakenErr error
 
-	// Copy: the full item to store, including its PK, SK, _t and _v attributes.
-	Item any
+	// Copy: the full item to store, including its PK, SK, _t and _v attributes. Created is the
+	// owner's creation time (TimeLayout), stamped on the copy; "" for a new owner, stamped now.
+	Item    any
+	Created string
 }
 
 // ShardPK appends the shard an owner's contributions land on to a counter partition key.
@@ -80,6 +83,8 @@ type claimItem struct {
 	Type    string `dynamo:"_t"`
 	OwnerPK string `dynamo:"ownerPK"`
 	OwnerSK string `dynamo:"ownerSK"`
+	Created string `dynamo:"_created,omitempty"`
+	Updated string `dynamo:"_updated,omitempty"`
 }
 
 // Claim is the stored form of a uniqueness claim.
@@ -175,8 +180,10 @@ func DiffAll(t dynamo.Table, changes []Change) ([]Op, error) {
 		byKey[ca.key] = append(byKey[ca.key], ca)
 	}
 	sortKeys(keyOrder)
+	now := NewStamp()
 	for _, k := range keyOrder {
-		u := t.Update(AttrPK, k.PK).Range(AttrSK, k.SK).Set(Path(AttrType), counters[byKey[k][0]].typ)
+		u := t.Update(AttrPK, k.PK).Range(AttrSK, k.SK).Set(Path(AttrType), counters[byKey[k][0]].typ).
+			Set(Path(AttrUpdated), now).SetIfNotExists(Path(AttrCreated), now)
 		var limitErrs []error
 		for _, ca := range byKey[k] {
 			cs := counters[ca]
@@ -203,13 +210,17 @@ func DiffAll(t dynamo.Table, changes []Change) ([]Op, error) {
 		ops = append(ops, UpdateOp(k, u, errors.Join(limitErrs...)))
 	}
 	for _, ch := range changes {
-		ops = append(ops, claimsAndCopies(t, ch)...)
+		cc, err := claimsAndCopies(t, ch, now)
+		if err != nil {
+			return nil, err
+		}
+		ops = append(ops, cc...)
 	}
 	return ops, nil
 }
 
-// claimsAndCopies returns the claim and copy writes of one owner's change.
-func claimsAndCopies(t dynamo.Table, ch Change) []Op {
+// claimsAndCopies returns the claim and copy writes of one owner's change, stamped now.
+func claimsAndCopies(t dynamo.Table, ch Change, now string) ([]Op, error) {
 	var ops []Op
 	owner := ch.Owner
 	claimsBefore, claimsAfter := map[Key]Derived{}, map[Key]Derived{}
@@ -246,7 +257,7 @@ func claimsAndCopies(t dynamo.Table, ch Change) []Op {
 		d, has := claimsAfter[k]
 		switch {
 		case has && !had:
-			p := t.Put(claimItem{PK: k.PK, SK: k.SK, Type: d.Type, OwnerPK: owner.PK, OwnerSK: owner.SK}).
+			p := t.Put(claimItem{PK: k.PK, SK: k.SK, Type: d.Type, OwnerPK: owner.PK, OwnerSK: owner.SK, Created: now, Updated: now}).
 				If("attribute_not_exists($) OR ($ = ? AND $ = ?)", AttrPK, "ownerPK", owner.PK, "ownerSK", owner.SK)
 			ops = append(ops, PutOp(k, p, d.TakenErr))
 		case had && !has:
@@ -262,12 +273,22 @@ func claimsAndCopies(t dynamo.Table, ch Change) []Op {
 		a, has := copiesAfter[k]
 		switch {
 		case has && (!had || !sameItem(a.Item, b.Item)):
-			ops = append(ops, PutOp(k, t.Put(a.Item), nil))
+			item, err := dynamo.MarshalItem(a.Item)
+			if err != nil {
+				return nil, err
+			}
+			created := a.Created
+			if created == "" {
+				created = now
+			}
+			item[AttrCreated] = &types.AttributeValueMemberS{Value: created}
+			item[AttrUpdated] = &types.AttributeValueMemberS{Value: now}
+			ops = append(ops, PutOp(k, t.Put(item), nil))
 		case had && !has:
 			ops = append(ops, DeleteOp(k, t.Delete(AttrPK, k.PK).Range(AttrSK, k.SK), nil))
 		}
 	}
-	return ops
+	return ops, nil
 }
 
 func sameItem(a, b any) bool {

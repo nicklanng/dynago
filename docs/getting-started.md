@@ -62,7 +62,7 @@ The first line gives your editor autocomplete and inline errors from the
 
 ```sh
 cd tasks
-go tool dynago check tasks.dynago.yaml      # validate, and print costs and risks
+go tool dynago check tasks.dynago.yaml      # validate, and print costs, partitions and findings
 go tool dynago generate tasks.dynago.yaml
 ```
 
@@ -172,7 +172,10 @@ go tool dynago generate -check tasks/tasks.dynago.yaml
 ```
 
 This fails if anything generated is out of date, so the model document in the repository always
-matches the code.
+matches the code. `dynago check` fails on the design's errors (or whatever a `dynago.policy.yaml`
+says), `dynago diff -base origin/main tasks/tasks.dynago.yaml` prints a pull request's
+architectural changes, and `dynago vet ./...` finds DynamoDB calls that bypass the schema. See
+[Reviewing designs and changes](guides/review.md).
 
 ## 7. Change the schema
 
@@ -190,6 +193,7 @@ data.
 ## Next
 
 - [Modelling](guides/modelling.md): choosing keys, GSIs vs copies, claims and counters.
+- [Analysis](guides/analysis.md): declaring volumes, reading the partition estimates and findings.
 - [Counters](guides/counters.md): limits, lower bounds, sharding.
 - [Concurrency](guides/concurrency.md): preventing lost updates with `dynago.From` and `dynago.IfVersion`.
 - [Generated code](generated-code.md): every generated name, method and error.

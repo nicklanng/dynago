@@ -1,28 +1,30 @@
-// Package docs renders a schema as a Markdown data model document with Mermaid diagrams.
+// Package docs renders a schema as a Markdown data model document with Mermaid diagrams. The
+// document leads with what a reviewer needs (the domain, the rules the code guarantees, every
+// read and write, how items group into partitions, and the risks) and ends with the reference
+// detail an implementer needs.
 package docs
 
 import (
 	"bytes"
 	"fmt"
 	"slices"
-	"strconv"
 	"strings"
-	"time"
 
-	"github.com/nicklanng/dynago"
+	"github.com/nicklanng/dynago/internal/analysis"
 	"github.com/nicklanng/dynago/internal/cost"
 	"github.com/nicklanng/dynago/internal/schema"
 )
 
 // Generate renders the model document.
-func Generate(m *schema.Model, r *cost.Report, source string) []byte {
-	d := &doc{m: m, r: r}
+func Generate(m *schema.Model, r *analysis.Result, source string) []byte {
+	d := &doc{m: m, a: r, r: r.Cost}
 	d.render(source)
 	return d.buf.Bytes()
 }
 
 type doc struct {
 	m   *schema.Model
+	a   *analysis.Result
 	r   *cost.Report
 	buf bytes.Buffer
 }
@@ -56,385 +58,450 @@ func (d *doc) render(source string) {
 	}
 	d.p("%s", gen)
 	d.p("")
-	contents := []string{"[Table](#table)"}
-	for _, e := range m.Entities {
-		contents = append(contents, "["+e.Name+"](#"+strings.ToLower(e.Name)+")")
-	}
-	contents = append(contents, "[Costs and risks](#costs-and-risks)", "[How to read this](#how-to-read-this)")
-	d.p("**Contents:** %s", strings.Join(contents, " · "))
+	d.p("**Contents:** [Summary](#summary) · [Domain](#domain) · [Reads](#reads) · [Writes](#writes) · [Storage and partitions](#storage-and-partitions) · [Risks and costs](#risks-and-costs) · [Reference](#reference) · [How to read this](#how-to-read-this)")
 	d.p("")
-	d.table()
-	for _, e := range m.Entities {
-		d.entity(e)
-	}
-	d.costs()
+	d.summary()
+	d.domain()
+	d.reads()
+	d.writes()
+	d.storage()
+	d.risks()
+	d.reference()
 	d.primer()
 }
 
-func (d *doc) table() {
-	m := d.m
-	d.p("## Table")
+// ---- summary ----
+
+func (d *doc) summary() {
+	m, a := d.m, d.a
+	d.p("## Summary")
 	d.p("")
-	d.p("| Setting | Value |")
-	d.p("|---|---|")
-	d.p("| Base key | `PK` (partition, string) + `SK` (sort, string) |")
-	d.p("| Billing | On-demand |")
-	if ttl := ttlAttr(m); ttl != "" {
-		d.p("| TTL attribute | `%s` (epoch seconds) |", ttl)
-	}
 	var entities []string
 	for _, e := range m.Entities {
 		entities = append(entities, e.Name)
 	}
-	d.p("| Entities | %s |", strings.Join(entities, ", "))
-	d.p("")
-	if len(m.GSIs) == 0 {
-		d.p("The table has no global secondary indexes.")
-		d.p("")
-		return
-	}
-	d.p("| Global secondary index | Keys | Projection | Used by |")
-	d.p("|---|---|---|---|")
-	for _, g := range m.GSIs {
-		keys := "`" + g.PKAttr + "`"
-		if g.HasSK {
-			keys += " + `" + g.SKAttr + "`"
+	reads, writes := 0, 0
+	kinds := map[schema.AccessKind]int{}
+	tx, readFirst := 0, 0
+	for _, er := range d.r.Entities {
+		for _, rc := range er.Reads {
+			reads++
+			kinds[rc.Access.Kind]++
 		}
-		proj := "ALL"
-		if g.Projection == schema.ProjectInclude {
-			proj = "INCLUDE " + codeList(g.NonKeyAttrs)
-		}
-		var users []string
-		for _, ix := range g.Users {
-			users = append(users, ix.Entity.Name)
-		}
-		d.p("| `%s` | %s | %s | %s |", g.Name, keys, proj, strings.Join(users, ", "))
-	}
-	d.p("")
-}
-
-func (d *doc) entity(e *schema.Entity) {
-	er := d.report(e)
-	d.p("## %s", e.Name)
-	d.p("")
-	if e.Doc != "" {
-		d.p("%s", e.Doc)
-		d.p("")
-	}
-	d.p("Schema version **%d**. Go type `%s`, store `Store.%s`.", e.Version, e.GoName, schema.Plural(e.GoName))
-	d.p("")
-	d.diagram(e)
-
-	d.p("### Fields")
-	d.p("")
-	d.p("| Field | Type | Attribute | Size p50/p99 | Notes |")
-	d.p("|---|---|---|---|---|")
-	for _, f := range e.Fields {
-		var notes []string
-		if f.Key {
-			notes = append(notes, "key")
-		}
-		if e.TTL == f {
-			notes = append(notes, "TTL: the item expires at this time")
-		}
-		if f.CopyOf != nil {
-			notes = append(notes, fmt.Sprintf("**copy of %s.%s, not kept in sync by dynago**", f.CopyOfEntity.Name, f.CopyOf.Name))
-		}
-		if f.Doc != "" {
-			notes = append(notes, f.Doc)
-		}
-		typ := string(f.Type)
-		if f.Type == schema.TypeEnum {
-			typ = "enum: " + strings.Join(f.Enum, ", ")
-		}
-		d.p("| `%s` | %s | `%s` | %d / %d B | %s |", f.Name, typ, f.Attr, f.SizeP50, f.SizeP99, escape(strings.Join(notes, "; ")))
-	}
-	d.p("")
-
-	d.p("### Stored items")
-	d.p("")
-	d.p("Every item that exists because of %s %s, and what keeps it up to date.", article(e.Name), e.Name)
-	d.p("")
-	d.p("| Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |")
-	d.p("|---|---|---|---|---|---|")
-	d.p("| **%s** | `%s` | `%s` | %s | %s | the writes below |", e.Name, e.PK.Raw, e.SK.Raw,
-		example(e, e.PK, e.SK, true), sizeText(er.Item))
-	for _, ix := range e.Indexes {
-		size := er.Indexes[ix.Name]
-		where := ""
-		if len(ix.Where) > 0 {
-			where = " Only when " + predText(ix.Where) + "."
-		}
-		if ix.Strategy == schema.StrategyGSI {
-			sk := "—"
-			if ix.HasSK {
-				sk = "`" + ix.SK.Raw + "`"
-			}
-			d.p("| GSI `%s` entry | `%s` | %s | %s | %s | DynamoDB, from the item's `%s`/`%s` attributes (eventually consistent). Sparse: absent when a key field is empty.%s |",
-				ix.Name, ix.PK.Raw, sk, example(e, ix.PK, ix.SK, ix.HasSK), sizeText(size), ix.PKAttr, ix.SKAttr, where)
-		} else {
-			d.p("| Copy `%s` | `%s` | `%s` | %s | %s | the writes below, in the same transaction as the item.%s |",
-				ix.Name, ix.PK.Raw, ix.SK.Raw, example(e, ix.PK, ix.SK, true), sizeText(size), where)
-		}
-	}
-	for _, u := range e.Uniques {
-		what := fmt.Sprintf("a conditional put makes %s unique", fieldCodes(u.Fields))
-		if u.Set != nil {
-			what = fmt.Sprintf("one claim per element of `%s`, each taken by a conditional put", u.Set.Name)
-		}
-		d.p("| Claim `%s` | `%s` | `%s` | %s | ~150 B each | the writes below, in the same transaction; %s. |",
-			u.Name, u.PK.Raw, u.SK.Raw, example(e, u.PK, u.SK, true), what)
-	}
-	for _, c := range e.Counters {
-		pk := c.PK.Raw
-		if c.Shards > 1 {
-			pk += fmt.Sprintf("#S{0..%d}", c.Shards-1)
-		}
-		d.p("| Counter `%s` | `%s` | `%s` | %s | ~100 B | the writes below, with atomic ADDs in the same transaction. |",
-			c.Name, pk, c.SK.Raw, example(e, c.PK, c.SK, true))
-	}
-	d.p("")
-
-	if len(e.Indexes) > 0 {
-		d.p("### Indexes")
-		d.p("")
-		for _, ix := range e.Indexes {
-			strategy := "global secondary index, maintained by DynamoDB, eventually consistent"
-			if ix.Strategy == schema.StrategyCopy {
-				strategy = "copy items written in the same transaction as the entity, readable strongly consistently"
-			}
-			d.p("- **%s** (%s). %s Projection: %s.", ix.Name, strategy, strings.TrimSpace(ix.Doc), projText(ix))
-		}
-		d.p("")
-	}
-	if len(e.Counters) > 0 {
-		d.p("### Counters")
-		d.p("")
-		for _, c := range e.Counters {
-			extra := ""
-			if c.Shards > 1 {
-				extra = fmt.Sprintf(" Spread over %d shards; reads sum them with one BatchGetItem.", c.Shards)
-			}
-			d.p("- **%s**, keyed by %s. %s%s", c.Name, fieldCodes(c.KeyFields()), strings.TrimSpace(c.Doc), extra)
-			for _, v := range c.Values {
-				d.p("  - `%s`: %s.", v.Attr, counterValueText(v))
-			}
-		}
-		d.p("")
-	}
-	if len(e.Uniques) > 0 {
-		d.p("### Uniqueness")
-		d.p("")
-		for _, u := range e.Uniques {
-			rule := fmt.Sprintf("no two %s items share %s", e.Name, fieldCodes(u.Fields))
-			if u.Set != nil {
-				rule = fmt.Sprintf("no element of `%s` appears in two %s items", u.Set.Name, e.Name)
-				if len(u.Fields) > 1 {
-					rule = fmt.Sprintf("for the same %s, %s", fieldCodes(slices.DeleteFunc(slices.Clone(u.Fields), func(f *schema.Field) bool { return f == u.Set })), rule)
-				}
-			}
-			d.p("- **%s**: %s. %s", u.Name, rule, strings.TrimSpace(u.Doc))
-		}
-		d.p("")
-	}
-
-	d.p("### Access patterns")
-	d.p("")
-	if len(e.Access) == 0 {
-		d.p("None declared.")
-		d.p("")
-	} else {
-		d.p("| Method | Reads | Key condition | Consistency | Requests | RRU per call p50/p99 |")
-		d.p("|---|---|---|---|---|---|")
-		for i, a := range e.Access {
-			rc := er.Reads[i]
-			d.p("| `%s` | %s | %s | %s | %s | %s |", a.Name, readsText(a), escape(keyCondition(a)),
-				consistencyText(a), rc.Requests, unitsText(rc.RRU))
-		}
-		d.p("")
-		d.docList(func(yield func(name, doc string)) {
-			for _, a := range e.Access {
-				yield(a.Name, a.Doc)
-			}
-		})
-	}
-
-	d.p("### Writes")
-	d.p("")
-	if len(e.Writes) == 0 {
-		d.p("None declared.")
-		d.p("")
-	} else {
-		d.p("| Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |")
-		d.p("|---|---|---|---|---|---|---|---|")
-		for i, w := range e.Writes {
-			wc := er.Writes[i]
-			reads := "no"
-			switch {
-			case w.Transition:
-				reads = "no: read-free (reads only if the item is not in the assumed state)"
-			case wc.ReadFirst:
-				reads = "yes (1 consistent read; none with `dynago.From`)"
-			}
-			version := "optional"
-			switch {
-			case w.Kind == schema.WriteCreate:
-				version = "—"
-			case w.VersionRequired:
-				version = "**required**"
-			}
-			atomic := "single item"
+		for _, wc := range er.Writes {
+			writes++
 			if wc.Transactional {
-				atomic = fmt.Sprintf("transaction (%d items)", wc.MaxTxItems)
+				tx++
 			}
-			d.p("| `%s` | %s | %s | %s | %s | %s | %s | %s |", w.Name, escape(writeText(w)), strings.Join(wc.Items, "<br>"),
-				reads, atomic, version, unitsText(wc.WRU), strings.Join(writeErrors(w), "<br>"))
+			if wc.ReadFirst {
+				readFirst++
+			}
+		}
+	}
+	var gsis, copies []string
+	claims, counters := 0, 0
+	for _, e := range m.Entities {
+		for _, ix := range e.Indexes {
+			if ix.Strategy == schema.StrategyCopy {
+				copies = append(copies, e.Name+"."+ix.Name)
+			}
+		}
+		claims += len(e.Uniques)
+		counters += len(e.Counters)
+	}
+	for _, g := range m.GSIs {
+		gsis = append(gsis, g.Name)
+	}
+	var rk []string
+	for _, k := range []struct {
+		kind schema.AccessKind
+		name string
+	}{{schema.AccessGet, "by key"}, {schema.AccessGetUnique, "by unique value"}, {schema.AccessQuery, "queries"}, {schema.AccessCounter, "counters"}, {schema.AccessScan, "scans"}} {
+		if n := kinds[k.kind]; n > 0 {
+			rk = append(rk, fmt.Sprintf("%d %s", n, k.name))
+		}
+	}
+	d.p("| | |")
+	d.p("|---|---|")
+	d.p("| Entities | %d: %s |", len(entities), strings.Join(entities, ", "))
+	d.p("| Reads | %d: %s |", reads, strings.Join(rk, ", "))
+	d.p("| Writes | %d: %d in a transaction, %d reading the item first |", writes, tx, readFirst)
+	var idx string
+	idx = fmt.Sprintf("%s, %s", plural(len(gsis), "GSI", "GSIs"), plural(len(copies), "copy index", "copy indexes"))
+	if len(gsis) > 0 || len(copies) > 0 {
+		idx += " (" + strings.Join(append(append([]string{}, gsis...), copies...), ", ") + ")"
+	}
+	d.p("| Indexes | %s |", idx)
+	d.p("| Uniqueness claims, counters | %d, %d |", claims, counters)
+	d.p("| Workload | %s |", workloadText(m))
+	if big := largestPartition(a); big != nil {
+		d.p("| Largest partition | `%s` (%s): %s typical, %s at most |", escape(big.PK), big.Space(), bytesText(big.Size.Typical, big.Size.Known), bytesText(big.Size.Max, big.Size.MaxKnown))
+	}
+	if busy := busiestPartition(a); busy != nil {
+		d.p("| Busiest partition at peak | `%s` (%s): %s%% of a partition's capacity, risk **%s** |", escape(busy.PK), busy.Space(), load(busy.Headroom*100), busy.Risk)
+	}
+	if d.r.StorageBytes > 0 {
+		d.p("| Storage | %s at the declared volumes |", cost.HumanBytes(d.r.StorageBytes))
+	}
+	d.p("| Cost | $%.2f/month at the declared volumes and rates |", d.r.MonthlyUSD)
+	counts := a.Counts()
+	accepted := len(a.Findings) - len(a.Open())
+	d.p("| Findings | %s, %s, %s open; %d accepted |", plural(counts[analysis.Error], "error", "errors"), plural(counts[analysis.Warning], "warning", "warnings"), plural(counts[analysis.Note], "note", "notes"), accepted)
+	d.p("")
+	var open []analysis.Finding
+	for _, f := range a.Open() {
+		if f.Severity != analysis.Note {
+			open = append(open, f)
+		}
+	}
+	if len(open) > 0 {
+		d.p("Open findings (details under [Risks and costs](#risks-and-costs)):")
+		d.p("")
+		for _, f := range open {
+			d.p("- %s **%s**, %s: %s", icon(f.Severity), f.Rule, analysis.SubjectText(f.Subject), firstSentence(f.Message))
 		}
 		d.p("")
-		d.docList(func(yield func(name, doc string)) {
-			for _, w := range e.Writes {
-				yield(w.Name, w.Doc)
-			}
-		})
 	}
 }
 
-// docList prints the documented methods as a list, followed by a blank line if there were any.
-func (d *doc) docList(each func(yield func(name, doc string))) {
-	found := false
-	each(func(name, doc string) {
-		if doc != "" {
-			d.p("- `%s`: %s", name, doc)
-			found = true
-		}
-	})
-	if found {
-		d.p("")
+func workloadText(m *schema.Model) string {
+	var parts []string
+	if m.Workload.Horizon != "" {
+		parts = append(parts, "volumes expected at "+m.Workload.Horizon)
 	}
+	if m.Workload.PeakDeclared {
+		parts = append(parts, fmt.Sprintf("peak traffic %s× the average", schema.Number(m.Workload.Peak)))
+	} else {
+		parts = append(parts, "no peak factor declared (peaks taken as the averages)")
+	}
+	declared := 0
+	for _, e := range m.Entities {
+		if e.Volume.Declared {
+			declared++
+		}
+	}
+	parts = append(parts, fmt.Sprintf("volumes declared for %d of %d entities", declared, len(m.Entities)))
+	return capital(strings.Join(parts, "; "))
 }
 
-func (d *doc) diagram(e *schema.Entity) {
-	d.p("```mermaid")
-	d.p("flowchart LR")
-	id := func(kind, name string) string { return kind + "_" + name }
-	d.p("  %s[\"%s item<br/>%s<br/>%s\"]", id("item", e.Name), e.Name, mm(e.PK.Raw), mm(e.SK.Raw))
-	for _, ix := range e.Indexes {
-		if ix.Strategy == schema.StrategyGSI {
-			d.p("  %s[(\"GSI %s<br/>%s\")]", id("ix", ix.Name), ix.Name, mm(ix.PK.Raw))
-			d.p("  %s -. DynamoDB maintains .-> %s", id("item", e.Name), id("ix", ix.Name))
-		} else {
-			d.p("  %s[\"copy %s<br/>%s\"]", id("ix", ix.Name), ix.Name, mm(ix.PK.Raw))
+func largestPartition(a *analysis.Result) *analysis.Partition {
+	var best *analysis.Partition
+	for _, p := range a.Partitions {
+		if p.Size.MaxKnown && !bookkeeping(p) && (best == nil || p.Size.Max > best.Size.Max) {
+			best = p
 		}
 	}
-	for _, u := range e.Uniques {
-		d.p("  %s[\"claim %s<br/>%s\"]", id("claim", u.Name), u.Name, mm(u.PK.Raw))
-	}
-	for _, c := range e.Counters {
-		d.p("  %s[\"counter %s<br/>%s\"]", id("counter", c.Name), c.Name, mm(c.PK.Raw+" / "+c.SK.Raw))
-	}
-	for _, w := range e.Writes {
-		d.p("  %s([\"%s\"])", id("w", w.Name), w.Name)
-		targets := []string{id("item", e.Name)}
-		all := w.Kind != schema.WriteUpdate
-		changed := map[*schema.Field]bool{}
-		for _, f := range w.Changed() {
-			changed[f] = true
-		}
-		touched := func(fs []*schema.Field) bool {
-			for _, f := range fs {
-				if changed[f] {
-					return true
-				}
-			}
+	return best
+}
+
+// bookkeeping reports whether a partition holds only claims and counters.
+func bookkeeping(p *analysis.Partition) bool {
+	for _, mb := range p.Members {
+		if mb.Target.Kind != cost.TargetClaim && mb.Target.Kind != cost.TargetCounter {
 			return false
 		}
-		for _, ix := range e.Indexes {
-			if ix.Strategy == schema.StrategyCopy && (all || touched(ix.ProjectedFields()) || touched(ix.PK.Fields) || touched(ix.SK.Fields)) {
-				targets = append(targets, id("ix", ix.Name))
-			}
-		}
-		for _, u := range e.Uniques {
-			if all || touched(u.Fields) {
-				targets = append(targets, id("claim", u.Name))
-			}
-		}
-		for _, c := range e.Counters {
-			fs := c.KeyFields()
-			for _, v := range c.Values {
-				if v.Sum != nil {
-					fs = append(fs, v.Sum)
-				}
-				for _, p := range v.Where {
-					fs = append(fs, p.Field)
-				}
-			}
-			if all || touched(fs) {
-				targets = append(targets, id("counter", c.Name))
-			}
-		}
-		d.p("  %s --> %s", id("w", w.Name), strings.Join(targets, " & "))
-		for _, rq := range w.Requires {
-			verb := "checks"
-			switch {
-			case len(rq.Sets) > 0:
-				verb = "checks and changes"
-			case rq.Consume:
-				verb = "checks and deletes"
-			}
-			if rq.Counter != nil && rq.Counter.Entity == e {
-				d.p("  %s -. %s .-> %s", id("w", w.Name), verb, id("counter", rq.Counter.Name))
-				continue
-			}
-			label := rq.Name + " item"
-			if rq.Counter != nil {
-				label = "counter " + rq.Name
-			}
-			d.p("  %s[\"%s\"]", id("other", rq.Name), label)
-			d.p("  %s -. %s .-> %s", id("w", w.Name), verb, id("other", rq.Name))
+	}
+	return true
+}
+
+func busiestPartition(a *analysis.Result) *analysis.Partition {
+	var best *analysis.Partition
+	for _, p := range a.Partitions {
+		if p.Rated && (best == nil || p.Headroom > best.Headroom) {
+			best = p
 		}
 	}
-	for _, a := range e.Access {
-		d.p("  %s{{\"%s\"}}", id("r", a.Name), a.Name)
-		var target string
-		switch {
-		case a.Kind == schema.AccessCounter:
-			target = id("counter", a.Counter.Name)
-		case a.Kind == schema.AccessGetUnique:
-			target = id("claim", a.Unique.Name) + " & " + id("item", e.Name)
-		case a.Index != nil:
-			target = id("ix", a.Index.Name)
-		default:
-			target = id("item", e.Name)
+	return best
+}
+
+// ---- domain ----
+
+func (d *doc) domain() {
+	m := d.m
+	d.p("## Domain")
+	d.p("")
+	d.p("### Entities")
+	d.p("")
+	d.p("| Entity | What it is | Identified by | Volume | Expected items |")
+	d.p("|---|---|---|---|---|")
+	for _, e := range m.Entities {
+		count := "—"
+		if e.Count > 0 {
+			count = schema.Number(roundCount(e.Count))
 		}
-		d.p("  %s --> %s", target, id("r", a.Name))
+		d.p("| [%s](#%s) | %s | %s | %s | %s |", e.Name, anchor(e.Name), escape(firstSentence(e.Doc)), fieldCodes(e.KeyFields()), escape(e.Volume.String()), count)
+	}
+	d.p("")
+	d.relationships()
+	d.guarantees()
+	d.lifecycles()
+}
+
+func (d *doc) relationships() {
+	rels := d.visibleRelations()
+	if len(rels) == 0 {
+		return
+	}
+	d.p("### Relationships")
+	d.p("")
+	d.p("```mermaid")
+	d.p("erDiagram")
+	for _, rel := range rels {
+		card := "||--o{"
+		if rel.OneToOne() {
+			card = "||--o|"
+		}
+		d.p("  %s %s %s : \"%s\"", rel.To.Name, card, rel.From.Name, relLabel(rel))
 	}
 	d.p("```")
 	d.p("")
-	d.p("Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB; solid arrows are written by the generated code.")
+	d.p("| Entity | Related to | How |")
+	d.p("|---|---|---|")
+	for _, rel := range rels {
+		d.p("| %s | %s | %s |", rel.From.Name, rel.To.Name, escape(relText(rel)))
+	}
 	d.p("")
 }
 
-func (d *doc) costs() {
-	r := d.r
-	d.p("## Costs and risks")
-	d.p("")
-	if len(r.Findings) == 0 {
-		d.p("No findings.")
-	} else {
-		d.p("| | Subject | Finding |")
-		d.p("|---|---|---|")
-		for _, f := range r.Findings {
-			icon := map[cost.Severity]string{cost.Error: "⛔ error", cost.Warn: "⚠️ warning", cost.Info: "ℹ️ note"}[f.Severity]
-			d.p("| %s | %s | %s |", icon, f.Subject, escape(f.Message))
+// visibleRelations drops a relation whose reverse is a parent link: the hold a tool's retirement
+// deletes is the same link as the hold's place under its tool.
+func (d *doc) visibleRelations() []*schema.Relation {
+	var out []*schema.Relation
+	for _, rel := range d.m.Relations {
+		if rel.From == rel.To {
+			continue
+		}
+		dup := false
+		for _, o := range d.m.Relations {
+			if o != rel && o.From == rel.To && o.To == rel.From && (o.Is(schema.RelNests) || o == o.From.Parent) && !rel.Is(schema.RelNests) && rel != rel.From.Parent {
+				dup = true
+			}
+		}
+		if !dup {
+			out = append(out, rel)
 		}
 	}
+	return out
+}
+
+func relLabel(rel *schema.Relation) string {
+	if rel.Is(schema.RelNests) || rel == rel.From.Parent {
+		return "contains"
+	}
+	if len(rel.Writes) > 0 {
+		var ws []string
+		for _, w := range rel.Writes {
+			ws = append(ws, w.Name)
+		}
+		return strings.Join(ws, ", ") + " requires"
+	}
+	return "referenced by"
+}
+
+func relText(rel *schema.Relation) string {
+	var parts []string
+	var keys []string
+	for _, k := range rel.Key {
+		if k.Source.Name == k.Target.Name {
+			keys = append(keys, "`"+k.Source.Name+"`")
+		} else {
+			keys = append(keys, fmt.Sprintf("`%s` (%s's `%s`)", k.Source.Name, rel.To.Name, k.Target.Name))
+		}
+	}
+	holds := fmt.Sprintf("holds its %s's key in %s", rel.To.Name, strings.Join(keys, ", "))
+	switch {
+	case rel.Is(schema.RelNests):
+		parts = append(parts, fmt.Sprintf("lives in (or under) its %s's partition, and %s", rel.To.Name, holds))
+	default:
+		parts = append(parts, holds)
+	}
+	for _, f := range rel.From.Fields {
+		if f.Ref == rel.To {
+			parts = append(parts, fmt.Sprintf("`%s` is declared `ref: %s`", f.Name, rel.To.Name))
+		}
+	}
+	if len(rel.Writes) > 0 {
+		var ws []string
+		for _, w := range rel.Writes {
+			ws = append(ws, w.Name)
+		}
+		parts = append(parts, strings.Join(ws, ", ")+map[bool]string{true: " requires it", false: " require it"}[len(ws) == 1])
+	}
+	v := rel.From.Volume
+	switch {
+	case v.Declared && v.Per == rel:
+		parts = append(parts, perText(rel.To, v.Typical, v.Max))
+	case rel.OneToOne():
+		parts = append(parts, fmt.Sprintf("at most one per %s", rel.To.Name))
+	}
+	for _, b := range v.By {
+		if b.Relation == rel {
+			parts = append(parts, perText(rel.To, b.Typical, b.Max))
+		}
+	}
+	return capital(strings.Join(parts, "; ")) + "."
+}
+
+func perText(to *schema.Entity, typical, most float64) string {
+	s := fmt.Sprintf("%s per %s typically", schema.Number(typical), to.Name)
+	if most > 0 {
+		s += ", at most " + schema.Number(most)
+	}
+	return s
+}
+
+func (d *doc) guarantees() {
+	if len(d.a.Guarantees) == 0 {
+		return
+	}
+	d.p("### Guarantees")
 	d.p("")
-	d.p("| Entity | Items (assumed) | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |")
+	d.p("What the generated code enforces on every write, so no bug or race elsewhere can break it.")
+	d.p("")
+	var cur *schema.Entity
+	for _, g := range d.a.Guarantees {
+		if g.Entity != cur {
+			cur = g.Entity
+			d.p("- **%s**", cur.Name)
+		}
+		d.p("  - %s *(%s)*", escape(g.Text), g.By)
+	}
+	d.p("")
+}
+
+func (d *doc) lifecycles() {
+	if len(d.a.Lifecycles) == 0 {
+		return
+	}
+	d.p("### Lifecycles")
+	d.p("")
+	d.p("How writes move each status-like field between its values. `*` marks a write that doesn't check the current value, or lets the caller choose the new one.")
+	d.p("")
+	for _, lc := range d.a.Lifecycles {
+		f := lc.Field
+		d.p("#### %s.%s", lc.Entity.Name, f.Name)
+		d.p("")
+		d.p("```mermaid")
+		d.p("stateDiagram-v2")
+		id := map[string]string{}
+		for i, v := range f.Enum {
+			id[v] = fmt.Sprintf("s%d", i)
+			d.p("  state \"%s\" as s%d", mmState(v), i)
+		}
+		expand := func(v string, except string) []string {
+			if v != analysis.Any {
+				return []string{id[v]}
+			}
+			var out []string
+			for _, ev := range f.Enum {
+				if ev != except {
+					out = append(out, id[ev])
+				}
+			}
+			return out
+		}
+		for _, t := range lc.Transitions {
+			if t.From == "" {
+				for _, to := range expand(t.To, "") {
+					d.p("  [*] --> %s: %s", to, t.By)
+				}
+				continue
+			}
+			for _, to := range expand(t.To, "") {
+				for _, from := range expand(t.From, "") {
+					if from != to {
+						d.p("  %s --> %s: %s", from, to, t.By)
+					}
+				}
+			}
+		}
+		d.p("```")
+		d.p("")
+		var notes []string
+		for _, t := range lc.Transitions {
+			if t.From == "" && t.To == analysis.Any {
+				notes = append(notes, fmt.Sprintf("%s lets the caller choose the first value", t.By))
+			}
+			if t.From != "" && t.To == analysis.Any {
+				notes = append(notes, fmt.Sprintf("%s sets any value the caller gives", t.By))
+			}
+		}
+		if len(lc.Final) > 0 {
+			notes = append(notes, fmt.Sprintf("no write moves a %s out of %s", lc.Entity.Name, strings.Join(quoteAll(lc.Final), " or ")))
+		}
+		if len(lc.Deleted) > 0 {
+			notes = append(notes, fmt.Sprintf("%s deletes it, whatever the value", strings.Join(lc.Deleted, " and ")))
+		}
+		if len(notes) > 0 {
+			d.p("%s.", capital(strings.Join(notes, "; ")))
+			d.p("")
+		}
+	}
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
+func quoteAll(ss []string) []string {
+	out := make([]string, len(ss))
+	for i, s := range ss {
+		out[i] = "`" + s + "`"
+	}
+	return out
+}
+
+// ---- risks ----
+
+func (d *doc) risks() {
+	a := d.a
+	d.p("## Risks and costs")
+	d.p("")
+	open := a.Open()
+	if len(open) == 0 {
+		d.p("No open findings.")
+		d.p("")
+	} else {
+		d.p("| | Rule | About | Finding |")
+		d.p("|---|---|---|---|")
+		for _, f := range open {
+			d.p("| %s | `%s` | %s | %s |", icon(f.Severity), f.Rule, analysis.SubjectText(f.Subject), escape(f.Message))
+		}
+		d.p("")
+	}
+	var accepted []analysis.Finding
+	for _, f := range a.Findings {
+		if f.Accepted != nil {
+			accepted = append(accepted, f)
+		}
+	}
+	if len(accepted) > 0 {
+		d.p("### Accepted")
+		d.p("")
+		d.p("Findings the schema records as deliberate, with its reasons.")
+		d.p("")
+		d.p("| Rule | About | Finding | Reason |")
+		d.p("|---|---|---|---|")
+		for _, f := range accepted {
+			d.p("| `%s` | %s | %s | %s |", f.Rule, analysis.SubjectText(f.Subject), escape(f.Message), escape(f.Accepted.Reason))
+		}
+		d.p("")
+	}
+	if pol := a.Policy; pol.Path != "" {
+		d.p("Checked against the policy in `%s`: open findings of severity %s or worse fail `dynago check` and `dynago generate`.", pol.Path, pol.FailOn)
+		d.p("")
+	}
+	d.p("### Costs")
+	d.p("")
+	d.p("| Entity | Expected items | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |")
 	d.p("|---|---|---|---|---|---|")
-	for _, er := range r.Entities {
+	for _, er := range d.r.Entities {
 		items := "not declared"
-		if er.Entity.Items > 0 {
-			items = strconv.FormatInt(er.Entity.Items, 10)
+		if er.Entity.Count > 0 {
+			items = schema.Number(roundCount(er.Entity.Count))
 		}
 		var tput float64
 		for _, rc := range er.Reads {
@@ -446,386 +513,35 @@ func (d *doc) costs() {
 		d.p("| %s | %s | %s | %.2f GB | $%.2f | $%.2f |", er.Entity.Name, items, sizeText(er.Item), er.StorageGB, er.StorageUSD, tput)
 	}
 	d.p("")
-	d.p("Estimated total: **$%.2f/month** for the declared item counts and rates.", r.MonthlyUSD)
+	d.p("Estimated total: **$%.2f/month** for the declared volumes and rates.", d.r.MonthlyUSD)
 	d.p("")
 	d.p("Assumptions:")
 	d.p("")
-	for _, a := range r.Assumptions {
-		d.p("- %s", a)
+	for _, s := range append(slices.Clone(a.Assumptions), d.r.Assumptions...) {
+		d.p("- %s", s)
 	}
 	d.p("")
+}
+
+func icon(s analysis.Severity) string {
+	return map[analysis.Severity]string{analysis.Error: "⛔ error", analysis.Warning: "⚠️ warning", analysis.Note: "ℹ️ note"}[s]
 }
 
 func (d *doc) primer() {
 	d.p("## How to read this")
 	d.p("")
-	d.p(`- **Everything lives in one table.** Items are addressed by a partition key (` + "`PK`" + `) and a sort key (` + "`SK`" + `). Items sharing a partition key are stored together and can be read with one Query, in sort key order.
-- **Key patterns** such as ` + "`LIB#{libraryId}#TOOL#{toolId}`" + ` show how keys are built: literal text plus field values. Times in keys are fixed-width UTC so they sort chronologically.
-- **Entities** are the domain types. Each is stored as one item, plus the items listed under *Stored items*: index entries, copies, uniqueness claims and counters. The generated code writes and deletes the copies, claims and counters in the same transaction as the item; DynamoDB maintains the GSI entries itself.
+	d.p(`- **Items and keys.** Everything lives in one table. Items are addressed by a partition key (` + "`PK`" + `) and a sort key (` + "`SK`" + `). Items sharing a partition key are stored together and can be read with one Query, in sort key order. Key patterns such as ` + "`LIB#{libraryId}#TOOL#{toolId}`" + ` show how keys are built: literal text plus field values. Times in keys are fixed-width UTC so they sort chronologically.
+- **Entities** are the domain types. Each is stored as one item, plus the items listed under *Stored items* in the reference: index entries, copies, uniqueness claims and counters. The generated code writes and deletes the copies, claims and counters in the same transaction as the item; DynamoDB maintains the GSI entries itself.
+- **Reads and writes** are the only ones the code can do: each read is one request (two for a lookup by a unique value), and each write is atomic. A read or write nobody declared has no method, so every new one shows up in review as a change to this document.
 - **Global secondary indexes (GSIs)** re-key the same items so they can be queried another way. DynamoDB keeps them up to date asynchronously, so reads through them are eventually consistent (usually well under a second behind). An entity only appears in an index while every text or time field its index keys use is set, and its ` + "`where`" + ` holds, so an index can hold a subset (a *sparse* index).
-- **Copies** are an alternative to a GSI: separate items written in the same transaction as the entity. They cost a transaction on every write that changes what they hold, but can be read back immediately.
+- **Copies** are the other way to index: separate items written in the same transaction as the entity. Writes that change them become transactions, but reads see a write immediately. dynago picks a copy when a read declares ` + "`freshness: immediate`" + `.
 - **Claims** make a value unique: creating the entity also creates an item keyed by the value, conditional on it not existing.
 - **Counters** are items updated with atomic ADD in the same transaction as the entity, so counts never drift from the items they count. A limit on a counter value turns into a condition, which is how capacity is enforced without races.
-- **Access patterns** are the only reads the code can do: each is one request (or two for a lookup by a unique value). A query nobody declared does not exist as a method, so every new way of reading data shows up in review as a schema change.
+- **Partitions.** A partition key value's items (an *item collection*) are served by one DynamoDB partition, which takes at most 1,000 write units and 3,000 read units a second. The partition table estimates, from the declared volumes and rates, how many items each partition key value holds, how big it gets, and how close its busiest value comes to those limits at peak.
 - **Costs** are in DynamoDB capacity units: a write costs 1 WRU per started KB, a read 1 RRU per started 4 KB (half for eventually consistent reads), and transactions cost double.
+- **Findings** have a rule id. A schema can accept a warning or note with a reason (` + "`accept: { rule: reason }`" + ` on the thing it's about); errors must be fixed. A ` + "`dynago.policy.yaml`" + ` can change a rule's severity and which severities fail the build.
 - **Document versions** guard against lost updates. Every entity the store returns knows the version it was read at (` + "`Version()`" + `, an opaque string suitable for an ETag). Passing it back with a write (` + "`dynago.IfVersion`" + `, or the entity itself with ` + "`dynago.From`" + `) makes the write fail if anyone changed the item since, rather than silently overwriting their change. Writes marked *required* refuse to run without one.
-- **Schema versions** are stored on every item (` + "`_v`" + `), along with the entity type (` + "`_t`" + `) and a revision counter (` + "`_rev`" + `) that guards read-modify-write updates.
+- **Schema versions** are stored on every item (` + "`_v`" + `), along with the entity type (` + "`_t`" + `), a revision counter (` + "`_rev`" + `) that guards read-modify-write updates, and when the item was first written and last changed (` + "`_created`" + `, ` + "`_updated`" + `, by the writing server's clock).
 - **Table generations.** A schema change that existing items don't fit (adding, changing or dropping an index, claim or counter; a changed key; a changed field type; a field made required) moves the data to a new table, ` + "`<name>-g<generation>`" + `, copied by a generated migration job; the old table stays for rollback.`)
 	d.p("")
-}
-
-func (d *doc) report(e *schema.Entity) *cost.EntityReport {
-	for _, er := range d.r.Entities {
-		if er.Entity == e {
-			return er
-		}
-	}
-	return &cost.EntityReport{Entity: e, Indexes: map[string]cost.Size{}}
-}
-
-// ---- text helpers ----
-
-func ttlAttr(m *schema.Model) string {
-	for _, e := range m.Entities {
-		if e.TTL != nil {
-			return m.Table.TTLAttr
-		}
-	}
-	return ""
-}
-
-func readsText(a *schema.Access) string {
-	switch a.Kind {
-	case schema.AccessGet:
-		return "item by key"
-	case schema.AccessGetUnique:
-		return "claim `" + a.Unique.Name + "`, then the item"
-	case schema.AccessCounter:
-		return "counter `" + a.Counter.Name + "`"
-	}
-	if a.Index == nil {
-		proj := ""
-		if a.Project != nil {
-			proj = ", only " + fieldCodes(a.ProjectedFields())
-		}
-		return fmt.Sprintf("entity partition%s, page %d (max %d)", proj, a.Page, a.MaxPage)
-	}
-	kind := "GSI"
-	if a.Index.Strategy == schema.StrategyCopy {
-		kind = "copies"
-	}
-	return fmt.Sprintf("%s `%s`, page %d (max %d)", kind, a.Index.Name, a.Page, a.MaxPage)
-}
-
-func keyCondition(a *schema.Access) string {
-	e := a.Entity
-	switch a.Kind {
-	case schema.AccessGet:
-		return fmt.Sprintf("`PK = %s`, `SK = %s`", e.PK.Raw, e.SK.Raw)
-	case schema.AccessGetUnique:
-		return fmt.Sprintf("`PK = %s`", a.Unique.PK.Raw)
-	case schema.AccessCounter:
-		return fmt.Sprintf("`PK = %s`, `SK = %s`", a.Counter.PK.Raw, a.Counter.SK.Raw)
-	}
-	pkAttr, skAttr := "PK", "SK"
-	if a.Index != nil && a.Index.Strategy == schema.StrategyGSI {
-		pkAttr, skAttr = a.Index.PKAttr, a.Index.SKAttr
-	}
-	cond := fmt.Sprintf("`%s = %s`", pkAttr, a.QueryPK().Raw)
-	sk, ok := a.QuerySK()
-	switch {
-	case a.Range != nil:
-		cond += fmt.Sprintf(", `%s` between optional bounds on `%s`", skAttr, a.Range.Name)
-	case ok && sk.LiteralPrefix() != "":
-		cond += fmt.Sprintf(", `begins_with(%s, %q)`", skAttr, sk.LiteralPrefix())
-	}
-	order := "ascending"
-	if a.Desc {
-		order = "descending"
-	}
-	return cond + ", " + order
-}
-
-func consistencyText(a *schema.Access) string {
-	switch {
-	case a.Kind == schema.AccessGetUnique, a.Consistent:
-		return "strong"
-	case a.Index != nil && a.Index.Strategy == schema.StrategyGSI:
-		return "eventual (GSI)"
-	}
-	return "eventual"
-}
-
-func writeText(w *schema.Write) string {
-	switch w.Kind {
-	case schema.WriteCreate:
-		text := "create (fails if it exists)"
-		for _, s := range w.Sets {
-			text += fmt.Sprintf(", set `%s` = %s", s.Field.Name, value(s.Value))
-		}
-		return text + requiresText(w)
-	case schema.WriteDelete:
-		return "delete (fails if absent)" + requiresText(w)
-	}
-	var parts []string
-	for _, f := range w.Args {
-		parts = append(parts, "set `"+f.Name+"`")
-	}
-	for _, f := range w.Patch {
-		parts = append(parts, "set `"+f.Name+"` if given")
-	}
-	for _, s := range w.Sets {
-		parts = append(parts, fmt.Sprintf("set `%s` = %s", s.Field.Name, value(s.Value)))
-	}
-	text := strings.Join(parts, ", ")
-	if len(w.When) > 0 {
-		text += " when " + predText(w.When)
-	}
-	return text + requiresText(w)
-}
-
-func requiresText(w *schema.Write) string {
-	var parts []string
-	for _, rq := range w.Requires {
-		t := "requires " + rq.Condition(w.Entity.Name)
-		if eff := rq.Effect(w.Entity.Name); eff != "" {
-			t += " and " + eff
-		}
-		parts = append(parts, t)
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return "; " + strings.Join(parts, "; ")
-}
-
-func writeErrors(w *schema.Write) []string {
-	e := w.Entity
-	var out []string
-	switch w.Kind {
-	case schema.WriteCreate:
-		out = append(out, "`Err"+e.GoName+"Exists`")
-	default:
-		out = append(out, "`Err"+e.GoName+"NotFound`")
-	}
-	if len(w.When) > 0 {
-		out = append(out, "`Err"+e.GoName+w.GoName+"Precondition`")
-	}
-	for _, rq := range w.Requires {
-		if rq.CanFail() {
-			out = append(out, "`"+rq.ErrName+"`")
-		}
-	}
-	for _, f := range e.Fields {
-		if f.Required && !f.Key && (w.Kind == schema.WriteCreate || changedField(w, f)) {
-			out = append(out, "`dynago.ErrFieldRequired` (a required field is empty)")
-			break
-		}
-	}
-	if len(w.Limits) > 0 {
-		out = append(out, "`dynago.ErrLimitRequired` (no limit given)")
-	}
-	changed := map[*schema.Field]bool{}
-	for _, f := range w.Changed() {
-		changed[f] = true
-	}
-	for _, u := range e.Uniques {
-		touched := w.Kind == schema.WriteCreate
-		for _, f := range u.Fields {
-			touched = touched || changed[f]
-		}
-		if touched && w.Kind != schema.WriteDelete {
-			out = append(out, "`"+u.ErrName+"`")
-		}
-	}
-	for _, c := range e.Counters {
-		for _, v := range c.Values {
-			if v.Limit > 0 && w.Kind == schema.WriteCreate {
-				out = append(out, "`"+v.ErrName+"`")
-			}
-		}
-	}
-	for _, v := range w.Limits {
-		out = append(out, "`"+v.ErrName+"`")
-	}
-	if w.Kind != schema.WriteCreate {
-		for _, c := range e.Counters {
-			for _, v := range c.Values {
-				if v.HasMin && (w.Kind == schema.WriteDelete || feeds(w, c, v)) {
-					out = append(out, "`"+v.MinErrName+"`")
-				}
-			}
-		}
-	}
-	if w.Kind != schema.WriteCreate {
-		out = append(out, "`dynago.ErrVersionMismatch` (with a version)")
-	}
-	if w.VersionRequired {
-		out = append(out, "`dynago.ErrVersionRequired`")
-	}
-	if w.ReadFirst {
-		out = append(out, "`dynago.ErrConflict` (after retries)")
-	}
-	return out
-}
-
-func counterValueText(v *schema.CounterValue) string {
-	var b strings.Builder
-	if v.Sum != nil {
-		fmt.Fprintf(&b, "sum of `%s`", v.Sum.Name)
-	} else {
-		b.WriteString("count of items")
-	}
-	if len(v.Where) > 0 {
-		fmt.Fprintf(&b, " where %s", predText(v.Where))
-	}
-	switch {
-	case v.LimitArg:
-		b.WriteString("; writes that grow it take a caller-supplied limit")
-	case v.Limit > 0:
-		fmt.Fprintf(&b, "; never exceeds %d", v.Limit)
-	}
-	if v.HasMin {
-		fmt.Fprintf(&b, "; never goes below %d", v.Min)
-	}
-	if v.Doc != "" {
-		b.WriteString(". " + strings.TrimSuffix(v.Doc, "."))
-	}
-	return b.String()
-}
-
-func projText(ix *schema.Index) string {
-	switch ix.Projection {
-	case schema.ProjectAll:
-		return "all fields"
-	case schema.ProjectKeys:
-		return "key fields only"
-	}
-	return fieldCodes(ix.Project) + " plus key fields"
-}
-
-func predText(ps []*schema.Pred) string {
-	var parts []string
-	for _, p := range ps {
-		parts = append(parts, fmt.Sprintf("`%s = %s`", p.Field.Name, value(p.Value)))
-	}
-	return strings.Join(parts, " and ")
-}
-
-func value(v any) string {
-	if s, ok := v.(string); ok {
-		return strconv.Quote(s)
-	}
-	return fmt.Sprint(v)
-}
-
-func fieldCodes(fs []*schema.Field) string {
-	var out []string
-	for _, f := range fs {
-		out = append(out, "`"+f.Name+"`")
-	}
-	return strings.Join(out, ", ")
-}
-
-func codeList(ss []string) string {
-	var out []string
-	for _, s := range ss {
-		out = append(out, "`"+s+"`")
-	}
-	return strings.Join(out, ", ")
-}
-
-// example renders a key with the fields' example values, or the pattern where a field has none.
-func example(e *schema.Entity, pk, sk schema.Template, hasSK bool) string {
-	vals := map[string]string{}
-	for _, f := range e.Fields {
-		if f.Example == "" {
-			continue
-		}
-		vals[f.Name] = exampleValue(f)
-	}
-	out := "`" + pk.Render(vals) + "`"
-	if hasSK {
-		out += "<br>`" + sk.Render(vals) + "`"
-	}
-	return out
-}
-
-func exampleValue(f *schema.Field) string {
-	switch f.Type {
-	case schema.TypeTime:
-		for _, layout := range []string{time.RFC3339Nano, time.DateOnly} {
-			if t, err := time.Parse(layout, f.Example); err == nil {
-				return dynago.FmtTime(t)
-			}
-		}
-	case schema.TypeInt:
-		if n, err := strconv.ParseInt(f.Example, 10, 64); err == nil {
-			return dynago.FmtInt(n)
-		}
-	}
-	return f.Example
-}
-
-func sizeText(s cost.Size) string {
-	return cost.Human(s.P50) + " / " + cost.Human(s.P99)
-}
-
-func unitsText(u cost.Units) string {
-	if u.P50 == u.P99 {
-		return trim(u.P50)
-	}
-	return trim(u.P50) + " / " + trim(u.P99)
-}
-
-func trim(f float64) string {
-	return strconv.FormatFloat(f, 'f', -1, 64)
-}
-
-func escape(s string) string {
-	return strings.ReplaceAll(s, "|", "\\|")
-}
-
-// mm escapes text for a quoted Mermaid label.
-func mm(s string) string {
-	return strings.NewReplacer("#", "#35;", `"`, "#quot;").Replace(s)
-}
-
-// article returns "a" or "an" for a word.
-func article(word string) string {
-	if word != "" && strings.ContainsRune("AEIOUaeiou", rune(word[0])) {
-		return "an"
-	}
-	return "a"
-}
-
-// feeds reports whether an update changes anything a counter value depends on.
-func feeds(w *schema.Write, c *schema.Counter, v *schema.CounterValue) bool {
-	changed := map[*schema.Field]bool{}
-	for _, f := range w.Changed() {
-		changed[f] = true
-	}
-	for _, f := range c.KeyFields() {
-		if changed[f] {
-			return true
-		}
-	}
-	if v.Sum != nil && changed[v.Sum] {
-		return true
-	}
-	for _, p := range v.Where {
-		if changed[p.Field] {
-			return true
-		}
-	}
-	return false
-}
-
-func changedField(w *schema.Write, f *schema.Field) bool {
-	for _, c := range w.Changed() {
-		if c == f {
-			return true
-		}
-	}
-	return false
 }

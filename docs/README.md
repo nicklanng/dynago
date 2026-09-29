@@ -11,7 +11,7 @@
 - [Schema](schema.md): every key of a schema file, its defaults and rules. Editors can use the
   [JSON Schema](../schema/dynago.schema.json) for autocomplete.
 - [Generated code](generated-code.md): every generated type, method and error, and how each call behaves.
-- [Command line](cli.md): `dynago generate` and `dynago check`.
+- [Command line](cli.md): `dynago generate`, `check`, `diff` and `vet`.
 - Runtime package: `go doc github.com/nicklanng/dynago`, or pkg.go.dev.
 
 **Guides**
@@ -25,7 +25,11 @@
   changes need a new table.
 - [Migrations](guides/migrations.md): the generated job that fills a new table generation, and
   running it on Kubernetes.
-- [Costs and risks](guides/costs.md): how the estimates are made and what the findings mean.
+- [Analysis](guides/analysis.md): volumes, partitions, every finding's rule, accepting findings,
+  and the policy file.
+- [Reviewing designs and changes](guides/review.md): the model document, architecture diffs for
+  pull requests, and keeping DynamoDB access inside the schema with `dynago vet`.
+- [Costs](guides/costs.md): how capacity and cost are estimated.
 
 **Project**
 

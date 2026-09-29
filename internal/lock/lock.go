@@ -416,7 +416,7 @@ func Changes(a, b Shape, e *schema.Entity) []Change {
 		old, had := oldFields[f.Name]
 		delete(oldFields, f.Name)
 		switch {
-		case !had && e != nil && e.Field(f.Name) != nil && e.Field(f.Name).Required:
+		case !had && (f.Required || (e != nil && e.Field(f.Name) != nil && e.Field(f.Name).Required)):
 			add(false, "field %s added as required (existing items don't have it)", f.Name)
 		case !had:
 			add(true, "field %s added", f.Name)

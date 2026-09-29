@@ -27,6 +27,9 @@
     "output": {
       "$ref": "#/$defs/output"
     },
+    "workload": {
+      "$ref": "#/$defs/workload"
+    },
     "entities": {
       "type": "object",
       "description": "The entities stored in the table, by PascalCase name.",
@@ -87,6 +90,35 @@
       },
       "uniqueItems": true
     },
+    "accept": {
+      "type": "object",
+      "description": "Findings of dynago check this schema records as deliberate: rule id → the reason. Errors can't be accepted. See docs/guides/risks.md.",
+      "propertyNames": {
+        "type": "string",
+        "pattern": "^[a-z][a-z-]*$"
+      },
+      "additionalProperties": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "workload": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Table-wide workload assumptions for the analysis.",
+      "properties": {
+        "peak": {
+          "type": "number",
+          "minimum": 1,
+          "default": 1,
+          "description": "Peak traffic as a multiple of the declared average rates."
+        },
+        "horizon": {
+          "type": "string",
+          "description": "When the declared volumes are expected, e.g. \"3 years\". Shown to readers."
+        }
+      }
+    },
     "table": {
       "type": "object",
       "additionalProperties": false,
@@ -121,6 +153,9 @@
           },
           "uniqueItems": true,
           "description": "Older generations whose tables stay declared in Terraform, for rollback. To delete one, turn off its deletion protection outside the Terraform (the generated Terraform always enables it), then remove it here."
+        },
+        "accept": {
+          "$ref": "#/$defs/accept"
         }
       }
     },
@@ -234,8 +269,11 @@
             "$ref": "#/$defs/write"
           }
         },
-        "estimate": {
-          "$ref": "#/$defs/estimate"
+        "volume": {
+          "$ref": "#/$defs/volume"
+        },
+        "accept": {
+          "$ref": "#/$defs/accept"
         }
       }
     },
@@ -255,14 +293,63 @@
         }
       }
     },
-    "estimate": {
+    "volume": {
+      "oneOf": [
+        {
+          "type": "number",
+          "minimum": 0,
+          "description": "The number of items in the table."
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "typical"
+          ],
+          "properties": {
+            "per": {
+              "$ref": "#/$defs/pascalName",
+              "description": "The entity the numbers are per. Default: the entity whose partition this one's nests in."
+            },
+            "typical": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Items per parent, typically."
+            },
+            "max": {
+              "type": "number",
+              "minimum": 0,
+              "description": "Items per parent, at most: the biggest parent's count."
+            },
+            "by": {
+              "type": "object",
+              "description": "How the items spread over other entities whose keys they hold.",
+              "propertyNames": {
+                "$ref": "#/$defs/pascalName"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/volumeBy"
+              }
+            }
+          }
+        }
+      ],
+      "description": "How many items to expect: a number (the total), or typical and max per parent."
+    },
+    "volumeBy": {
       "type": "object",
       "additionalProperties": false,
+      "required": [
+        "typical"
+      ],
       "properties": {
-        "items": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Expected number of items, for the storage estimate."
+        "typical": {
+          "type": "number",
+          "minimum": 0
+        },
+        "max": {
+          "type": "number",
+          "minimum": 0
         }
       }
     },
@@ -332,12 +419,24 @@
             "copy_of": {
               "type": "string",
               "pattern": "^[A-Z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$",
-              "description": "Entity.field this field copies. dynago does not keep it in sync; declaring it documents the duty and makes dynago check warn."
+              "description": "Entity.field this field copies and must stay equal to. dynago does not keep it in sync: dynago check warns, saying how many items a change of the source fans out to."
+            },
+            "snapshot_of": {
+              "type": "string",
+              "pattern": "^[A-Z][A-Za-z0-9]*\\.[a-z][A-Za-z0-9]*$",
+              "description": "Entity.field whose value this field takes when the item is written, deliberately never updated (a name at the time of an order). Exclusive with copy_of."
+            },
+            "ref": {
+              "$ref": "#/$defs/pascalName",
+              "description": "The entity whose key this field holds, when the field's name doesn't match the key field's."
             },
             "required": {
               "type": "boolean",
               "default": false,
               "description": "Writes may not leave this field at its zero value (dynago.ErrFieldRequired): creates must set it, and updates may not clear it."
+            },
+            "accept": {
+              "$ref": "#/$defs/accept"
             }
           },
           "if": {
@@ -388,8 +487,7 @@
             "gsi",
             "copy"
           ],
-          "default": "gsi",
-          "description": "gsi: a global secondary index maintained by DynamoDB. copy: copy items written in the same transaction."
+          "description": "gsi: a global secondary index maintained by DynamoDB, read eventually consistently. copy: copy items written in the same transaction, readable immediately. Default: copy if a read through it needs freshness: immediate, else gsi."
         },
         "pk": {
           "$ref": "#/$defs/keyTemplate"
@@ -405,6 +503,9 @@
         },
         "doc": {
           "$ref": "#/$defs/doc"
+        },
+        "accept": {
+          "$ref": "#/$defs/accept"
         }
       },
       "if": {
@@ -455,6 +556,9 @@
         },
         "doc": {
           "$ref": "#/$defs/doc"
+        },
+        "accept": {
+          "$ref": "#/$defs/accept"
         }
       }
     },
@@ -492,6 +596,9 @@
           "additionalProperties": {
             "$ref": "#/$defs/counterValue"
           }
+        },
+        "accept": {
+          "$ref": "#/$defs/accept"
         }
       }
     },
@@ -585,6 +692,15 @@
             "counter": {
               "$ref": "#/$defs/pascalName"
             },
+            "scan": {
+              "const": true,
+              "description": "Read every item of the entity, one page of the whole table per call. A declared exception: give a reason."
+            },
+            "reason": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Why a scan is needed."
+            },
             "order": {
               "enum": [
                 "asc",
@@ -610,7 +726,14 @@
             },
             "consistent": {
               "type": "boolean",
-              "description": "Strongly consistent read (twice the cost). Default false, except for queries through a copy index, which default to true. Not allowed on a GSI."
+              "description": "Strongly consistent read (twice the cost). Default false, except for queries through a copy index, which default to true. Not allowed on a GSI. Prefer freshness, which states the need."
+            },
+            "freshness": {
+              "enum": [
+                "immediate",
+                "eventual"
+              ],
+              "description": "What the reader needs. immediate: read-your-writes (a consistent read; an index read through becomes a copy). eventual: a moment's lag is fine."
             },
             "doc": {
               "$ref": "#/$defs/doc"
@@ -623,6 +746,9 @@
             "project": {
               "$ref": "#/$defs/projection",
               "description": "For query: key only. Read just these fields (plus key fields), for bandwidth and to keep other fields from callers. DynamoDB still bills the whole item."
+            },
+            "accept": {
+              "$ref": "#/$defs/accept"
             }
           },
           "oneOf": [
@@ -639,6 +765,12 @@
             {
               "required": [
                 "counter"
+              ]
+            },
+            {
+              "required": [
+                "scan",
+                "reason"
               ]
             }
           ]
@@ -708,6 +840,9 @@
               "additionalProperties": {
                 "$ref": "#/$defs/require"
               }
+            },
+            "accept": {
+              "$ref": "#/$defs/accept"
             }
           },
           "oneOf": [

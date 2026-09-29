@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/nicklanng/dynago/internal/analysis"
 	"github.com/nicklanng/dynago/internal/cost"
 	"github.com/nicklanng/dynago/internal/lock"
 	"github.com/nicklanng/dynago/internal/schema"
@@ -22,7 +23,7 @@ func TestGolden(t *testing.T) {
 	if _, _, err := lock.Apply(m, &lock.File{Dynago: 1, Entities: map[string]*lock.History{}}, lock.Options{}); err != nil {
 		t.Fatal(err)
 	}
-	got := Generate(m, cost.Analyze(m, cost.DefaultPrices), "golden.dynago.yaml")
+	got := Generate(m, analysis.Analyze(m, cost.DefaultPrices, nil), "golden.dynago.yaml")
 	path := filepath.Join("..", "testdata", "golden.model.md")
 	if *update {
 		if err := os.WriteFile(path, got, 0o644); err != nil {

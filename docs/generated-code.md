@@ -34,10 +34,11 @@ For an entity `Loan`:
 
 | Name | Declared by | What it is |
 |---|---|---|
-| `Loan` | the entity | A struct with one exported field per schema field, tagged for guregu. Has `Key()` and `Version()`. |
+| `Loan` | the entity | A struct with one exported field per schema field, tagged for guregu. Has `Key()`, `Version()` and `Timestamps()`. |
 | `LoanKey` | the key templates | The primary key fields, in template order. |
 | `(*Loan).Key() LoanKey` | | The entity's key. |
 | `(*Loan).Version() string` | | The opaque version the entity was read or created at, or `""` if the store never saw it. See [Concurrency](guides/concurrency.md). |
+| `(*Loan).Timestamps() dynago.Timestamps` | | When the stored item was first written and last changed. See [Timestamps](#timestamps). |
 | `LoanStatus` + `LoanStatusActive`, … | an `enum` field `status` | A string type and one constant per value. |
 | `LoanStore` | | The methods below. Get it from `Store.Loans`. |
 | `LoanOverdue` | an index `Overdue` without `project: all` | What a query through the index returns: key fields plus projected fields. |
@@ -88,8 +89,8 @@ the item's condition failed, not which clause, so the error matches each of thei
 
 ## Reads
 
-Every read is one request, except a lookup by unique value (two). None of them scan or page
-internally. Items whose `ttl` time has passed are treated as absent everywhere, even though
+Every read is one request, except a lookup by unique value (two). None of them page internally,
+and none scan, except a read declared as a `scan`. Items whose `ttl` time has passed are treated as absent everywhere, even though
 DynamoDB may not delete them for days.
 
 ### `get: key`
@@ -146,6 +147,18 @@ with `dynago.From` fails with `ErrVersionMismatch` if so. Copy items don't store
 entities read through a copy index have no version (`Version()` is `""`, and `dynago.From` refuses
 them): get the item when you need one. Other indexes return the `<Entity><Index>` view type, and
 projected base queries the `<Entity><Access>Item` type.
+
+### `scan`
+
+```go
+func (s *LoanStore) Export(ctx context.Context, page dynago.Page) ([]Loan, string, error)
+```
+
+A declared exception: exactly one Scan request per call, over **the whole table**, filtered to the
+entity's items (and, for an entity with a `ttl`, to unexpired ones). `page.Size` counts items
+evaluated, of every kind, so a page can hold few or none of the entity's items and still have a
+next cursor: keep going until the cursor is `""`. Cursors work as for queries. The method's doc
+comment carries the schema's `reason`.
 
 ### `counter`
 
@@ -240,6 +253,35 @@ An entity with no claims, copies, counters or `requires` is deleted with one con
 DeleteItem. Otherwise the item is read (or taken from `dynago.From`) so its contributions can be
 released in the same transaction.
 
+## Timestamps
+
+Every row dynago writes records when it was first written (`_created`) and last changed
+(`_updated`): entity items, copies, uniqueness claims and counter items. The generated code sets
+them on every write path (creates, each update shape, changes made through `requires`, counter
+updates), so they can't be forgotten, and callers can't set them.
+
+```go
+tool, _ := st.Tools.Get(ctx, key)
+ts := tool.Timestamps()          // dynago.Timestamps{Created, Updated time.Time}
+```
+
+- A create stamps both, and afterwards `e.Timestamps()` returns them.
+- Every change stamps `_updated`; `_created` never changes.
+- A copy carries its entity's creation time, and is stamped updated when it is written. A counter
+  item records when it was first and last counted; a claim, when the value was taken.
+- The migration job copies an item with its timestamps: moving to a new table generation doesn't
+  change it.
+- Items written before dynago kept timestamps have none until they are rewritten, and then only
+  `_updated`: their creation time stays unknown (zero), rather than wrong.
+- They are stored in the same fixed-width UTC format as times in keys, so they sort and read
+  naturally in the console.
+- The time comes from the clock of the server that made the write. Across servers, timestamps are
+  ordered only as well as those clocks agree: fine for "when did this change", not for deciding
+  which of two concurrent writes came first (the revision does that).
+- They are on the item, not in index projections: entities read through a GSI or copy with
+  `project: all` carry them (a copy's `_updated` is when the copy was last written); narrower
+  views don't.
+
 ## What every write guarantees
 
 - **Atomic derived items.** Claims, copies, counters and everything `requires` declares (checks,
@@ -272,9 +314,10 @@ released in the same transaction.
 
 ## What the generated code does not do
 
-- It does not expose raw DynamoDB access, scans or filters (the only filter is the one that drops
+- It does not expose raw DynamoDB access, or filters (the only filter is the one that drops
   expired items, on entities with a `ttl`). A read that is not declared does not
-  exist. Add an access pattern to the schema instead.
+  exist. Add an access pattern to the schema instead. `dynago vet` finds code that reaches
+  DynamoDB around the store.
 - It does not change another entity in arbitrary ways: `requires` can set constants (or the
   writer's field values) on another entity and delete it, not compute new values from it.
 - It does not decrement counters or release claims and copies when DynamoDB deletes an expired item.

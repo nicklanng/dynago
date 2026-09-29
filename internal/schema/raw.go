@@ -47,7 +47,16 @@ type RawFile struct {
 	Package  string             `yaml:"package"`
 	Table    RawTable           `yaml:"table"`
 	Output   RawOutput          `yaml:"output"`
+	Workload RawWorkload        `yaml:"workload"`
 	Entities Ordered[RawEntity] `yaml:"entities"`
+}
+
+// RawWorkload holds table-wide workload assumptions for the analysis.
+type RawWorkload struct {
+	// Peak is the ratio of peak to average traffic, applied to every declared rate.
+	Peak float64 `yaml:"peak"`
+	// Horizon says when the declared volumes are expected, for the reader ("3 years").
+	Horizon string `yaml:"horizon"`
 }
 
 // RawOutput overrides where generated files are written, relative to the schema file.
@@ -70,6 +79,8 @@ type RawTable struct {
 	Generation int `yaml:"generation"`
 	// Retain lists older generations whose tables are kept (declared in Terraform) for rollback.
 	Retain []int `yaml:"retain"`
+	// Accept records findings about the table as deliberate: rule id → reason.
+	Accept Ordered[string] `yaml:"accept"`
 }
 
 // RawEntity describes one entity and everything derived from it.
@@ -84,12 +95,59 @@ type RawEntity struct {
 	Counters Ordered[RawCounter] `yaml:"counters"`
 	Access   Ordered[RawAccess]  `yaml:"access"`
 	Writes   Ordered[RawWrite]   `yaml:"writes"`
-	Estimate RawEstimate         `yaml:"estimate"`
+	Volume   RawVolume           `yaml:"volume"`
+	Accept   Ordered[string]     `yaml:"accept"`
 }
 
-// RawEstimate holds volume assumptions used by the cost report.
-type RawEstimate struct {
-	Items int64 `yaml:"items"`
+// RawVolume is how many items of an entity to expect: a total (`volume: 2000`), or a number per
+// parent entity (`volume: { typical: 20, max: 40000 }`).
+type RawVolume struct {
+	// Total is the short form: the number of items in the table.
+	Total *float64 `yaml:"-"`
+	// Per names the parent the numbers are per; inferred from the partition key when absent.
+	Per     string   `yaml:"per"`
+	Typical *float64 `yaml:"typical"`
+	Max     *float64 `yaml:"max"`
+	// By says how the items spread over other entities they refer to.
+	By  Ordered[RawVolumeBy] `yaml:"by"`
+	Set bool                 `yaml:"-"`
+}
+
+// UnmarshalYAML accepts a number (the total) or a mapping.
+func (v *RawVolume) UnmarshalYAML(n *yaml.Node) error {
+	v.Set = true
+	if n.Kind == yaml.ScalarNode {
+		var total float64
+		if err := n.Decode(&total); err != nil {
+			return fmt.Errorf("line %d: volume must be a number of items or {typical, max}", n.Line)
+		}
+		v.Total = &total
+		return nil
+	}
+	type plain RawVolume
+	if err := strictDecode(n, (*plain)(v)); err != nil {
+		return err
+	}
+	v.Set = true
+	return nil
+}
+
+// RawVolumeBy is how many items of an entity each item of another entity has.
+type RawVolumeBy struct {
+	Typical *float64 `yaml:"typical"`
+	Max     *float64 `yaml:"max"`
+}
+
+// UnmarshalYAML decodes a RawVolumeBy, rejecting unknown keys.
+func (v *RawVolumeBy) UnmarshalYAML(n *yaml.Node) error {
+	type plain RawVolumeBy
+	return strictDecode(n, (*plain)(v))
+}
+
+// UnmarshalYAML decodes a RawWorkload, rejecting unknown keys.
+func (w *RawWorkload) UnmarshalYAML(n *yaml.Node) error {
+	type plain RawWorkload
+	return strictDecode(n, (*plain)(w))
 }
 
 // RawKey is a pair of key templates.
@@ -106,9 +164,16 @@ type RawField struct {
 	Size    string   `yaml:"size"`
 	Example string   `yaml:"example"`
 	Values  []string `yaml:"values"`
-	CopyOf  string   `yaml:"copy_of"`
+	// CopyOf declares a copy of another entity's field that must stay equal to it.
+	CopyOf string `yaml:"copy_of"`
+	// SnapshotOf declares a copy of another entity's field taken when this item is written, and
+	// deliberately never updated.
+	SnapshotOf string `yaml:"snapshot_of"`
+	// Ref names the entity whose key this field holds.
+	Ref string `yaml:"ref"`
 	// Required rejects the zero value on every write that sets the field.
-	Required bool `yaml:"required"`
+	Required bool            `yaml:"required"`
+	Accept   Ordered[string] `yaml:"accept"`
 }
 
 // UnmarshalYAML accepts the scalar short form.
@@ -123,12 +188,13 @@ func (f *RawField) UnmarshalYAML(n *yaml.Node) error {
 
 // RawIndex declares an alternative way to reach an entity.
 type RawIndex struct {
-	Strategy string       `yaml:"strategy"`
-	PK       string       `yaml:"pk"`
-	SK       string       `yaml:"sk"`
-	Project  RawProject   `yaml:"project"`
-	Where    Ordered[any] `yaml:"where"`
-	Doc      string       `yaml:"doc"`
+	Strategy string          `yaml:"strategy"`
+	PK       string          `yaml:"pk"`
+	SK       string          `yaml:"sk"`
+	Project  RawProject      `yaml:"project"`
+	Where    Ordered[any]    `yaml:"where"`
+	Doc      string          `yaml:"doc"`
+	Accept   Ordered[string] `yaml:"accept"`
 }
 
 // RawProject is "all", "keys", or a list of fields.
@@ -154,10 +220,11 @@ func (p *RawProject) UnmarshalYAML(n *yaml.Node) error {
 
 // RawUnique declares a uniqueness constraint enforced by a claim item.
 type RawUnique struct {
-	Fields []string `yaml:"fields"`
-	PK     string   `yaml:"pk"`
-	SK     string   `yaml:"sk"`
-	Doc    string   `yaml:"doc"`
+	Fields []string        `yaml:"fields"`
+	PK     string          `yaml:"pk"`
+	SK     string          `yaml:"sk"`
+	Doc    string          `yaml:"doc"`
+	Accept Ordered[string] `yaml:"accept"`
 }
 
 // RawCounter declares an atomic counter item maintained from the entity's writes.
@@ -167,6 +234,7 @@ type RawCounter struct {
 	Shards int                      `yaml:"shards"`
 	Doc    string                   `yaml:"doc"`
 	Values Ordered[RawCounterValue] `yaml:"values"`
+	Accept Ordered[string]          `yaml:"accept"`
 }
 
 // RawCounterValue is one attribute of a counter item. The short form is `name: count`.
@@ -197,15 +265,21 @@ type RawAccess struct {
 	Get     *RawGet `yaml:"get"`
 	Query   string  `yaml:"query"`
 	Counter string  `yaml:"counter"`
-	Order   string  `yaml:"order"`
-	Page    int     `yaml:"page"`
-	MaxPage int     `yaml:"max_page"`
-	Range   string  `yaml:"range"`
+	// Scan reads every item of the entity, a page at a time: a declared exception, with a reason.
+	Scan   bool   `yaml:"scan"`
+	Reason string `yaml:"reason"`
+	// Freshness is what the reader needs: immediate (read-your-writes) or eventual.
+	Freshness string `yaml:"freshness"`
+	Order     string `yaml:"order"`
+	Page      int    `yaml:"page"`
+	MaxPage   int    `yaml:"max_page"`
+	Range     string `yaml:"range"`
 	// Consistent is nil when not given: copy queries then default to consistent reads.
-	Consistent *bool      `yaml:"consistent"`
-	Project    RawProject `yaml:"project"`
-	Doc        string     `yaml:"doc"`
-	Rate       float64    `yaml:"rate"`
+	Consistent *bool           `yaml:"consistent"`
+	Project    RawProject      `yaml:"project"`
+	Doc        string          `yaml:"doc"`
+	Rate       float64         `yaml:"rate"`
+	Accept     Ordered[string] `yaml:"accept"`
 }
 
 // RawGet is `key` or `{unique: Name}`.
@@ -262,6 +336,7 @@ type RawWrite struct {
 	Doc        string              `yaml:"doc"`
 	Rate       float64             `yaml:"rate"`
 	HotKeyRate float64             `yaml:"hot_key_rate"`
+	Accept     Ordered[string]     `yaml:"accept"`
 	isUpdate   bool
 }
 
@@ -368,12 +443,6 @@ func (t *RawTable) UnmarshalYAML(n *yaml.Node) error {
 // UnmarshalYAML decodes a RawEntity, rejecting unknown keys.
 func (e *RawEntity) UnmarshalYAML(n *yaml.Node) error {
 	type plain RawEntity
-	return strictDecode(n, (*plain)(e))
-}
-
-// UnmarshalYAML decodes a RawEstimate, rejecting unknown keys.
-func (e *RawEstimate) UnmarshalYAML(n *yaml.Node) error {
-	type plain RawEstimate
 	return strictDecode(n, (*plain)(e))
 }
 

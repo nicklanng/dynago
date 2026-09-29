@@ -6,22 +6,194 @@ A table whose name starts with a digit.
 
 Table generation **1**: `2shop-g1`.
 
-**Contents:** [Table](#table) · [Order](#order) · [Cart](#cart) · [Costs and risks](#costs-and-risks) · [How to read this](#how-to-read-this)
+**Contents:** [Summary](#summary) · [Domain](#domain) · [Reads](#reads) · [Writes](#writes) · [Storage and partitions](#storage-and-partitions) · [Risks and costs](#risks-and-costs) · [Reference](#reference) · [How to read this](#how-to-read-this)
 
-## Table
+## Summary
+
+| | |
+|---|---|
+| Entities | 2: Order, Cart |
+| Reads | 3: 1 by key, 2 queries |
+| Writes | 4: 3 in a transaction, 2 reading the item first |
+| Indexes | 1 GSI, 1 copy index (ByDay, Order.Recent) |
+| Uniqueness claims, counters | 0, 1 |
+| Workload | No peak factor declared (peaks taken as the averages); volumes declared for 0 of 2 entities |
+| Cost | $0.00/month at the declared volumes and rates |
+| Findings | 0 errors, 4 warnings, 1 note open; 0 accepted |
+
+Open findings (details under [Risks and costs](#risks-and-costs)):
+
+- ⚠️ warning **sparse-index**, index Order.ByDay: is keyed by placedAt, which is optional.
+- ⚠️ warning **sparse-index**, index Order.Recent: is keyed by customerId and placedAt, which are optional.
+- ⚠️ warning **unused-index**, index Cart.ByDay: no declared read uses ByDay, yet every write that creates, deletes or moves an entry pays for it.
+- ⚠️ warning **sparse-index**, index Cart.ByDay: is keyed by placedAt, which is optional.
+
+## Domain
+
+### Entities
+
+| Entity | What it is | Identified by | Volume | Expected items |
+|---|---|---|---|---|
+| [Order](#order) | An order in a shop. | `shopId`, `orderId` | not declared | — |
+| [Cart](#cart) | A basket that lapses. | `shopId`, `cartId` | not declared | — |
+
+### Relationships
+
+```mermaid
+erDiagram
+  Order ||--o| Cart : "Checkout requires"
+```
+
+| Entity | Related to | How |
+|---|---|---|
+| Cart | Order | Holds its Order's key in `shopId`, `cartId` (Order's `orderId`); Checkout requires it; at most one per Order. |
+
+### Guarantees
+
+What the generated code enforces on every write, so no bug or race elsewhere can break it.
+
+- **Cart**
+  - Every Cart has expiresAt. *(required fields)*
+  - Checkout requires any Order to have status = "open" (an absent or expired one passes), in one transaction. *(Cart.Checkout)*
+
+### Lifecycles
+
+How writes move each status-like field between its values. `*` marks a write that doesn't check the current value, or lets the caller choose the new one.
+
+#### Order.status
+
+```mermaid
+stateDiagram-v2
+  state "open" as s0
+  state "closed" as s1
+  [*] --> s0: Place
+  s0 --> s1: Close
+```
+
+No write moves a Order out of `closed`.
+
+## Reads
+
+Every read the code can make. A read that isn't listed has no method, so a new way of reading the data can only arrive as a change to the schema, and to this document.
+
+| Read | Answers | Served by | Freshness | Returns | RRU per call p50/p99 | Rate |
+|---|---|---|---|---|---|---|
+| `Order.Get` | One Order, by shopId and orderId. | GetItem | eventual (not stated) | one | 0.5 | — |
+| `Order.Day` | Orders with a given shopId, by placedAt (ascending). | Query of GSI ByDay | eventual (not stated) | pages of 50, a page at a time (volume not declared) | 2 / 3.5 | — |
+| `Order.Recent` | Orders with a given customerId, by placedAt (descending). | Query of copy Recent | strong (not stated) | pages of 50, a page at a time (volume not declared) | 5 / 8 | — |
+
+## Writes
+
+Every write the code can make, and everything each changes. Each is atomic: all of it happens, or none of it does.
+
+| Write | Does | Checks | Changes | Reads first | Atomic | WRU per call p50/p99 | Rate |
+|---|---|---|---|---|---|---|---|
+| `Order.Place` | Creates a Order, sets `status` = "open" | no Order at the key | Order<br>GSI ByDay entry<br>copy Recent<br>counter CustomerOrders | no | transaction, 3 items | 7 | — |
+| `Order.Close` | Sets `status` = "closed" | the Order exists; status = "open" | Order<br>GSI ByDay entry<br>copy Recent<br>counter CustomerOrders | yes | transaction, 3 items | 7 | — |
+| `Cart.Open` | Creates a Cart | no Cart at the key; required fields are set | Cart<br>GSI ByDay entry | no | single item | 2 | — |
+| `Cart.Checkout` | Deletes a Cart | the Cart exists; any Order has status = "open" (none is fine) | Cart<br>GSI ByDay entry<br>check Order | yes | transaction, 2 items | 5 | — |
+
+## Storage and partitions
+
+### Table
 
 | Setting | Value |
 |---|---|
+| Table | `2shop-g1` (generation 1) |
 | Base key | `PK` (partition, string) + `SK` (sort, string) |
 | Billing | On-demand |
 | TTL attribute | `ttl` (epoch seconds) |
-| Entities | Order, Cart |
 
-| Global secondary index | Keys | Projection | Used by |
+### Indexes
+
+A GSI is maintained by DynamoDB a moment after each write: writes stay cheap, and reads are eventually consistent. A copy is written by the generated code in the write's transaction: writes that change it cost a transaction, and reads see them immediately.
+
+| Index | Kind | Keys | Projection | Read by | Why this kind | The other kind |
+|---|---|---|---|---|---|---|
+| `Order.ByDay` | GSI `ByDay` | `SHOP#{shopId}#DAY` / `ORDER#{placedAt}#{orderId}` | `status`, `total` plus key fields | Day | chosen: no read through it needs immediate freshness | Can't be a copy: as copies in the base table, ByDay's items could be confused with Order items (sort keys "ORDER#{placedAt}#{orderId}" and "ORDER#{orderId}" share a prefix). |
+| `Order.Recent` | copy | `CUST#{customerId}#RECENT` / `ORDER#{placedAt}#{shopId}#{orderId}` | all fields | Recent | declared | As a GSI: Order.Place 7 → 6 WRU (3 → 2 items); Order.Close 7 → 6 WRU (3 → 2 items); reads would be eventually consistent. |
+| `Cart.ByDay` | GSI `ByDay` | `SHOP#{shopId}#DAY` / `CART#{placedAt}#{cartId}` | key fields only | nothing | chosen: no read through it needs immediate freshness | Can't be a copy: as copies in the base table, ByDay's items could be confused with Cart items (sort keys "CART#{placedAt}#{cartId}" and "CART#{cartId}" share a prefix). |
+
+### Partition map
+
+Which items share a partition, in the base table and in each GSI, and which reads reach them.
+
+```mermaid
+flowchart LR
+  subgraph p0["SHOP#35;{shopId}"]
+    p0m0["Order"]
+    p0m1["Cart"]
+  end
+  subgraph p1["GSI ByDay: SHOP#35;{shopId}#35;DAY"]
+    p1m0["Order ByDay entry"]
+    p1m1["Cart ByDay entry"]
+  end
+  subgraph p2["CUST#35;{customerId}#35;RECENT"]
+    p2m0["Order Recent copy"]
+  end
+  subgraph p3["CUST#35;{customerId}"]
+    p3m0["counter CustomerOrders"]
+  end
+  r_Order_Get{{"Order.Get"}} --> p0
+  r_Order_Day{{"Order.Day"}} --> p1
+  r_Order_Recent{{"Order.Recent"}} --> p2
+```
+
+### Partitions
+
+Each row is every partition key value one key pattern renders: *Keys* is how many values there are. Counts are per value: typical, then the largest. Traffic is the busiest value's at peak.
+
+| Partition key | In | Keys | Holds | Size, typical / largest | Grows | Busiest key at peak | Risk |
+|---|---|---|---|---|---|---|---|
+| `SHOP#{shopId}` | base table | unknown | Order: unknown<br>Cart: unknown | unknown / unknown | yes: Order never removed | no rates declared | — |
+| `SHOP#{shopId}#DAY` | GSI ByDay | unknown | Order ByDay entry: unknown<br>Cart ByDay entry: unknown | unknown / unknown | yes: Order never removed | no rates declared | — |
+| `CUST#{customerId}#RECENT` | base table | unknown | Order Recent copy: unknown | unknown / unknown | yes: Order never removed | no rates declared | — |
+| `CUST#{customerId}` | base table | unknown | counter CustomerOrders: 1 | 152 B / 152 B | no | no rates declared | — |
+
+Unknown counts: nothing declares how many items share a value of `shopId` in `SHOP#{shopId}`, `shopId` in `SHOP#{shopId}#DAY`, `customerId` in `CUST#{customerId}#RECENT`, `customerId` in `CUST#{customerId}`. For a field that identifies another entity, name it (`ref:`, or a matching field name) and give the spread (`volume.by`).
+
+## Risks and costs
+
+| | Rule | About | Finding |
 |---|---|---|---|
-| `ByDay` | `ByDayPK` + `ByDaySK` | INCLUDE `_t`, `_v`, `shopId`, `orderId`, `status`, `total`, `placedAt`, `cartId`, `ttl` | Order, Cart |
+| ⚠️ warning | `sparse-index` | index Order.ByDay | is keyed by placedAt, which is optional: a Order without one is missing from ByDay and from Day, with nothing to say so. Make the field required, or accept this if it's deliberate. |
+| ⚠️ warning | `sparse-index` | index Order.Recent | is keyed by customerId and placedAt, which are optional: a Order without them is missing from Recent and from the read Recent, with nothing to say so. Make the field required, or accept this if it's deliberate. |
+| ⚠️ warning | `unused-index` | index Cart.ByDay | no declared read uses ByDay, yet every write that creates, deletes or moves an entry pays for it. Declare the read that needs it, or remove it. |
+| ⚠️ warning | `sparse-index` | index Cart.ByDay | is keyed by placedAt, which is optional: a Cart without one is missing from ByDay, with nothing to say so. Make the field required, or accept this if it's deliberate. |
+| ℹ️ note | `shared-gsi` | index Order.ByDay | GSI ByDay is shared by Order, Cart; its projection is the union of what each needs, so every entity pays for the others' projected attributes. |
 
-## Order
+### Costs
+
+| Entity | Expected items | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
+|---|---|---|---|---|---|
+| Order | not declared | 395 B / 713 B | 0.00 GB | $0.00 | $0.00 |
+| Cart | not declared | 384 B / 660 B | 0.00 GB | $0.00 | $0.00 |
+
+Estimated total: **$0.00/month** for the declared volumes and rates.
+
+Assumptions:
+
+- Volumes describe the table at no stated point in time (no workload.horizon).
+- Peak traffic is assumed equal to the declared average rates (no workload.peak).
+- Items per partition follow the volumes: an entity's items per parent (typical and max), multiplied up the parents. A partition's largest count takes the biggest skew along its path, not every one at once.
+- An enum in a partition key splits the items evenly among its values typically; at worst they all share one. A field that refers to another entity (by name, ref or requires) spreads the items evenly over that entity's items, unless volume.by says otherwise. Any other field leaves the count unknown.
+- Index entries are counted as if every item had one: `where` and empty key fields only make an index smaller.
+- The busiest partition gets traffic in proportion to its share of the items: its largest count over the entity's total. A write's declared hot_key_rate replaces that estimate for every partition it touches.
+- A partition key value takes at most 1000 WRU and 3000 RRU per second. Risk is the larger share of either at peak: low under 10%, medium under 50%, high above.
+- Sizes use each field's declared size (p50/p99); undeclared sizes use type defaults (string 20/64 B, time 30/35 B, int 8/11 B).
+- Every declared field is assumed present; empty fields are not stored, so real items are usually smaller.
+- A unique string set makes one claim per element; the number of elements is estimated from the set's declared size at 20 B per element.
+- Capacity follows DynamoDB rules: 1 WRU per started 1 KB written, 1 RRU per started 4 KB read strongly (half for eventually consistent); transactions cost double, and a condition check on another item is billed as a transactional write of that item.
+- GSI and copy writes are counted as one index write per entry; an index key change is a delete plus a put.
+- Prices: $0.625 per million WRU, $0.125 per million RRU, $0.25 per GB-month (on-demand).
+- Monthly figures use each access pattern's and write's declared average rate (rate:, per second); patterns without a rate are not costed.
+- Storage counts each entity's items, index entries and claims at its declared volume, plus 100 bytes of overhead per item. A scan reads the base table's items, copies and claims, without GSI entries or overhead; counter items aren't counted.
+
+## Reference
+
+Each entity in full: its fields, every item stored for it, the key condition of each read, and the errors each write returns.
+
+### Order
 
 An order in a shop.
 
@@ -48,7 +220,7 @@ flowchart LR
 
 Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB; solid arrows are written by the generated code.
 
-### Fields
+#### Fields
 
 | Field | Type | Attribute | Size p50/p99 | Notes |
 |---|---|---|---|---|
@@ -59,44 +231,44 @@ Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB
 | `total` | int | `total` | 8 / 11 B |  |
 | `placedAt` | time | `placedAt` | 30 / 35 B |  |
 
-### Stored items
+#### Stored items
 
 Every item that exists because of an Order, and what keeps it up to date.
 
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
-| **Order** | `SHOP#{shopId}` | `ORDER#{orderId}` | `SHOP#{shopId}`<br>`ORDER#{orderId}` | 319 B / 637 B | the writes below |
+| **Order** | `SHOP#{shopId}` | `ORDER#{orderId}` | `SHOP#{shopId}`<br>`ORDER#{orderId}` | 395 B / 713 B | the writes below |
 | GSI `ByDay` entry | `SHOP#{shopId}#DAY` | `ORDER#{placedAt}#{orderId}` | `SHOP#{shopId}#DAY`<br>`ORDER#{placedAt}#{orderId}` | 282 B / 554 B | DynamoDB, from the item's `ByDayPK`/`ByDaySK` attributes (eventually consistent). Sparse: absent when a key field is empty. |
-| Copy `Recent` | `CUST#{customerId}#RECENT` | `ORDER#{placedAt}#{shopId}#{orderId}` | `CUST#{customerId}#RECENT`<br>`ORDER#{placedAt}#{shopId}#{orderId}` | 271 B / 543 B | the writes below, in the same transaction as the item. |
-| Counter `CustomerOrders` | `CUST#{customerId}` | `ORDERS` | `CUST#{customerId}`<br>`ORDERS` | ~100 B | the writes below, with atomic ADDs in the same transaction. |
+| Copy `Recent` | `CUST#{customerId}#RECENT` | `ORDER#{placedAt}#{shopId}#{orderId}` | `CUST#{customerId}#RECENT`<br>`ORDER#{placedAt}#{shopId}#{orderId}` | 347 B / 619 B | the writes below, in the same transaction as the item. |
+| Counter `CustomerOrders` | `CUST#{customerId}` | `ORDERS` | `CUST#{customerId}`<br>`ORDERS` | ~152 B | the writes below, with atomic ADDs in the same transaction. |
 
-### Indexes
+#### Indexes
 
-- **ByDay** (global secondary index, maintained by DynamoDB, eventually consistent).  Projection: `status`, `total` plus key fields.
+- **ByDay** (global secondary index, maintained by DynamoDB, eventually consistent; chosen because no read through it needs immediate freshness).  Projection: `status`, `total` plus key fields.
 - **Recent** (copy items written in the same transaction as the entity, readable strongly consistently).  Projection: all fields.
 
-### Counters
+#### Counters
 
 - **CustomerOrders**, keyed by `customerId`. 
   - `open`: count of items where `status = "open"`.
   - `spent`: sum of `total`.
 
-### Access patterns
+#### Access patterns
 
 | Method | Reads | Key condition | Consistency | Requests | RRU per call p50/p99 |
 |---|---|---|---|---|---|
 | `Get` | item by key | `PK = SHOP#{shopId}`, `SK = ORDER#{orderId}` | eventual | GetItem | 0.5 |
 | `Day` | GSI `ByDay`, page 50 (max 100) | `ByDayPK = SHOP#{shopId}#DAY`, `ByDaySK` between optional bounds on `placedAt`, ascending | eventual (GSI) | Query | 2 / 3.5 |
-| `Recent` | copies `Recent`, page 50 (max 100) | `PK = CUST#{customerId}#RECENT`, `begins_with(SK, "ORDER#")`, descending | strong | Query | 4 / 7 |
+| `Recent` | copies `Recent`, page 50 (max 100) | `PK = CUST#{customerId}#RECENT`, `begins_with(SK, "ORDER#")`, descending | strong | Query | 5 / 8 |
 
-### Writes
+#### Writes
 
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
 | `Place` | create (fails if it exists), set `status` = "open" | Order<br>GSI ByDay entry<br>copy Recent<br>counter CustomerOrders | no | transaction (3 items) | — | 7 | `ErrOrderExists` |
 | `Close` | set `status` = "closed" when `status = "open"` | Order<br>GSI ByDay entry<br>copy Recent<br>counter CustomerOrders | yes (1 consistent read; none with `dynago.From`) | transaction (3 items) | optional | 7 | `ErrOrderNotFound`<br>`ErrOrderClosePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 
-## Cart
+### Cart
 
 A basket that lapses.
 
@@ -117,74 +289,52 @@ flowchart LR
 
 Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB; solid arrows are written by the generated code.
 
-### Fields
+#### Fields
 
 | Field | Type | Attribute | Size p50/p99 | Notes |
 |---|---|---|---|---|
 | `shopId` | string | `shopId` | 20 / 64 B | key |
 | `cartId` | string | `cartId` | 20 / 64 B | key |
 | `placedAt` | time | `placedAt` | 30 / 35 B |  |
-| `expiresAt` | time | `expiresAt` | 30 / 35 B | TTL: the item expires at this time |
+| `expiresAt` | time | `expiresAt` | 30 / 35 B | TTL: the item expires at this time; required |
 
-### Stored items
+#### Stored items
 
 Every item that exists because of a Cart, and what keeps it up to date.
 
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
-| **Cart** | `SHOP#{shopId}` | `CART#{cartId}` | `SHOP#{shopId}`<br>`CART#{cartId}` | 308 B / 584 B | the writes below |
+| **Cart** | `SHOP#{shopId}` | `CART#{cartId}` | `SHOP#{shopId}`<br>`CART#{cartId}` | 384 B / 660 B | the writes below |
 | GSI `ByDay` entry | `SHOP#{shopId}#DAY` | `CART#{placedAt}#{cartId}` | `SHOP#{shopId}#DAY`<br>`CART#{placedAt}#{cartId}` | 253 B / 522 B | DynamoDB, from the item's `ByDayPK`/`ByDaySK` attributes (eventually consistent). Sparse: absent when a key field is empty. |
 
-### Indexes
+#### Indexes
 
-- **ByDay** (global secondary index, maintained by DynamoDB, eventually consistent).  Projection: key fields only.
+- **ByDay** (global secondary index, maintained by DynamoDB, eventually consistent; chosen because no read through it needs immediate freshness).  Projection: key fields only.
 
-### Access patterns
+#### Access patterns
 
 None declared.
 
-### Writes
+#### Writes
 
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
 | `Open` | create (fails if it exists) | Cart<br>GSI ByDay entry | no | single item | — | 2 | `ErrCartExists`<br>`dynago.ErrFieldRequired` (a required field is empty) |
 | `Checkout` | delete (fails if absent); requires any Order to have status = "open" (an absent or expired one passes) | Cart<br>GSI ByDay entry<br>check Order | yes (1 consistent read; none with `dynago.From`) | transaction (2 items) | optional | 5 | `ErrCartNotFound`<br>`ErrCartCheckoutRequiresOrder`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 
-## Costs and risks
-
-| | Subject | Finding |
-|---|---|---|
-| ℹ️ note | GSI ByDay | shared by Order, Cart; its projection is the union of what each needs, so every entity pays for the others' projected attributes. |
-
-| Entity | Items (assumed) | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
-|---|---|---|---|---|---|
-| Order | not declared | 319 B / 637 B | 0.00 GB | $0.00 | $0.00 |
-| Cart | not declared | 308 B / 584 B | 0.00 GB | $0.00 | $0.00 |
-
-Estimated total: **$0.00/month** for the declared item counts and rates.
-
-Assumptions:
-
-- Sizes use each field's declared size (p50/p99); undeclared sizes use type defaults (string 20/64 B, time 30/35 B, int 8/11 B).
-- Every declared field is assumed present; empty fields are not stored, so real items are usually smaller.
-- A unique string set makes one claim per element; the number of elements is estimated from the set's declared size at 20 B per element.
-- Capacity follows DynamoDB rules: 1 WRU per started 1 KB written, 1 RRU per started 4 KB read strongly (half for eventually consistent); transactions cost double, and a condition check on another item is billed as a transactional write of that item.
-- GSI and copy writes are counted as one index write per entry; an index key change is a delete plus a put.
-- Prices: $0.625 per million WRU, $0.125 per million RRU, $0.25 per GB-month (on-demand).
-- Monthly figures use each access pattern's and write's declared average rate (rate:, per second); patterns without a rate are not costed.
-
 ## How to read this
 
-- **Everything lives in one table.** Items are addressed by a partition key (`PK`) and a sort key (`SK`). Items sharing a partition key are stored together and can be read with one Query, in sort key order.
-- **Key patterns** such as `LIB#{libraryId}#TOOL#{toolId}` show how keys are built: literal text plus field values. Times in keys are fixed-width UTC so they sort chronologically.
-- **Entities** are the domain types. Each is stored as one item, plus the items listed under *Stored items*: index entries, copies, uniqueness claims and counters. The generated code writes and deletes the copies, claims and counters in the same transaction as the item; DynamoDB maintains the GSI entries itself.
+- **Items and keys.** Everything lives in one table. Items are addressed by a partition key (`PK`) and a sort key (`SK`). Items sharing a partition key are stored together and can be read with one Query, in sort key order. Key patterns such as `LIB#{libraryId}#TOOL#{toolId}` show how keys are built: literal text plus field values. Times in keys are fixed-width UTC so they sort chronologically.
+- **Entities** are the domain types. Each is stored as one item, plus the items listed under *Stored items* in the reference: index entries, copies, uniqueness claims and counters. The generated code writes and deletes the copies, claims and counters in the same transaction as the item; DynamoDB maintains the GSI entries itself.
+- **Reads and writes** are the only ones the code can do: each read is one request (two for a lookup by a unique value), and each write is atomic. A read or write nobody declared has no method, so every new one shows up in review as a change to this document.
 - **Global secondary indexes (GSIs)** re-key the same items so they can be queried another way. DynamoDB keeps them up to date asynchronously, so reads through them are eventually consistent (usually well under a second behind). An entity only appears in an index while every text or time field its index keys use is set, and its `where` holds, so an index can hold a subset (a *sparse* index).
-- **Copies** are an alternative to a GSI: separate items written in the same transaction as the entity. They cost a transaction on every write that changes what they hold, but can be read back immediately.
+- **Copies** are the other way to index: separate items written in the same transaction as the entity. Writes that change them become transactions, but reads see a write immediately. dynago picks a copy when a read declares `freshness: immediate`.
 - **Claims** make a value unique: creating the entity also creates an item keyed by the value, conditional on it not existing.
 - **Counters** are items updated with atomic ADD in the same transaction as the entity, so counts never drift from the items they count. A limit on a counter value turns into a condition, which is how capacity is enforced without races.
-- **Access patterns** are the only reads the code can do: each is one request (or two for a lookup by a unique value). A query nobody declared does not exist as a method, so every new way of reading data shows up in review as a schema change.
+- **Partitions.** A partition key value's items (an *item collection*) are served by one DynamoDB partition, which takes at most 1,000 write units and 3,000 read units a second. The partition table estimates, from the declared volumes and rates, how many items each partition key value holds, how big it gets, and how close its busiest value comes to those limits at peak.
 - **Costs** are in DynamoDB capacity units: a write costs 1 WRU per started KB, a read 1 RRU per started 4 KB (half for eventually consistent reads), and transactions cost double.
+- **Findings** have a rule id. A schema can accept a warning or note with a reason (`accept: { rule: reason }` on the thing it's about); errors must be fixed. A `dynago.policy.yaml` can change a rule's severity and which severities fail the build.
 - **Document versions** guard against lost updates. Every entity the store returns knows the version it was read at (`Version()`, an opaque string suitable for an ETag). Passing it back with a write (`dynago.IfVersion`, or the entity itself with `dynago.From`) makes the write fail if anyone changed the item since, rather than silently overwriting their change. Writes marked *required* refuse to run without one.
-- **Schema versions** are stored on every item (`_v`), along with the entity type (`_t`) and a revision counter (`_rev`) that guards read-modify-write updates.
+- **Schema versions** are stored on every item (`_v`), along with the entity type (`_t`), a revision counter (`_rev`) that guards read-modify-write updates, and when the item was first written and last changed (`_created`, `_updated`, by the writing server's clock).
 - **Table generations.** A schema change that existing items don't fit (adding, changing or dropping an index, claim or counter; a changed key; a changed field type; a field made required) moves the data to a new table, `<name>-g<generation>`, copied by a generated migration job; the old table stays for rollback.
 

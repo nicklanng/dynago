@@ -1,8 +1,10 @@
 # Command line
 
 ```
-dynago generate [-check] [-prices wru,rru,gb] [-new-history] <schema.dynago.yaml>...
-dynago check [-prices wru,rru,gb] [-new-history] <schema.dynago.yaml>...
+dynago generate [-check] [-prices wru,rru,gb] [-policy file] [-new-history] <schema.dynago.yaml>...
+dynago check [-json] [-prices wru,rru,gb] [-policy file] [-new-history] <schema.dynago.yaml>...
+dynago diff [-base ref | -from file] [-prices wru,rru,gb] [-policy file] <schema.dynago.yaml>...
+dynago vet [-tests] [-list] [packages]
 ```
 
 Flags may come before or after the schema files.
@@ -26,8 +28,8 @@ configurable with [`output`](schema.md#output)):
 
 Files whose content hasn't changed are not rewritten. Nothing is written if the schema is invalid,
 if its storage shape changed without a version bump, if a change existing items don't fit is made
-without a new table generation, or if the cost report has errors (such as an item that can exceed
-400 KB).
+without a new table generation, or if the design has open findings the policy fails on (by
+default, errors, such as an item that can exceed 400 KB). See [Analysis](guides/analysis.md).
 
 It also prints a note for each change since the last recorded version, marked as a warning where
 it needs the new generation's migration job.
@@ -37,15 +39,48 @@ model document and code always match the schema.
 
 ## `dynago check`
 
-Validates each schema and prints the cost and risk report: item sizes, capacity units per call,
-monthly cost at the declared rates, storage, and findings. See [Costs](guides/costs.md). Nothing is
-written.
+Validates each schema and prints its analysis: item sizes and counts, capacity units per call,
+monthly cost at the declared rates, storage, every partition family (items per key, size, growth,
+busiest key at peak, risk), open findings and accepted ones with their reasons. See
+[Analysis](guides/analysis.md) and [Costs](guides/costs.md). Nothing is written.
+
+With `-json`, it prints the analysed design as JSON instead: entities, reads, writes, guarantees,
+partitions, findings and costs, for tools of your own.
+
+It fails if the design has open findings the policy fails on.
+
+## `dynago diff`
+
+Prints the architectural changes to each schema, as Markdown for a pull request: whether existing
+items need a new table generation (and what the migration copies), entities, fields, indexes,
+claims, counters, reads and writes added, removed or changed, guarantees, partitions, findings and
+costs. See [Reviewing designs and changes](guides/review.md).
+
+It compares the schema with its version at a git ref (`-base`, default `HEAD`), or with another
+schema file (`-from`). A schema that didn't exist at the ref is shown as new. Documentation-only
+changes print "no architectural changes".
+
+## `dynago vet`
+
+Finds DynamoDB calls outside generated code in the given packages (default `./...`): methods of
+guregu/dynamo's types and of the AWS SDK's DynamoDB client, its paginators and waiters, methods
+of interfaces over the client (taking the SDK's request inputs), and dynago's runtime functions.
+Creating a client is allowed. A call marked `//dynago:raw <reason>` (at the end of its line, alone
+on the line above its statement, or in its function's doc comment) is allowed; `-list` prints those
+with their reasons. Test files are skipped unless `-tests` is given. Fails if any unmarked call is
+found. See [Reviewing designs and changes](guides/review.md#only-declared-access).
 
 ## Flags
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `-check` | off | `generate` only: fail instead of writing when outputs are stale. |
+| `-policy` | the nearest `dynago.policy.yaml` in the schema's directory or above | The policy file: which findings fail, rule severities, limits, required declarations. See [Analysis](guides/analysis.md#policy). |
+| `-json` | off | `check` only: print the analysed design as JSON. |
+| `-base` | `HEAD` | `diff` only: the git ref to compare with. |
+| `-from` | | `diff` only: a schema file to compare with, instead of a git ref. |
+| `-tests` | off | `vet` only: include test files. |
+| `-list` | off | `vet` only: also print the calls marked `//dynago:raw` and their reasons. |
 | `-prices` | `0.625,0.125,0.25` | On-demand prices: dollars per million WRU, per million RRU, per GB-month. The default is us-east-1's Standard table class as published in September 2026; prices change, so check yours. |
 | `-new-history` | off | Accept a schema whose history the lock file doesn't have (entities above version 1, or a table above generation 1), starting the history there. Only right for a new table; otherwise restore the lock file. See [Schema changes](guides/schema-changes.md#the-lock-file). |
 
@@ -54,7 +89,7 @@ written.
 | Status | Meaning |
 |---|---|
 | 0 | Success. |
-| 1 | A schema is invalid, needs a version bump, has design errors, or (with `-check`) has stale outputs. Errors are printed per schema; all schemas are processed. |
+| 1 | A schema is invalid, needs a version bump, has open findings the policy fails on, or (with `-check`) has stale outputs; or `vet` found calls that bypass the schema. Errors are printed per schema; all schemas are processed. |
 | 2 | Usage error: unknown command, bad flag, or no schema given. |
 
 ## With `go generate`

@@ -129,6 +129,54 @@ func Query(ctx context.Context, t dynamo.Table, spec QuerySpec, page Page, out a
 	return encodeCursor(scope, lek)
 }
 
+// ScanSpec describes one generated scan: a declared read of every item of one entity.
+type ScanSpec struct {
+	// Scope identifies the access pattern; a cursor is only valid for the scope that produced it.
+	Scope string
+	// Type is the entity's type attribute (_t): the scan returns only its items.
+	Type       string
+	Consistent bool
+	PageSize   int
+	MaxPage    int
+	// TTLAttr, if set, leaves out items whose TTL has passed.
+	TTLAttr string
+}
+
+// Scan runs exactly one Scan request for one page and appends the entity's items to out, which
+// must be a pointer to a slice. A page evaluates up to its size of the table's items, of every
+// kind, and keeps the entity's: it can hold few items, or none, and still have a next cursor. It
+// returns the cursor for the next page, or "" when the whole table has been read.
+func Scan(ctx context.Context, t dynamo.Table, spec ScanSpec, page Page, out any) (string, error) {
+	s := t.Scan().Filter("$ = ?", AttrType, spec.Type)
+	if spec.TTLAttr != "" {
+		s.Filter("attribute_not_exists($) OR $ > ?", spec.TTLAttr, spec.TTLAttr, Now())
+	}
+	size := page.Size
+	if size <= 0 {
+		size = spec.PageSize
+	}
+	if size > spec.MaxPage {
+		size = spec.MaxPage
+	}
+	s.SearchLimit(size)
+	if spec.Consistent {
+		s.Consistent(true)
+	}
+	scope := spec.Scope + "|scan"
+	if page.Cursor != "" {
+		lek, err := decodeCursor(scope, page.Cursor)
+		if err != nil {
+			return "", err
+		}
+		s.StartFrom(lek)
+	}
+	lek, err := s.AllWithLastEvaluatedKey(ctx, out)
+	if err != nil {
+		return "", err
+	}
+	return encodeCursor(scope, lek)
+}
+
 // cursorScope ties a cursor to everything that decides which items a page can hold: the access
 // pattern, partition and schema version (spec.Scope) and the range bounds. A cursor from other
 // bounds could start outside them, which DynamoDB rejects.

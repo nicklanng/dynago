@@ -74,6 +74,7 @@ type Library struct {
 	OpenedAt time.Time `dynamo:"openedAt,omitempty"`
 
 	loaded *libraryLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
 }
 
 // libraryLoaded remembers the stored state an entity was read at, so a write passed the entity
@@ -94,6 +95,11 @@ func (e *Library) Version() string {
 	}
 	return dynago.FormatVersion(e.loaded.rev)
 }
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Library) Timestamps() dynago.Timestamps { return e.stamps }
 
 // clone copies e, including its slices and maps, without its loaded state.
 func (e *Library) clone() Library {
@@ -135,20 +141,24 @@ const libraryVersion = 1
 
 type libraryItem struct {
 	Library
-	PK  string `dynamo:"PK"`
-	SK  string `dynamo:"SK"`
-	T   string `dynamo:"_t"`
-	V   int    `dynamo:"_v"`
-	Rev int64  `dynamo:"_rev"`
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
 
 	raw dynamo.Item // as read, for writes to keep attributes this code doesn't know
 }
 
 // libraryKnown is every attribute this code writes on Library items.
-var libraryKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "libraryId": true, "name": true, "slug": true, "openedAt": true}
+var libraryKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "libraryId": true, "name": true, "slug": true, "openedAt": true}
 
-func libraryToItem(e *Library, key dynago.Key, rev int64) *libraryItem {
-	it := &libraryItem{Library: *e, PK: key.PK, SK: key.SK, T: "Library", V: libraryVersion, Rev: rev}
+// libraryToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func libraryToItem(e *Library, key dynago.Key, rev int64, created, updated string) *libraryItem {
+	it := &libraryItem{Library: *e, PK: key.PK, SK: key.SK, T: "Library", V: libraryVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
 	return it
 }
 
@@ -189,6 +199,7 @@ func libraryDecode(raw dynamo.Item) (*libraryItem, error) {
 		return nil, err
 	}
 	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
 	it.loaded = &libraryLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
@@ -354,9 +365,11 @@ func (s *LibraryStore) Open(ctx context.Context, e *Library) error {
 	if err := e.checkKeyParts(); err != nil {
 		return err
 	}
-	rev := dynago.NewRev()
-	return dynago.Retry(ctx, func() error {
-		put := s.t.Put(libraryToItem(e, key, rev)).If("attribute_not_exists($)", "PK")
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		put := s.t.Put(libraryToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
 		ops := []dynago.Op{dynago.CreateOp(key, put, ErrLibraryExists, rev)}
 		changes := []dynago.Change{{Owner: key, After: libraryDerived(e, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
@@ -370,6 +383,10 @@ func (s *LibraryStore) Open(ctx context.Context, e *Library) error {
 		e.loaded = &libraryLoaded{rev: rev, v: libraryVersion, snapshot: e.clone()}
 		return nil
 	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
 }
 
 // LibraryRename holds the new values for Library.Rename.
@@ -430,7 +447,7 @@ func (s *LibraryStore) ChangeSlug(ctx context.Context, k LibraryKey, v LibraryCh
 		after := before.clone()
 		after.Slug = v.Slug
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, libraryKnown, libraryToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, libraryKnown, libraryToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -484,6 +501,7 @@ type Member struct {
 	JoinedAt time.Time `dynamo:"joinedAt,omitempty"`
 
 	loaded *memberLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
 }
 
 // memberLoaded remembers the stored state an entity was read at, so a write passed the entity
@@ -504,6 +522,11 @@ func (e *Member) Version() string {
 	}
 	return dynago.FormatVersion(e.loaded.rev)
 }
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Member) Timestamps() dynago.Timestamps { return e.stamps }
 
 // clone copies e, including its slices and maps, without its loaded state.
 func (e *Member) clone() Member {
@@ -558,11 +581,13 @@ const memberVersion = 1
 
 type memberItem struct {
 	Member
-	PK  string `dynamo:"PK"`
-	SK  string `dynamo:"SK"`
-	T   string `dynamo:"_t"`
-	V   int    `dynamo:"_v"`
-	Rev int64  `dynamo:"_rev"`
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
 
 	raw      dynamo.Item // as read, for writes to keep attributes this code doesn't know
 	ByNamePK string      `dynamo:"ByNamePK,omitempty"`
@@ -570,10 +595,12 @@ type memberItem struct {
 }
 
 // memberKnown is every attribute this code writes on Member items.
-var memberKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "libraryId": true, "memberId": true, "email": true, "name": true, "phone": true, "role": true, "status": true, "maxLoans": true, "joinedAt": true, "ByNamePK": true, "ByNameSK": true}
+var memberKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "libraryId": true, "memberId": true, "email": true, "name": true, "phone": true, "role": true, "status": true, "maxLoans": true, "joinedAt": true, "ByNamePK": true, "ByNameSK": true}
 
-func memberToItem(e *Member, key dynago.Key, rev int64) *memberItem {
-	it := &memberItem{Member: *e, PK: key.PK, SK: key.SK, T: "Member", V: memberVersion, Rev: rev}
+// memberToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func memberToItem(e *Member, key dynago.Key, rev int64, created, updated string) *memberItem {
+	it := &memberItem{Member: *e, PK: key.PK, SK: key.SK, T: "Member", V: memberVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
 	if e.LibraryID != "" && e.Name != "" && e.MemberID != "" {
 		it.ByNamePK = "LIB#" + e.LibraryID + "#MEMBERS"
 		it.ByNameSK = dynago.Lower(e.Name) + "#" + e.MemberID
@@ -656,6 +683,7 @@ func memberDecode(raw dynamo.Item) (*memberItem, error) {
 		return nil, err
 	}
 	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
 	it.loaded = &memberLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
@@ -822,9 +850,11 @@ func (s *MemberStore) Join(ctx context.Context, e *Member) error {
 	if err := e.checkKeyParts(); err != nil {
 		return err
 	}
-	rev := dynago.NewRev()
-	return dynago.Retry(ctx, func() error {
-		put := s.t.Put(memberToItem(e, key, rev)).If("attribute_not_exists($)", "PK")
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		put := s.t.Put(memberToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
 		ops := []dynago.Op{dynago.CreateOp(key, put, ErrMemberExists, rev)}
 		changes := []dynago.Change{{Owner: key, After: memberDerived(e, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
@@ -838,6 +868,10 @@ func (s *MemberStore) Join(ctx context.Context, e *Member) error {
 		e.loaded = &memberLoaded{rev: rev, v: memberVersion, snapshot: e.clone()}
 		return nil
 	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
 }
 
 // MemberUpdateProfile holds the new values for Member.UpdateProfile.
@@ -895,7 +929,7 @@ func (s *MemberStore) UpdateProfile(ctx context.Context, k MemberKey, v MemberUp
 			after.Phone = *v.Phone
 		}
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -964,7 +998,7 @@ func (s *MemberStore) Suspend(ctx context.Context, k MemberKey, opts ...dynago.W
 		after := before.clone()
 		after.Status = MemberStatusSuspended
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -1006,7 +1040,7 @@ func (s *MemberStore) Reinstate(ctx context.Context, k MemberKey, opts ...dynago
 		after := before.clone()
 		after.Status = MemberStatusActive
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -1048,7 +1082,7 @@ func (s *MemberStore) MakeSteward(ctx context.Context, k MemberKey, opts ...dyna
 		after := before.clone()
 		after.Role = MemberRoleSteward
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -1089,7 +1123,7 @@ func (s *MemberStore) StepDown(ctx context.Context, k MemberKey, opts ...dynago.
 		after := before.clone()
 		after.Role = MemberRoleMember
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -1190,6 +1224,7 @@ type Tool struct {
 	AddedAt  time.Time `dynamo:"addedAt,omitempty"`
 
 	loaded *toolLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
 }
 
 // toolLoaded remembers the stored state an entity was read at, so a write passed the entity
@@ -1210,6 +1245,11 @@ func (e *Tool) Version() string {
 	}
 	return dynago.FormatVersion(e.loaded.rev)
 }
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Tool) Timestamps() dynago.Timestamps { return e.stamps }
 
 // clone copies e, including its slices and maps, without its loaded state.
 func (e *Tool) clone() Tool {
@@ -1268,11 +1308,13 @@ const toolVersion = 2
 
 type toolItem struct {
 	Tool
-	PK  string `dynamo:"PK"`
-	SK  string `dynamo:"SK"`
-	T   string `dynamo:"_t"`
-	V   int    `dynamo:"_v"`
-	Rev int64  `dynamo:"_rev"`
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
 
 	raw          dynamo.Item // as read, for writes to keep attributes this code doesn't know
 	ByCategoryPK string      `dynamo:"ByCategoryPK,omitempty"`
@@ -1280,10 +1322,12 @@ type toolItem struct {
 }
 
 // toolKnown is every attribute this code writes on Tool items.
-var toolKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "libraryId": true, "toolId": true, "name": true, "category": true, "status": true, "manual": true, "tags": true, "serialNumber": true, "barcodes": true, "addedAt": true, "ByCategoryPK": true, "ByCategorySK": true}
+var toolKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "libraryId": true, "toolId": true, "name": true, "category": true, "status": true, "manual": true, "tags": true, "serialNumber": true, "barcodes": true, "addedAt": true, "ByCategoryPK": true, "ByCategorySK": true}
 
-func toolToItem(e *Tool, key dynago.Key, rev int64) *toolItem {
-	it := &toolItem{Tool: *e, PK: key.PK, SK: key.SK, T: "Tool", V: toolVersion, Rev: rev}
+// toolToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func toolToItem(e *Tool, key dynago.Key, rev int64, created, updated string) *toolItem {
+	it := &toolItem{Tool: *e, PK: key.PK, SK: key.SK, T: "Tool", V: toolVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
 	if e.LibraryID != "" && e.Category != "" && e.Name != "" && e.ToolID != "" {
 		it.ByCategoryPK = "LIB#" + e.LibraryID + "#CAT#" + string(e.Category)
 		it.ByCategorySK = dynago.Lower(e.Name) + "#" + e.ToolID
@@ -1374,6 +1418,7 @@ func toolDecode(raw dynamo.Item) (*toolItem, error) {
 		return nil, err
 	}
 	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
 	it.loaded = &toolLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
@@ -1534,10 +1579,11 @@ func (s *ToolStore) GetByBarcode(ctx context.Context, libraryID string, barcodes
 	return &it.Tool, nil
 }
 
-// Add creates a Tool, failing with ErrToolExists if one already exists. In the same transaction it
-// maintains counter ToolCounts, unique claim Serial, unique claim Barcode. Afterwards e.Version()
-// returns the new item's version.
+// Add creates a Tool, failing with ErrToolExists if one already exists. It sets status to
+// "available", whatever e holds. In the same transaction it maintains counter ToolCounts, unique
+// claim Serial, unique claim Barcode. Afterwards e.Version() returns the new item's version.
 func (s *ToolStore) Add(ctx context.Context, e *Tool) error {
+	e.Status = ToolStatusAvailable
 	key, err := e.Key().dynamoKey()
 	if err != nil {
 		return err
@@ -1545,9 +1591,11 @@ func (s *ToolStore) Add(ctx context.Context, e *Tool) error {
 	if err := e.checkKeyParts(); err != nil {
 		return err
 	}
-	rev := dynago.NewRev()
-	return dynago.Retry(ctx, func() error {
-		put := s.t.Put(toolToItem(e, key, rev)).If("attribute_not_exists($)", "PK")
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		put := s.t.Put(toolToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
 		ops := []dynago.Op{dynago.CreateOp(key, put, ErrToolExists, rev)}
 		changes := []dynago.Change{{Owner: key, After: toolDerived(e, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
@@ -1561,6 +1609,10 @@ func (s *ToolStore) Add(ctx context.Context, e *Tool) error {
 		e.loaded = &toolLoaded{rev: rev, v: toolVersion, snapshot: e.clone()}
 		return nil
 	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
 }
 
 // ToolEditDetails holds the new values for Tool.EditDetails.
@@ -1623,7 +1675,7 @@ func (s *ToolStore) EditDetails(ctx context.Context, k ToolKey, v ToolEditDetail
 			after.Tags = *v.Tags
 		}
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -1668,7 +1720,7 @@ func (s *ToolStore) Relabel(ctx context.Context, k ToolKey, v ToolRelabel, opts 
 		after := before.clone()
 		after.Barcodes = v.Barcodes
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -1755,7 +1807,7 @@ func (s *ToolStore) Retire(ctx context.Context, k ToolKey, opts ...dynago.WriteO
 		after := before.clone()
 		after.Status = ToolStatusRetired
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -1829,7 +1881,7 @@ type Loan struct {
 	// A ULID, so a tool's loans sort by time.
 	LoanID   string `dynamo:"loanId"`
 	MemberID string `dynamo:"memberId,omitempty"`
-	// Shown in "my loans" without reading the tool.
+	// The tool's name when it was borrowed, shown in "my loans" without reading the tool.
 	ToolName string `dynamo:"toolName,omitempty"`
 	// Set by Borrow and Return; callers never choose it.
 	Status     LoanStatus `dynamo:"status,omitempty"`
@@ -1840,6 +1892,7 @@ type Loan struct {
 	Notes string `dynamo:"notes,omitempty"`
 
 	loaded *loanLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
 }
 
 // loanLoaded remembers the stored state an entity was read at, so a write passed the entity
@@ -1860,6 +1913,11 @@ func (e *Loan) Version() string {
 	}
 	return dynago.FormatVersion(e.loaded.rev)
 }
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Loan) Timestamps() dynago.Timestamps { return e.stamps }
 
 // clone copies e, including its slices and maps, without its loaded state.
 func (e *Loan) clone() Loan {
@@ -1921,11 +1979,13 @@ const loanVersion = 1
 
 type loanItem struct {
 	Loan
-	PK  string `dynamo:"PK"`
-	SK  string `dynamo:"SK"`
-	T   string `dynamo:"_t"`
-	V   int    `dynamo:"_v"`
-	Rev int64  `dynamo:"_rev"`
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
 
 	raw       dynamo.Item // as read, for writes to keep attributes this code doesn't know
 	OverduePK string      `dynamo:"OverduePK,omitempty"`
@@ -1933,10 +1993,12 @@ type loanItem struct {
 }
 
 // loanKnown is every attribute this code writes on Loan items.
-var loanKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "libraryId": true, "toolId": true, "loanId": true, "memberId": true, "toolName": true, "status": true, "borrowedAt": true, "dueAt": true, "returnedAt": true, "notes": true, "OverduePK": true, "OverdueSK": true}
+var loanKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "libraryId": true, "toolId": true, "loanId": true, "memberId": true, "toolName": true, "status": true, "borrowedAt": true, "dueAt": true, "returnedAt": true, "notes": true, "OverduePK": true, "OverdueSK": true}
 
-func loanToItem(e *Loan, key dynago.Key, rev int64) *loanItem {
-	it := &loanItem{Loan: *e, PK: key.PK, SK: key.SK, T: "Loan", V: loanVersion, Rev: rev}
+// loanToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func loanToItem(e *Loan, key dynago.Key, rev int64, created, updated string) *loanItem {
+	it := &loanItem{Loan: *e, PK: key.PK, SK: key.SK, T: "Loan", V: loanVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
 	if e.LibraryID != "" && !e.DueAt.IsZero() && e.LoanID != "" && e.Status == LoanStatusActive {
 		it.OverduePK = "LIB#" + e.LibraryID + "#DUE"
 		it.OverdueSK = dynago.FmtTime(e.DueAt) + "#" + e.LoanID
@@ -2025,7 +2087,7 @@ func loanDerived(e *Loan, owner dynago.Key, lim loanLimits) []dynago.Derived {
 	// copy index ByMember
 	if e.LibraryID != "" && e.MemberID != "" && !e.DueAt.IsZero() && e.ToolID != "" && e.LoanID != "" && e.Status == LoanStatusActive {
 		k := dynago.Key{PK: "LIB#" + e.LibraryID + "#MEMBER#" + e.MemberID, SK: "MYLOAN#" + dynago.FmtTime(e.DueAt) + "#" + e.ToolID + "#" + e.LoanID}
-		d = append(d, dynago.Derived{Kind: dynago.KindCopy, Key: k, Type: "Loan.ByMember", Item: &loanByMemberCopy{LoanByMember: LoanByMember{LibraryID: e.LibraryID, ToolID: e.ToolID, LoanID: e.LoanID, MemberID: e.MemberID, ToolName: e.ToolName, DueAt: e.DueAt}, PK: k.PK, SK: k.SK, T: "Loan.ByMember", V: loanVersion}})
+		d = append(d, dynago.Derived{Kind: dynago.KindCopy, Key: k, Type: "Loan.ByMember", Item: &loanByMemberCopy{LoanByMember: LoanByMember{LibraryID: e.LibraryID, ToolID: e.ToolID, LoanID: e.LoanID, MemberID: e.MemberID, ToolName: e.ToolName, DueAt: e.DueAt}, PK: k.PK, SK: k.SK, T: "Loan.ByMember", V: loanVersion}, Created: dynago.FmtStamp(e.stamps.Created)})
 	}
 	return d
 }
@@ -2056,6 +2118,7 @@ func loanDecode(raw dynamo.Item) (*loanItem, error) {
 		return nil, err
 	}
 	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
 	it.loaded = &loanLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
@@ -2331,10 +2394,12 @@ func (s *LoanStore) Borrow(ctx context.Context, e *Loan, limits LoanBorrowLimits
 	if err := e.checkKeyParts(); err != nil {
 		return err
 	}
-	rev := dynago.NewRev()
-	return dynago.Retry(ctx, func() error {
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
 		err := dynago.ReadIfNeeded(func(read bool) error {
-			put := s.t.Put(loanToItem(e, key, rev)).If("attribute_not_exists($)", "PK")
+			put := s.t.Put(loanToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
 			ops := []dynago.Op{dynago.CreateOp(key, put, ErrLoanExists, rev)}
 			changes := []dynago.Change{{Owner: key, After: loanDerived(e, key, loanLimits{MemberLoansActive: limits.MemberLoansActive})}}
 			// requires Member
@@ -2375,6 +2440,10 @@ func (s *LoanStore) Borrow(ctx context.Context, e *Loan, limits LoanBorrowLimits
 		e.loaded = &loanLoaded{rev: rev, v: loanVersion, snapshot: e.clone()}
 		return nil
 	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
 }
 
 // LoanReturn holds the new values for Loan.Return.
@@ -2408,7 +2477,7 @@ func (s *LoanStore) Return(ctx context.Context, k LoanKey, v LoanReturn, opts ..
 		after.ReturnedAt = v.ReturnedAt
 		after.Status = LoanStatusReturned
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, loanKnown, loanToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, loanKnown, loanToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -2473,7 +2542,7 @@ func (s *LoanStore) Extend(ctx context.Context, k LoanKey, v LoanExtend, opts ..
 		after := before.clone()
 		after.DueAt = v.DueAt
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, loanKnown, loanToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, loanKnown, loanToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -2561,7 +2630,7 @@ func (s *LoanStore) requireBorrowTool(ctx context.Context, e *Loan, read bool) (
 	}
 	after := before.clone()
 	after.Status = ToolStatusOnLoan
-	item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1))
+	item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 	if err != nil {
 		return nil, dynago.Change{}, err
 	}
@@ -2633,7 +2702,7 @@ func (s *LoanStore) requireReturnTool(ctx context.Context, e *Loan, read bool) (
 	}
 	after := before.clone()
 	after.Status = ToolStatusAvailable
-	item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1))
+	item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 	if err != nil {
 		return nil, dynago.Change{}, err
 	}
@@ -2657,6 +2726,7 @@ type Hold struct {
 	ExpiresAt time.Time `dynamo:"expiresAt,omitempty"`
 
 	loaded *holdLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
 }
 
 // holdLoaded remembers the stored state an entity was read at, so a write passed the entity
@@ -2677,6 +2747,11 @@ func (e *Hold) Version() string {
 	}
 	return dynago.FormatVersion(e.loaded.rev)
 }
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Hold) Timestamps() dynago.Timestamps { return e.stamps }
 
 // clone copies e, including its slices and maps, without its loaded state.
 func (e *Hold) clone() Hold {
@@ -2732,11 +2807,13 @@ const holdVersion = 1
 
 type holdItem struct {
 	Hold
-	PK  string `dynamo:"PK"`
-	SK  string `dynamo:"SK"`
-	T   string `dynamo:"_t"`
-	V   int    `dynamo:"_v"`
-	Rev int64  `dynamo:"_rev"`
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
 
 	raw      dynamo.Item // as read, for writes to keep attributes this code doesn't know
 	ByCodePK string      `dynamo:"ByCodePK,omitempty"`
@@ -2744,10 +2821,12 @@ type holdItem struct {
 }
 
 // holdKnown is every attribute this code writes on Hold items.
-var holdKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "libraryId": true, "toolId": true, "memberId": true, "codeHash": true, "createdAt": true, "expiresAt": true, "ByCodePK": true, "ttl": true}
+var holdKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "libraryId": true, "toolId": true, "memberId": true, "codeHash": true, "createdAt": true, "expiresAt": true, "ByCodePK": true, "ttl": true}
 
-func holdToItem(e *Hold, key dynago.Key, rev int64) *holdItem {
-	it := &holdItem{Hold: *e, PK: key.PK, SK: key.SK, T: "Hold", V: holdVersion, Rev: rev}
+// holdToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func holdToItem(e *Hold, key dynago.Key, rev int64, created, updated string) *holdItem {
+	it := &holdItem{Hold: *e, PK: key.PK, SK: key.SK, T: "Hold", V: holdVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
 	if e.CodeHash != "" {
 		it.ByCodePK = "HOLDCODE#" + e.CodeHash
 	}
@@ -2798,6 +2877,7 @@ func holdDecode(raw dynamo.Item) (*holdItem, error) {
 		return nil, err
 	}
 	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
 	it.loaded = &holdLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
@@ -2912,9 +2992,11 @@ func (s *HoldStore) Place(ctx context.Context, e *Hold) error {
 	if err := e.checkKeyParts(); err != nil {
 		return err
 	}
-	rev := dynago.NewRev()
-	return dynago.Retry(ctx, func() error {
-		put := s.t.Put(holdToItem(e, key, rev)).If("attribute_not_exists($) OR $ <= ?", "PK", "ttl", dynago.Now())
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		put := s.t.Put(holdToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($) OR $ <= ?", "PK", "ttl", dynago.Now())
 		ops := []dynago.Op{dynago.CreateOp(key, put, ErrHoldExists, rev)}
 		// requires Tool
 		if e.LibraryID == "" || e.ToolID == "" {
@@ -2934,6 +3016,10 @@ func (s *HoldStore) Place(ctx context.Context, e *Hold) error {
 		e.loaded = &holdLoaded{rev: rev, v: holdVersion, snapshot: e.clone()}
 		return nil
 	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
 }
 
 // Release deletes a Hold with one conditional DeleteItem, failing with ErrHoldNotFound if it is
@@ -3185,6 +3271,7 @@ func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item, fence dynago.O
 		if err != nil {
 			return err
 		}
+		e.stamps = dynago.StampsOf(raw)
 		src, srcRev, err := dynago.SourceOf(raw)
 		if err != nil {
 			return err
@@ -3195,6 +3282,7 @@ func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item, fence dynago.O
 		if err != nil {
 			return err
 		}
+		e.stamps = dynago.StampsOf(raw)
 		src, srcRev, err := dynago.SourceOf(raw)
 		if err != nil {
 			return err
@@ -3205,6 +3293,7 @@ func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item, fence dynago.O
 		if err != nil {
 			return err
 		}
+		e.stamps = dynago.StampsOf(raw)
 		src, srcRev, err := dynago.SourceOf(raw)
 		if err != nil {
 			return err
@@ -3215,6 +3304,7 @@ func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item, fence dynago.O
 		if err != nil {
 			return err
 		}
+		e.stamps = dynago.StampsOf(raw)
 		src, srcRev, err := dynago.SourceOf(raw)
 		if err != nil {
 			return err
@@ -3225,6 +3315,7 @@ func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item, fence dynago.O
 		if err != nil {
 			return err
 		}
+		e.stamps = dynago.StampsOf(raw)
 		src, srcRev, err := dynago.SourceOf(raw)
 		if err != nil {
 			return err
@@ -3331,7 +3422,8 @@ func (s *LibraryStore) migrate(ctx context.Context, e *Library, src dynago.Key, 
 			before = dynago.Unbounded(libraryDerived(&it.Library, key))
 			rev = it.Rev + 1
 		}
-		item, err := dynago.MigrationItem(libraryToItem(e, key, rev), src, srcRev)
+		// The copy keeps the source's timestamps: moving to a new table doesn't change the item.
+		item, err := dynago.MigrationItem(libraryToItem(e, key, rev, dynago.FmtStamp(e.stamps.Created), dynago.FmtStamp(e.stamps.Updated)), src, srcRev)
 		if err != nil {
 			return err
 		}
@@ -3412,7 +3504,8 @@ func (s *MemberStore) migrate(ctx context.Context, e *Member, src dynago.Key, sr
 			before = dynago.Unbounded(memberDerived(&it.Member, key))
 			rev = it.Rev + 1
 		}
-		item, err := dynago.MigrationItem(memberToItem(e, key, rev), src, srcRev)
+		// The copy keeps the source's timestamps: moving to a new table doesn't change the item.
+		item, err := dynago.MigrationItem(memberToItem(e, key, rev, dynago.FmtStamp(e.stamps.Created), dynago.FmtStamp(e.stamps.Updated)), src, srcRev)
 		if err != nil {
 			return err
 		}
@@ -3493,7 +3586,8 @@ func (s *ToolStore) migrate(ctx context.Context, e *Tool, src dynago.Key, srcRev
 			before = dynago.Unbounded(toolDerived(&it.Tool, key))
 			rev = it.Rev + 1
 		}
-		item, err := dynago.MigrationItem(toolToItem(e, key, rev), src, srcRev)
+		// The copy keeps the source's timestamps: moving to a new table doesn't change the item.
+		item, err := dynago.MigrationItem(toolToItem(e, key, rev, dynago.FmtStamp(e.stamps.Created), dynago.FmtStamp(e.stamps.Updated)), src, srcRev)
 		if err != nil {
 			return err
 		}
@@ -3586,7 +3680,8 @@ func (s *LoanStore) migrate(ctx context.Context, e *Loan, src dynago.Key, srcRev
 			before = dynago.Unbounded(loanDerived(&it.Loan, key, loanLimits{}))
 			rev = it.Rev + 1
 		}
-		item, err := dynago.MigrationItem(loanToItem(e, key, rev), src, srcRev)
+		// The copy keeps the source's timestamps: moving to a new table doesn't change the item.
+		item, err := dynago.MigrationItem(loanToItem(e, key, rev, dynago.FmtStamp(e.stamps.Created), dynago.FmtStamp(e.stamps.Updated)), src, srcRev)
 		if err != nil {
 			return err
 		}
@@ -3678,7 +3773,8 @@ func (s *HoldStore) migrate(ctx context.Context, e *Hold, src dynago.Key, srcRev
 			}
 			rev = it.Rev + 1
 		}
-		item, err := dynago.MigrationItem(holdToItem(e, key, rev), src, srcRev)
+		// The copy keeps the source's timestamps: moving to a new table doesn't change the item.
+		item, err := dynago.MigrationItem(holdToItem(e, key, rev, dynago.FmtStamp(e.stamps.Created), dynago.FmtStamp(e.stamps.Updated)), src, srcRev)
 		if err != nil {
 			return err
 		}

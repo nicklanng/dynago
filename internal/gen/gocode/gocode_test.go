@@ -52,11 +52,11 @@ func TestRewritesKeepUnknownAttributes(t *testing.T) {
 	}
 	code := string(out)
 	for _, want := range []string{
-		`var thingKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "tenantId": true, "thingId": true, "kind": true}`,
-		"item, err := dynago.KeepUnknown(it.raw, thingKnown, thingToItem(&after, key, it.Rev+1))",
+		`var thingKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "tenantId": true, "thingId": true, "kind": true}`,
+		"item, err := dynago.KeepUnknown(it.raw, thingKnown, thingToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))",
 		`s.t.Put(item).If("$ = ?", "_rev", it.Rev)`,
 		// Revisions start random so a delete + re-create cannot satisfy a stale revision guard.
-		"rev := dynago.NewRev()",
+		"rev, stamp := dynago.NewRev(), dynago.NewStamp()",
 		"dynago.CreateOp(key, put, ErrThingExists, rev)",
 	} {
 		if !strings.Contains(code, want) {

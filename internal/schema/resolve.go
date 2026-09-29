@@ -28,6 +28,52 @@ func Load(path string) (*Model, error) {
 	return m, nil
 }
 
+// ParseEarlier resolves a schema written for an earlier dynago, for comparing with the current one:
+// keys since replaced are read as their replacements (an entity's estimate: { items: N } as
+// volume: N).
+func ParseEarlier(data []byte) (*Model, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	if len(doc.Content) == 1 {
+		if entities := mapValue(doc.Content[0], "entities"); entities != nil && entities.Kind == yaml.MappingNode {
+			for i := 1; i < len(entities.Content); i += 2 {
+				e := entities.Content[i]
+				if e.Kind != yaml.MappingNode {
+					continue
+				}
+				for j := 0; j+1 < len(e.Content); j += 2 {
+					if e.Content[j].Value != "estimate" || mapValue(e, "volume") != nil {
+						continue
+					}
+					if items := mapValue(e.Content[j+1], "items"); items != nil {
+						e.Content[j].Value, e.Content[j+1] = "volume", items
+					}
+				}
+			}
+		}
+	}
+	out, err := yaml.Marshal(&doc)
+	if err != nil {
+		return nil, err
+	}
+	return Parse(out)
+}
+
+// mapValue returns the value of key in a mapping node, or nil.
+func mapValue(n *yaml.Node, key string) *yaml.Node {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == key {
+			return n.Content[i+1]
+		}
+	}
+	return nil
+}
+
 // Parse resolves and validates schema YAML.
 func Parse(data []byte) (*Model, error) {
 	var raw RawFile
@@ -44,6 +90,7 @@ func Parse(data []byte) (*Model, error) {
 
 type resolver struct {
 	raw  *RawFile
+	m    *Model
 	errs []error
 	// typeNames guards against generated Go type names colliding.
 	typeNames map[string]string
@@ -67,6 +114,7 @@ func (r *resolver) resolve() *Model {
 		"New": "the generated constructor", "EnsureTable": "the generated EnsureTable",
 		"Generation": "the generated Generation constant", "TableName": "the generated TableName function"}
 	m := &Model{Package: raw.Package}
+	r.m = m
 	if raw.Dynago != 1 {
 		r.errorf("dynago: schema format version must be 1 (got %d)", raw.Dynago)
 	}
@@ -96,6 +144,14 @@ func (r *resolver) resolve() *Model {
 	if m.Table.TTLAttr == "" {
 		m.Table.TTLAttr = "ttl"
 	}
+	r.accepts(Subject{Kind: SubjectTable}, "table", raw.Table.Accept)
+	m.Workload = Workload{Peak: 1, Horizon: raw.Workload.Horizon}
+	switch p := raw.Workload.Peak; {
+	case p < 0 || (p > 0 && p < 1):
+		r.errorf("workload.peak: %v is not a peak-to-average ratio; it must be 1 or more", p)
+	case p >= 1:
+		m.Workload.Peak, m.Workload.PeakDeclared = p, true
+	}
 	base := fileBase(m.Table.Name)
 	m.Output = Output{
 		Go:         orDefault(raw.Output.Go, base+"_dynago.go"),
@@ -114,6 +170,8 @@ func (r *resolver) resolve() *Model {
 		}
 	}
 	r.crossRefs(m)
+	r.relations(m)
+	r.volumes(m)
 	r.gsis(m)
 	r.keyspaces(m)
 	return m
@@ -126,9 +184,10 @@ func (r *resolver) entity(m *Model, name string, raw RawEntity) *Entity {
 		return nil
 	}
 	e := &Entity{
-		Name: name, GoName: name, Doc: raw.Doc, Version: raw.Version, Items: raw.Estimate.Items,
-		fieldsByName: map[string]*Field{},
+		Name: name, GoName: name, Doc: raw.Doc, Version: raw.Version,
+		fieldsByName: map[string]*Field{}, rawVolume: raw.Volume,
 	}
+	r.accepts(Subject{Kind: SubjectEntity, Entity: name}, where, raw.Accept)
 	r.claimType(e.GoName, where)
 	r.claimType(e.GoName+"Key", where)
 	if e.Version == 0 {
@@ -138,7 +197,7 @@ func (r *resolver) entity(m *Model, name string, raw RawEntity) *Entity {
 		r.errorf("%s: version must be positive", where)
 	}
 
-	reserved := map[string]bool{AttrPK: true, AttrSK: true, AttrType: true, AttrVer: true, AttrRev: true, m.Table.TTLAttr: true}
+	reserved := map[string]bool{AttrPK: true, AttrSK: true, AttrType: true, AttrVer: true, AttrRev: true, AttrCreated: true, AttrUpdated: true, m.Table.TTLAttr: true}
 	attrs := map[string]string{}
 	for _, rf := range raw.Fields {
 		f := r.field(e, rf.Key, rf.Value)
@@ -151,6 +210,7 @@ func (r *resolver) entity(m *Model, name string, raw RawEntity) *Entity {
 		if prev, ok := attrs[f.Attr]; ok {
 			r.errorf("%s: fields %s and %s both use attribute %q", where, prev, f.Name, f.Attr)
 		}
+		r.accepts(Subject{Kind: SubjectField, Entity: name, Name: f.Name}, where+" field "+f.Name, rf.Value.Accept)
 		attrs[f.Attr] = f.Name
 		e.Fields = append(e.Fields, f)
 		e.fieldsByName[f.Name] = f
@@ -197,17 +257,27 @@ func (r *resolver) entity(m *Model, name string, raw RawEntity) *Entity {
 		}
 	}
 
+	// Reads that need immediate freshness decide the strategy of an index that doesn't declare one.
+	fresh := map[string][]string{}
+	for _, ra := range raw.Access {
+		if ra.Value.Freshness == string(FreshnessImmediate) && ra.Value.Query != "" && ra.Value.Query != "key" {
+			fresh[ra.Value.Query] = append(fresh[ra.Value.Query], ra.Key)
+		}
+	}
 	for _, ri := range raw.Indexes {
-		if ix := r.index(e, ri.Key, ri.Value); ix != nil {
+		r.accepts(Subject{Kind: SubjectIndex, Entity: name, Name: ri.Key}, where+" index "+ri.Key, ri.Value.Accept)
+		if ix := r.index(e, ri.Key, ri.Value, fresh[ri.Key]); ix != nil {
 			e.Indexes = append(e.Indexes, ix)
 		}
 	}
 	for _, ru := range raw.Unique {
+		r.accepts(Subject{Kind: SubjectUnique, Entity: name, Name: ru.Key}, where+" unique "+ru.Key, ru.Value.Accept)
 		if u := r.unique(e, ru.Key, ru.Value); u != nil {
 			e.Uniques = append(e.Uniques, u)
 		}
 	}
 	for _, rc := range raw.Counters {
+		r.accepts(Subject{Kind: SubjectCounter, Entity: name, Name: rc.Key}, where+" counter "+rc.Key, rc.Value.Accept)
 		if c := r.counter(e, rc.Key, rc.Value); c != nil {
 			e.Counters = append(e.Counters, c)
 		}
@@ -218,6 +288,7 @@ func (r *resolver) entity(m *Model, name string, raw RawEntity) *Entity {
 			r.errorf("%s: %s is declared more than once across access and writes", where, ra.Key)
 		}
 		methods[ra.Key] = true
+		r.accepts(Subject{Kind: SubjectAccess, Entity: name, Name: ra.Key}, where+" access "+ra.Key, ra.Value.Accept)
 		if a := r.access(e, ra.Key, ra.Value); a != nil {
 			e.Access = append(e.Access, a)
 		}
@@ -227,6 +298,7 @@ func (r *resolver) entity(m *Model, name string, raw RawEntity) *Entity {
 			r.errorf("%s: %s is declared more than once across access and writes", where, rw.Key)
 		}
 		methods[rw.Key] = true
+		r.accepts(Subject{Kind: SubjectWrite, Entity: name, Name: rw.Key}, where+" write "+rw.Key, rw.Value.Accept)
 		if w := r.write(e, rw.Key, rw.Value); w != nil {
 			e.Writes = append(e.Writes, w)
 		}
@@ -240,14 +312,19 @@ func (r *resolver) field(e *Entity, name string, raw RawField) *Field {
 		r.errorf("%s: field names must be camelCase", where)
 		return nil
 	}
-	f := &Field{Name: name, Attr: orDefault(raw.Attr, name), GoName: GoName(name), Doc: raw.Doc, Example: raw.Example, copyOfRaw: raw.CopyOf, Required: raw.Required}
+	f := &Field{Name: name, Attr: orDefault(raw.Attr, name), GoName: GoName(name), Doc: raw.Doc, Example: raw.Example,
+		copyOfRaw: raw.CopyOf, snapshotOfRaw: raw.SnapshotOf, refRaw: raw.Ref, Required: raw.Required}
+	if raw.CopyOf != "" && raw.SnapshotOf != "" {
+		r.errorf("%s: copy_of and snapshot_of are exclusive: the copy is either kept equal to its source or taken once", where)
+	}
 	switch f.GoName {
-	case "Key", "Version":
+	case "Key", "Version", "Timestamps":
 		r.errorf("%s: a field named %s would clash with the generated %s() method; rename it", where, name, f.GoName)
 		return nil
-	case "PK", "SK", "T", "V", "Rev", "TTL":
+	case "PK", "SK", "T", "V", "Rev", "TTL", "DynagoCreated", "DynagoUpdated":
 		r.errorf("%s: the Go name %s is used by the generated item struct (for its %s); rename the field", where, f.GoName, map[string]string{
-			"PK": "partition key", "SK": "sort key", "T": "type", "V": "schema version", "Rev": "revision", "TTL": "expiry"}[f.GoName])
+			"PK": "partition key", "SK": "sort key", "T": "type", "V": "schema version", "Rev": "revision", "TTL": "expiry",
+			"DynagoCreated": "creation time", "DynagoUpdated": "update time"}[f.GoName])
 		return nil
 	}
 	if !reAttr.MatchString(f.Attr) {
@@ -439,14 +516,29 @@ func coerce(f *Field, v any) (any, error) {
 	return nil, fmt.Errorf("value %v does not match field type %s", v, f.Type)
 }
 
-func (r *resolver) index(e *Entity, name string, raw RawIndex) *Index {
+func (r *resolver) index(e *Entity, name string, raw RawIndex, fresh []string) *Index {
 	where := fmt.Sprintf("entity %s index %s", e.Name, name)
 	if !reExported.MatchString(name) {
 		r.errorf("%s: index names must be PascalCase", where)
 		return nil
 	}
 	ix := &Index{Name: name, GoName: name, Entity: e, Doc: raw.Doc}
-	switch Strategy(orDefault(raw.Strategy, string(StrategyGSI))) {
+	strategy := raw.Strategy
+	if strategy == "" {
+		ix.StrategyInferred = true
+		strategy = string(StrategyGSI)
+		ix.StrategyReason = "no read through it needs immediate freshness"
+		if len(fresh) > 0 {
+			strategy = string(StrategyCopy)
+			verb := "needs"
+			if len(fresh) > 1 {
+				verb = "need"
+			}
+			ix.StrategyReason = fmt.Sprintf("%s %s immediate freshness", strings.Join(fresh, " and "), verb)
+			where += " (a copy, because " + ix.StrategyReason + ")"
+		}
+	}
+	switch Strategy(strategy) {
 	case StrategyGSI:
 		ix.Strategy = StrategyGSI
 		ix.PKAttr, ix.SKAttr = name+"PK", name+"SK"
@@ -672,7 +764,7 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 		r.errorf("%s: access names must be PascalCase", where)
 		return nil
 	}
-	a := &Access{Name: name, GoName: name, Entity: e, Doc: raw.Doc, Consistent: raw.Consistent != nil && *raw.Consistent, Rate: raw.Rate}
+	a := &Access{Name: name, GoName: name, Entity: e, Doc: raw.Doc, Consistent: raw.Consistent != nil && *raw.Consistent, Rate: raw.Rate, Reason: strings.TrimSpace(raw.Reason)}
 	kinds := 0
 	if raw.Get != nil {
 		kinds++
@@ -683,11 +775,29 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 	if raw.Counter != "" {
 		kinds++
 	}
+	if raw.Scan {
+		kinds++
+	}
 	if kinds != 1 {
-		r.errorf("%s: declare exactly one of get, query or counter", where)
+		r.errorf("%s: declare exactly one of get, query, counter or scan", where)
 		return nil
 	}
+	switch Freshness(raw.Freshness) {
+	case FreshnessUnstated, FreshnessImmediate, FreshnessEventual:
+		a.Freshness = Freshness(raw.Freshness)
+	default:
+		r.errorf("%s: freshness must be immediate or eventual", where)
+	}
+	if raw.Reason != "" && !raw.Scan {
+		r.errorf("%s: reason applies to scans; use doc to describe other reads", where)
+	}
 	switch {
+	case raw.Scan:
+		a.Kind = AccessScan
+		if a.Reason == "" {
+			r.errorf("%s: a scan reads the whole table; give the reason it is needed (reason: ...)", where)
+		}
+		a.Page, a.MaxPage = r.pageSize(where, raw)
 	case raw.Get != nil && raw.Get.Key:
 		a.Kind = AccessGet
 	case raw.Get != nil:
@@ -721,8 +831,11 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 			if a.Consistent && a.Index.Strategy == StrategyGSI {
 				r.errorf("%s: global secondary indexes cannot be read consistently", where)
 			}
+			if a.Freshness == FreshnessImmediate && a.Index.Strategy == StrategyGSI {
+				r.errorf("%s: freshness: immediate needs read-your-writes, but %s is a GSI, which DynamoDB updates a moment after each write. Make it a copy (strategy: copy, or leave strategy out and dynago chooses a copy), or accept eventual freshness", where, a.Index.Name)
+			}
 			// Read-your-writes is why an index is a copy: read it consistently unless told not to.
-			if a.Index.Strategy == StrategyCopy && raw.Consistent == nil {
+			if a.Index.Strategy == StrategyCopy && raw.Consistent == nil && a.Freshness != FreshnessEventual {
 				a.Consistent = true
 			}
 		}
@@ -733,17 +846,7 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 		default:
 			r.errorf("%s: order must be asc or desc", where)
 		}
-		a.Page = raw.Page
-		if a.Page == 0 {
-			a.Page = 50
-		}
-		a.MaxPage = raw.MaxPage
-		if a.MaxPage == 0 {
-			a.MaxPage = max(100, a.Page)
-		}
-		if a.Page < 1 || a.MaxPage < a.Page || a.MaxPage > 1000 {
-			r.errorf("%s: need 1 <= page <= max_page <= 1000", where)
-		}
+		a.Page, a.MaxPage = r.pageSize(where, raw)
 		if sk, ok := a.QuerySK(); raw.Range != "" {
 			f := e.Field(raw.Range)
 			switch {
@@ -785,10 +888,54 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 			}
 		}
 	}
-	if a.Kind != AccessQuery && (raw.Order != "" || raw.Page != 0 || raw.MaxPage != 0 || raw.Range != "" || raw.Project.Set) {
+	switch {
+	case a.Kind == AccessScan && (raw.Order != "" || raw.Range != "" || raw.Project.Set):
+		r.errorf("%s: order, range and project apply to queries; a scan takes page and max_page", where)
+	case a.Kind != AccessQuery && a.Kind != AccessScan && (raw.Order != "" || raw.Page != 0 || raw.MaxPage != 0 || raw.Range != "" || raw.Project.Set):
 		r.errorf("%s: order, page, max_page, range and project only apply to queries", where)
 	}
+	switch a.Freshness {
+	case FreshnessImmediate:
+		if raw.Consistent != nil && !*raw.Consistent {
+			r.errorf("%s: freshness: immediate needs a consistent read; leave consistent out", where)
+		}
+		if a.Kind != AccessGetUnique && (a.Index == nil || a.Index.Strategy != StrategyGSI) {
+			a.Consistent = true
+		}
+	case FreshnessEventual:
+		if raw.Consistent != nil && *raw.Consistent {
+			r.errorf("%s: consistent: true contradicts freshness: eventual (a consistent read costs twice as much, for freshness the read doesn't need); leave one out", where)
+		}
+	}
 	return a
+}
+
+// pageSize resolves a query's or scan's page and max_page.
+func (r *resolver) pageSize(where string, raw RawAccess) (page, maxPage int) {
+	page = raw.Page
+	if page == 0 {
+		page = 50
+	}
+	maxPage = raw.MaxPage
+	if maxPage == 0 {
+		maxPage = max(100, page)
+	}
+	if page < 1 || maxPage < page || maxPage > 1000 {
+		r.errorf("%s: need 1 <= page <= max_page <= 1000", where)
+	}
+	return page, maxPage
+}
+
+// accepts records a subject's accepted findings. The analysis checks the rule names and that each
+// acceptance still matches a finding.
+func (r *resolver) accepts(s Subject, where string, raw Ordered[string]) {
+	for _, a := range raw {
+		if strings.TrimSpace(a.Value) == "" {
+			r.errorf("%s accept %s: give the reason the finding is acceptable", where, a.Key)
+			continue
+		}
+		r.m.Accepts = append(r.m.Accepts, &Acceptance{Subject: s, Rule: a.Key, Reason: strings.TrimSpace(a.Value), Line: a.Line})
+	}
 }
 
 func (r *resolver) write(e *Entity, name string, raw RawWrite) *Write {
@@ -903,25 +1050,36 @@ func (r *resolver) crossRefs(m *Model) {
 			counters[c.Name] = c
 		}
 	}
+	source := func(e *Entity, f *Field, key, raw string) (*Entity, *Field) {
+		where := fmt.Sprintf("entity %s field %s %s", e.Name, f.Name, key)
+		en, fn, ok := strings.Cut(raw, ".")
+		te := byName[en]
+		switch {
+		case !ok || te == nil:
+			r.errorf("%s: %q must be Entity.field, naming an entity of this table", where, raw)
+		case te == e:
+			r.errorf("%s: copies within one entity are kept in sync already; %s is for another entity's field", where, key)
+		case te.Field(fn) == nil:
+			r.errorf("%s: %s has no field %s", where, en, fn)
+		case te.Field(fn).Type != f.Type:
+			r.errorf("%s: %s.%s is a %s, but %s is a %s", where, en, fn, te.Field(fn).Type, f.Name, f.Type)
+		default:
+			return te, te.Field(fn)
+		}
+		return nil, nil
+	}
 	for _, e := range m.Entities {
 		for _, f := range e.Fields {
-			if f.copyOfRaw == "" {
-				continue
+			if f.copyOfRaw != "" {
+				f.CopyOfEntity, f.CopyOf = source(e, f, "copy_of", f.copyOfRaw)
 			}
-			where := fmt.Sprintf("entity %s field %s copy_of", e.Name, f.Name)
-			en, fn, ok := strings.Cut(f.copyOfRaw, ".")
-			te := byName[en]
-			switch {
-			case !ok || te == nil:
-				r.errorf("%s: %q must be Entity.field, naming an entity of this table", where, f.copyOfRaw)
-			case te == e:
-				r.errorf("%s: copies within one entity are kept in sync already; copy_of is for another entity's field", where)
-			case te.Field(fn) == nil:
-				r.errorf("%s: %s has no field %s", where, en, fn)
-			case te.Field(fn).Type != f.Type:
-				r.errorf("%s: %s.%s is a %s, but %s is a %s", where, en, fn, te.Field(fn).Type, f.Name, f.Type)
-			default:
-				f.CopyOf, f.CopyOfEntity = te.Field(fn), te
+			if f.snapshotOfRaw != "" {
+				f.SnapshotOfEntity, f.SnapshotOf = source(e, f, "snapshot_of", f.snapshotOfRaw)
+			}
+			if f.refRaw != "" {
+				if f.Ref = byName[f.refRaw]; f.Ref == nil {
+					r.errorf("entity %s field %s ref: %s is not an entity of this table", e.Name, f.Name, f.refRaw)
+				}
 			}
 		}
 		for _, a := range e.Access {
@@ -1076,7 +1234,7 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 				}
 			}
 		}
-		req.Fast = !req.Optional && transitionable(tw, changed)
+		req.Fast = !req.Optional && transitionable(te, tw, changed)
 	}
 	if req.Consume {
 		req.Fast = !te.HasDerived()
@@ -1208,20 +1366,7 @@ func (r *resolver) planWrite(w *Write) {
 	case WriteDelete:
 		w.ReadFirst = e.HasDerived() || len(w.Requires) > 0
 	case WriteUpdate:
-		inputs := e.DerivedInputs()
-		changed := map[string]bool{}
-		for _, f := range w.Changed() {
-			changed[f.Name] = true
-			if inputs[f.Name] {
-				w.ReadFirst = true
-			}
-		}
-		if len(w.Requires) > 0 {
-			// Condition checks and changes to other items need a transaction, which the single
-			// UpdateItem path cannot be.
-			w.ReadFirst = true
-		}
-		w.Transition = w.ReadFirst && transitionable(w, changed) && requiresKnown(w)
+		w.ReadFirst, w.Transition = PlanReads(e, w)
 		for _, c := range e.Counters {
 			for _, v := range c.Values {
 				if v.LimitArg && CanGrow(w, v, false) {
@@ -1233,6 +1378,32 @@ func (r *resolver) planWrite(w *Write) {
 	if len(w.Limits) > 0 {
 		r.claimType(e.GoName+w.GoName+"Limits", "entity "+e.Name+" write "+w.Name)
 	}
+}
+
+// PlanReads decides whether an update of e must read the item first, and whether it can run
+// read-free instead. e is normally w.Entity; the analysis passes variants of it (another index
+// strategy) to compare designs.
+func PlanReads(e *Entity, w *Write) (readFirst, transition bool) {
+	switch w.Kind {
+	case WriteCreate:
+		return false, false
+	case WriteDelete:
+		return e.HasDerived() || len(w.Requires) > 0, false
+	}
+	inputs := e.DerivedInputs()
+	changed := map[string]bool{}
+	for _, f := range w.Changed() {
+		changed[f.Name] = true
+		if inputs[f.Name] {
+			readFirst = true
+		}
+	}
+	if len(w.Requires) > 0 {
+		// Condition checks and changes to other items need a transaction, which the single
+		// UpdateItem path cannot be.
+		readFirst = true
+	}
+	return readFirst, readFirst && transitionable(e, w, changed) && requiresKnown(w)
 }
 
 // gsis merges entity indexes with the gsi strategy into physical GSIs.
@@ -1422,8 +1593,7 @@ func requiresKnown(w *Write) bool {
 // key fields, and fields pinned by `when`. Index keys and copies need the whole item, so any
 // change to them rules it out, as does a patch field that feeds anything (it may or may not be
 // given).
-func transitionable(w *Write, changed map[string]bool) bool {
-	e := w.Entity
+func transitionable(e *Entity, w *Write, changed map[string]bool) bool {
 	known := map[*Field]bool{}
 	for _, f := range e.KeyFields() {
 		known[f] = true

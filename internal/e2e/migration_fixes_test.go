@@ -10,18 +10,18 @@ import (
 	"github.com/guregu/dynamo/v2"
 
 	"github.com/nicklanng/dynago"
-	"github.com/nicklanng/dynago/dynagotest"
 	"github.com/nicklanng/dynago/examples/toollibrary"
 	"github.com/nicklanng/dynago/internal/e2e/rekey"
+	"github.com/nicklanng/dynago/internal/testdb"
 )
 
 // Generation 2 keys people by email. A person whose email changes in generation 1 during the
 // migration moves in generation 2: the copy under the old email is removed, and the count holds.
 func TestMigrationFollowsKeyChanges(t *testing.T) {
-	db := dynagotest.DB(t)
-	base := dynagotest.UniqueName(t, "rekey")
-	dynagotest.TableNamed(t, db, base+"-g1", rekey.TableSpec)
-	dynagotest.TableNamed(t, db, rekey.TableName(base), rekey.TableSpec)
+	db := testdb.DB(t)
+	base := testdb.UniqueName(t, "rekey")
+	testdb.TableNamed(t, db, base+"-g1", rekey.TableSpec)
+	testdb.TableNamed(t, db, rekey.TableName(base), rekey.TableSpec)
 	old := db.Table(base + "-g1")
 	person := func(id, email string, rev int) {
 		must(t, old.Put(map[string]any{"PK": "P#" + id, "SK": "PERSON", "_t": "Person", "_v": 1, "_rev": rev,
@@ -80,7 +80,7 @@ func TestLostLeaseStopsTheJob(t *testing.T) {
 	if n := count(t, newTable); n != stolenAt {
 		t.Fatalf("%d items written after the lease was lost", n-stolenAt)
 	}
-	if st := dynagotest.RawItem(t, newTable, "_DYNAGO#MIGRATION#"+g.base+"-g1", "STATE"); st["leaseOwner"] != "another job" {
+	if st := testdb.RawItem(t, newTable, "_DYNAGO#MIGRATION#"+g.base+"-g1", "STATE"); st["leaseOwner"] != "another job" {
 		t.Fatalf("the stale job changed the lease: %v", st)
 	}
 }
@@ -139,10 +139,10 @@ func TestMigrationSwappedUniqueValues(t *testing.T) {
 // segments: 4 segments of 4 would cover the whole table, and treating them as done would skip
 // half of it.
 func TestResumedPassKeepsItsSegments(t *testing.T) {
-	db := dynagotest.DB(t)
-	base := dynagotest.UniqueName(t, "segs")
-	dynagotest.TableNamed(t, db, base+"-g1", rekey.TableSpec)
-	dynagotest.TableNamed(t, db, rekey.TableName(base), rekey.TableSpec)
+	db := testdb.DB(t)
+	base := testdb.UniqueName(t, "segs")
+	testdb.TableNamed(t, db, base+"-g1", rekey.TableSpec)
+	testdb.TableNamed(t, db, rekey.TableName(base), rekey.TableSpec)
 	old := db.Table(base + "-g1")
 	for i := range 40 {
 		id := fmt.Sprintf("p%02d", i)
@@ -178,10 +178,10 @@ func TestResumedPassKeepsItsSegments(t *testing.T) {
 // Conflict records hold their source's key whatever characters it contains: two people whose ids
 // contain "|" converting to one email are a conflict, and finish must refuse.
 func TestConflictKeysWithSeparators(t *testing.T) {
-	db := dynagotest.DB(t)
-	base := dynagotest.UniqueName(t, "pipes")
-	dynagotest.TableNamed(t, db, base+"-g1", rekey.TableSpec)
-	dynagotest.TableNamed(t, db, rekey.TableName(base), rekey.TableSpec)
+	db := testdb.DB(t)
+	base := testdb.UniqueName(t, "pipes")
+	testdb.TableNamed(t, db, base+"-g1", rekey.TableSpec)
+	testdb.TableNamed(t, db, rekey.TableName(base), rekey.TableSpec)
 	old := db.Table(base + "-g1")
 	for _, id := range []string{"a|1", "b|2"} {
 		must(t, old.Put(map[string]any{"PK": "P#" + id, "SK": "PERSON", "_t": "Person", "_v": 1, "_rev": 1,
@@ -198,10 +198,10 @@ func TestConflictKeysWithSeparators(t *testing.T) {
 // Removing a copy judged stale spares it if it has been rewritten since: it is then a fresher
 // copy (another worker copied its source again), not the stale one.
 func TestRemovingAStaleCopySparesAFreshOne(t *testing.T) {
-	db := dynagotest.DB(t)
-	base := dynagotest.UniqueName(t, "fresh")
-	dynagotest.TableNamed(t, db, base+"-g1", rekey.TableSpec)
-	dynagotest.TableNamed(t, db, rekey.TableName(base), rekey.TableSpec)
+	db := testdb.DB(t)
+	base := testdb.UniqueName(t, "fresh")
+	testdb.TableNamed(t, db, base+"-g1", rekey.TableSpec)
+	testdb.TableNamed(t, db, rekey.TableName(base), rekey.TableSpec)
 	old := db.Table(base + "-g1")
 	person := func(name string, rev int) {
 		must(t, old.Put(map[string]any{"PK": "P#p1", "SK": "PERSON", "_t": "Person", "_v": 1, "_rev": rev,
@@ -225,5 +225,27 @@ func TestRemovingAStaleCopySparesAFreshOne(t *testing.T) {
 	p, err := rekey.New(db, rekey.TableName(base)).Persons.Get(ctx, rekey.PersonKey{Email: "ann@example.org"})
 	if err != nil || p.Name != "Ann B" {
 		t.Fatalf("the fresh copy: %+v, %v", p, err)
+	}
+}
+
+// A catch-up pass over items already copied reads their copies a page at a time, not one by one:
+// the final pass runs while writes are stopped, and each read by key is a round trip.
+func TestCatchUpReadsCopiesInBatches(t *testing.T) {
+	g := setupGenerations(t)
+	for i := 0; i < 30; i++ {
+		id := fmt.Sprintf("t%02d", i)
+		must(t, g.old.Tools.Add(ctx, &toollibrary.Tool{LibraryID: "lib1", ToolID: id, Name: "Tool " + id, Category: toollibrary.ToolCategoryHand}))
+	}
+	toollibrary.MigrateTool = func(o toollibrary.ToolG1) (toollibrary.Tool, error) { return toollibrary.AutoMigrateTool(o), nil }
+	defer func() { toollibrary.MigrateTool = nil }()
+	must(t, g.run("copy"))
+
+	db, n := testdb.CountingDB(t)
+	m := toollibrary.NewMigration(db, g.base)
+	m.Workers, m.Out = 1, &bytes.Buffer{}
+	must(t, m.Run(ctx, "copy"))
+	// The job's own state and checkpoints are read by key; the 30 tools are not.
+	if gets, batches := n.GetItem.Load(), n.BatchGetItem.Load(); gets >= 30 || batches == 0 {
+		t.Fatalf("a catch-up pass made %d GetItems and %d BatchGetItems", gets, batches)
 	}
 }

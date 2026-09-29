@@ -4,19 +4,119 @@
 
 Table generation **2**: `rekey-g2`. It is filled from generation 1 (`rekey-g1`) by the migration job (`RunMigration`); `rekey-g1` stays for rollback. See the [migrations guide](https://github.com/nicklanng/dynago/blob/main/docs/guides/migrations.md).
 
-**Contents:** [Table](#table) · [Person](#person) · [Costs and risks](#costs-and-risks) · [How to read this](#how-to-read-this)
+**Contents:** [Summary](#summary) · [Domain](#domain) · [Reads](#reads) · [Writes](#writes) · [Storage and partitions](#storage-and-partitions) · [Risks and costs](#risks-and-costs) · [Reference](#reference) · [How to read this](#how-to-read-this)
 
-## Table
+## Summary
+
+| | |
+|---|---|
+| Entities | 1: Person |
+| Reads | 2: 1 by key, 1 counters |
+| Writes | 1: 1 in a transaction, 0 reading the item first |
+| Indexes | 0 GSIs, 0 copy indexes |
+| Uniqueness claims, counters | 0, 1 |
+| Workload | No peak factor declared (peaks taken as the averages); volumes declared for 0 of 1 entities |
+| Largest partition | `E#{email}` (base table): 204 B typical, 204 B at most |
+| Cost | $0.00/month at the declared volumes and rates |
+| Findings | 0 errors, 0 warnings, 0 notes open; 0 accepted |
+
+## Domain
+
+### Entities
+
+| Entity | What it is | Identified by | Volume | Expected items |
+|---|---|---|---|---|
+| [Person](#person) |  | `email` | not declared | — |
+
+## Reads
+
+Every read the code can make. A read that isn't listed has no method, so a new way of reading the data can only arrive as a change to the schema, and to this document.
+
+| Read | Answers | Served by | Freshness | Returns | RRU per call p50/p99 | Rate |
+|---|---|---|---|---|---|---|
+| `Person.Get` | One Person, by email. | GetItem | eventual (not stated) | one | 0.5 | — |
+| `Person.Count` | The People counts for a . | counter People (GetItem) | eventual (not stated) | the counts | 0.5 | — |
+
+## Writes
+
+Every write the code can make, and everything each changes. Each is atomic: all of it happens, or none of it does.
+
+| Write | Does | Checks | Changes | Reads first | Atomic | WRU per call p50/p99 | Rate |
+|---|---|---|---|---|---|---|---|
+| `Person.Add` | Creates a Person | no Person at the key | Person<br>counter People | no | transaction, 2 items | 4 | — |
+
+## Storage and partitions
+
+### Table
 
 | Setting | Value |
 |---|---|
+| Table | `rekey-g2` (generation 2) |
 | Base key | `PK` (partition, string) + `SK` (sort, string) |
 | Billing | On-demand |
-| Entities | Person |
 
-The table has no global secondary indexes.
+The table has no indexes.
 
-## Person
+### Partition map
+
+Which items share a partition, in the base table and in each GSI, and which reads reach them.
+
+```mermaid
+flowchart LR
+  subgraph p0["E#35;{email}"]
+    p0m0["Person"]
+  end
+  subgraph p1["PEOPLE"]
+    p1m0["counter People"]
+  end
+  r_Person_Get{{"Person.Get"}} --> p0
+  r_Person_Count{{"Person.Count"}} --> p1
+```
+
+### Partitions
+
+Each row is every partition key value one key pattern renders: *Keys* is how many values there are. Counts are per value: typical, then the largest. Traffic is the busiest value's at peak.
+
+| Partition key | In | Keys | Holds | Size, typical / largest | Grows | Busiest key at peak | Risk |
+|---|---|---|---|---|---|---|---|
+| `E#{email}` | base table | unknown | Person: 1 | 204 B / 204 B | no | no rates declared | — |
+| `PEOPLE` | base table | unknown | counter People: 1 | 110 B / 110 B | no | no rates declared | — |
+
+## Risks and costs
+
+No open findings.
+
+### Costs
+
+| Entity | Expected items | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
+|---|---|---|---|---|---|
+| Person | not declared | 204 B / 382 B | 0.00 GB | $0.00 | $0.00 |
+
+Estimated total: **$0.00/month** for the declared volumes and rates.
+
+Assumptions:
+
+- Volumes describe the table at no stated point in time (no workload.horizon).
+- Peak traffic is assumed equal to the declared average rates (no workload.peak).
+- Items per partition follow the volumes: an entity's items per parent (typical and max), multiplied up the parents. A partition's largest count takes the biggest skew along its path, not every one at once.
+- An enum in a partition key splits the items evenly among its values typically; at worst they all share one. A field that refers to another entity (by name, ref or requires) spreads the items evenly over that entity's items, unless volume.by says otherwise. Any other field leaves the count unknown.
+- Index entries are counted as if every item had one: `where` and empty key fields only make an index smaller.
+- The busiest partition gets traffic in proportion to its share of the items: its largest count over the entity's total. A write's declared hot_key_rate replaces that estimate for every partition it touches.
+- A partition key value takes at most 1000 WRU and 3000 RRU per second. Risk is the larger share of either at peak: low under 10%, medium under 50%, high above.
+- Sizes use each field's declared size (p50/p99); undeclared sizes use type defaults (string 20/64 B, time 30/35 B, int 8/11 B).
+- Every declared field is assumed present; empty fields are not stored, so real items are usually smaller.
+- A unique string set makes one claim per element; the number of elements is estimated from the set's declared size at 20 B per element.
+- Capacity follows DynamoDB rules: 1 WRU per started 1 KB written, 1 RRU per started 4 KB read strongly (half for eventually consistent); transactions cost double, and a condition check on another item is billed as a transactional write of that item.
+- GSI and copy writes are counted as one index write per entry; an index key change is a delete plus a put.
+- Prices: $0.625 per million WRU, $0.125 per million RRU, $0.25 per GB-month (on-demand).
+- Monthly figures use each access pattern's and write's declared average rate (rate:, per second); patterns without a rate are not costed.
+- Storage counts each entity's items, index entries and claims at its declared volume, plus 100 bytes of overhead per item. A scan reads the base table's items, copies and claims, without GSI entries or overhead; counter items aren't counted.
+
+## Reference
+
+Each entity in full: its fields, every item stored for it, the key condition of each read, and the errors each write returns.
+
+### Person
 
 Schema version **2**. Go type `Person`, store `Store.Persons`.
 
@@ -34,7 +134,7 @@ flowchart LR
 
 Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB; solid arrows are written by the generated code.
 
-### Fields
+#### Fields
 
 | Field | Type | Attribute | Size p50/p99 | Notes |
 |---|---|---|---|---|
@@ -42,65 +142,46 @@ Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB
 | `email` | string | `email` | 20 / 64 B | key |
 | `name` | string | `name` | 20 / 64 B |  |
 
-### Stored items
+#### Stored items
 
 Every item that exists because of a Person, and what keeps it up to date.
 
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
-| **Person** | `E#{email}` | `PERSON` | `E#{email}`<br>`PERSON` | 128 B / 306 B | the writes below |
-| Counter `People` | `PEOPLE` | `COUNT` | `PEOPLE`<br>`COUNT` | ~100 B | the writes below, with atomic ADDs in the same transaction. |
+| **Person** | `E#{email}` | `PERSON` | `E#{email}`<br>`PERSON` | 204 B / 382 B | the writes below |
+| Counter `People` | `PEOPLE` | `COUNT` | `PEOPLE`<br>`COUNT` | ~110 B | the writes below, with atomic ADDs in the same transaction. |
 
-### Counters
+#### Counters
 
 - **People**, keyed by . 
   - `all`: count of items.
 
-### Access patterns
+#### Access patterns
 
 | Method | Reads | Key condition | Consistency | Requests | RRU per call p50/p99 |
 |---|---|---|---|---|---|
 | `Get` | item by key | `PK = E#{email}`, `SK = PERSON` | eventual | GetItem | 0.5 |
 | `Count` | counter `People` | `PK = PEOPLE`, `SK = COUNT` | eventual | GetItem | 0.5 |
 
-### Writes
+#### Writes
 
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
 | `Add` | create (fails if it exists) | Person<br>counter People | no | transaction (2 items) | — | 4 | `ErrPersonExists` |
 
-## Costs and risks
-
-No findings.
-
-| Entity | Items (assumed) | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
-|---|---|---|---|---|---|
-| Person | not declared | 128 B / 306 B | 0.00 GB | $0.00 | $0.00 |
-
-Estimated total: **$0.00/month** for the declared item counts and rates.
-
-Assumptions:
-
-- Sizes use each field's declared size (p50/p99); undeclared sizes use type defaults (string 20/64 B, time 30/35 B, int 8/11 B).
-- Every declared field is assumed present; empty fields are not stored, so real items are usually smaller.
-- A unique string set makes one claim per element; the number of elements is estimated from the set's declared size at 20 B per element.
-- Capacity follows DynamoDB rules: 1 WRU per started 1 KB written, 1 RRU per started 4 KB read strongly (half for eventually consistent); transactions cost double, and a condition check on another item is billed as a transactional write of that item.
-- GSI and copy writes are counted as one index write per entry; an index key change is a delete plus a put.
-- Prices: $0.625 per million WRU, $0.125 per million RRU, $0.25 per GB-month (on-demand).
-- Monthly figures use each access pattern's and write's declared average rate (rate:, per second); patterns without a rate are not costed.
-
 ## How to read this
 
-- **Everything lives in one table.** Items are addressed by a partition key (`PK`) and a sort key (`SK`). Items sharing a partition key are stored together and can be read with one Query, in sort key order.
-- **Key patterns** such as `LIB#{libraryId}#TOOL#{toolId}` show how keys are built: literal text plus field values. Times in keys are fixed-width UTC so they sort chronologically.
-- **Entities** are the domain types. Each is stored as one item, plus the items listed under *Stored items*: index entries, copies, uniqueness claims and counters. The generated code writes and deletes the copies, claims and counters in the same transaction as the item; DynamoDB maintains the GSI entries itself.
+- **Items and keys.** Everything lives in one table. Items are addressed by a partition key (`PK`) and a sort key (`SK`). Items sharing a partition key are stored together and can be read with one Query, in sort key order. Key patterns such as `LIB#{libraryId}#TOOL#{toolId}` show how keys are built: literal text plus field values. Times in keys are fixed-width UTC so they sort chronologically.
+- **Entities** are the domain types. Each is stored as one item, plus the items listed under *Stored items* in the reference: index entries, copies, uniqueness claims and counters. The generated code writes and deletes the copies, claims and counters in the same transaction as the item; DynamoDB maintains the GSI entries itself.
+- **Reads and writes** are the only ones the code can do: each read is one request (two for a lookup by a unique value), and each write is atomic. A read or write nobody declared has no method, so every new one shows up in review as a change to this document.
 - **Global secondary indexes (GSIs)** re-key the same items so they can be queried another way. DynamoDB keeps them up to date asynchronously, so reads through them are eventually consistent (usually well under a second behind). An entity only appears in an index while every text or time field its index keys use is set, and its `where` holds, so an index can hold a subset (a *sparse* index).
-- **Copies** are an alternative to a GSI: separate items written in the same transaction as the entity. They cost a transaction on every write that changes what they hold, but can be read back immediately.
+- **Copies** are the other way to index: separate items written in the same transaction as the entity. Writes that change them become transactions, but reads see a write immediately. dynago picks a copy when a read declares `freshness: immediate`.
 - **Claims** make a value unique: creating the entity also creates an item keyed by the value, conditional on it not existing.
 - **Counters** are items updated with atomic ADD in the same transaction as the entity, so counts never drift from the items they count. A limit on a counter value turns into a condition, which is how capacity is enforced without races.
-- **Access patterns** are the only reads the code can do: each is one request (or two for a lookup by a unique value). A query nobody declared does not exist as a method, so every new way of reading data shows up in review as a schema change.
+- **Partitions.** A partition key value's items (an *item collection*) are served by one DynamoDB partition, which takes at most 1,000 write units and 3,000 read units a second. The partition table estimates, from the declared volumes and rates, how many items each partition key value holds, how big it gets, and how close its busiest value comes to those limits at peak.
 - **Costs** are in DynamoDB capacity units: a write costs 1 WRU per started KB, a read 1 RRU per started 4 KB (half for eventually consistent reads), and transactions cost double.
+- **Findings** have a rule id. A schema can accept a warning or note with a reason (`accept: { rule: reason }` on the thing it's about); errors must be fixed. A `dynago.policy.yaml` can change a rule's severity and which severities fail the build.
 - **Document versions** guard against lost updates. Every entity the store returns knows the version it was read at (`Version()`, an opaque string suitable for an ETag). Passing it back with a write (`dynago.IfVersion`, or the entity itself with `dynago.From`) makes the write fail if anyone changed the item since, rather than silently overwriting their change. Writes marked *required* refuse to run without one.
-- **Schema versions** are stored on every item (`_v`), along with the entity type (`_t`) and a revision counter (`_rev`) that guards read-modify-write updates.
+- **Schema versions** are stored on every item (`_v`), along with the entity type (`_t`), a revision counter (`_rev`) that guards read-modify-write updates, and when the item was first written and last changed (`_created`, `_updated`, by the writing server's clock).
 - **Table generations.** A schema change that existing items don't fit (adding, changing or dropping an index, claim or counter; a changed key; a changed field type; a field made required) moves the data to a new table, `<name>-g<generation>`, copied by a generated migration job; the old table stays for rollback.
 

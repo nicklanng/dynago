@@ -66,6 +66,7 @@ type Account struct {
 	SuccessorID string        `dynamo:"successorId,omitempty"`
 
 	loaded *accountLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
 }
 
 // accountLoaded remembers the stored state an entity was read at, so a write passed the entity
@@ -86,6 +87,11 @@ func (e *Account) Version() string {
 	}
 	return dynago.FormatVersion(e.loaded.rev)
 }
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Account) Timestamps() dynago.Timestamps { return e.stamps }
 
 // clone copies e, including its slices and maps, without its loaded state.
 func (e *Account) clone() Account {
@@ -130,20 +136,24 @@ const accountVersion = 1
 
 type accountItem struct {
 	Account
-	PK  string `dynamo:"PK"`
-	SK  string `dynamo:"SK"`
-	T   string `dynamo:"_t"`
-	V   int    `dynamo:"_v"`
-	Rev int64  `dynamo:"_rev"`
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
 
 	raw dynamo.Item // as read, for writes to keep attributes this code doesn't know
 }
 
 // accountKnown is every attribute this code writes on Account items.
-var accountKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "tenantId": true, "accountId": true, "region": true, "status": true, "successorId": true}
+var accountKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "tenantId": true, "accountId": true, "region": true, "status": true, "successorId": true}
 
-func accountToItem(e *Account, key dynago.Key, rev int64) *accountItem {
-	it := &accountItem{Account: *e, PK: key.PK, SK: key.SK, T: "Account", V: accountVersion, Rev: rev}
+// accountToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func accountToItem(e *Account, key dynago.Key, rev int64, created, updated string) *accountItem {
+	it := &accountItem{Account: *e, PK: key.PK, SK: key.SK, T: "Account", V: accountVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
 	return it
 }
 
@@ -221,6 +231,7 @@ func accountDecode(raw dynamo.Item) (*accountItem, error) {
 		return nil, err
 	}
 	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
 	it.loaded = &accountLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
@@ -319,6 +330,21 @@ func (s *AccountStore) Region(ctx context.Context, k RegionCountsKey) (RegionCou
 	return out, err
 }
 
+// Export returns the Account items of one page of the whole table, with exactly one eventually
+// consistent Scan (default 2, max 100 items evaluated). A page evaluates items of every kind and
+// keeps the Account ones, so it can hold few or none and still have a next cursor. It returns the
+// cursor for the next page, or "" once the whole table has been read. Declared as a scan because:
+// the audit export reads every account
+func (s *AccountStore) Export(ctx context.Context, page dynago.Page) ([]Account, string, error) {
+	var raws []dynamo.Item
+	next, err := dynago.Scan(ctx, s.t, dynago.ScanSpec{Scope: "Account.Export@v1", Type: "Account", PageSize: 2, MaxPage: 100}, page, &raws)
+	if err != nil {
+		return nil, "", err
+	}
+	out, err := accountDecodeAll(raws)
+	return out, next, err
+}
+
 // Open creates an Account, failing with ErrAccountExists if one already exists. In the same
 // transaction it maintains counter TenantCounts, counter RegionCounts. Afterwards e.Version()
 // returns the new item's version.
@@ -330,9 +356,11 @@ func (s *AccountStore) Open(ctx context.Context, e *Account) error {
 	if err := e.checkKeyParts(); err != nil {
 		return err
 	}
-	rev := dynago.NewRev()
-	return dynago.Retry(ctx, func() error {
-		put := s.t.Put(accountToItem(e, key, rev)).If("attribute_not_exists($)", "PK")
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		put := s.t.Put(accountToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
 		ops := []dynago.Op{dynago.CreateOp(key, put, ErrAccountExists, rev)}
 		changes := []dynago.Change{{Owner: key, After: accountDerived(e, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
@@ -346,6 +374,10 @@ func (s *AccountStore) Open(ctx context.Context, e *Account) error {
 		e.loaded = &accountLoaded{rev: rev, v: accountVersion, snapshot: e.clone()}
 		return nil
 	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
 }
 
 // Activate updates status of an Account when status = "pending" (else
@@ -371,7 +403,7 @@ func (s *AccountStore) Activate(ctx context.Context, k AccountKey, opts ...dynag
 		after := before.clone()
 		after.Status = AccountStatusActive
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, accountKnown, accountToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, accountKnown, accountToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -420,7 +452,7 @@ func (s *AccountStore) HandOver(ctx context.Context, k AccountKey, v AccountHand
 		after.SuccessorID = v.SuccessorID
 		after.Status = AccountStatusClosed
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
-		item, err := dynago.KeepUnknown(it.raw, accountKnown, accountToItem(&after, key, it.Rev+1))
+		item, err := dynago.KeepUnknown(it.raw, accountKnown, accountToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {
 			return err
 		}
@@ -476,7 +508,7 @@ func (s *AccountStore) requireHandOverAccount(ctx context.Context, e *Account, r
 	}
 	after := before.clone()
 	after.Status = AccountStatusActive
-	item, err := dynago.KeepUnknown(it.raw, accountKnown, accountToItem(&after, key, it.Rev+1))
+	item, err := dynago.KeepUnknown(it.raw, accountKnown, accountToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 	if err != nil {
 		return nil, dynago.Change{}, err
 	}

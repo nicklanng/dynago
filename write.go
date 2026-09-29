@@ -301,7 +301,8 @@ func UpdateFields(ctx context.Context, t dynamo.Table, key Key, sets []Set, when
 	return 0, whyFailed(ctx, t, key, g, now, precondition)
 }
 
-// SetFields applies attribute changes to an update and bumps the item's revision.
+// SetFields applies attribute changes to an update, bumps the item's revision and stamps it as
+// updated now.
 func SetFields(u *dynamo.Update, sets []Set) {
 	for _, s := range sets {
 		switch {
@@ -314,6 +315,7 @@ func SetFields(u *dynamo.Update, sets []Set) {
 		}
 	}
 	u.Add(Path(AttrRev), 1)
+	u.Set(Path(AttrUpdated), NewStamp())
 }
 
 // KeepUnknown returns item, marshalled, with every attribute of raw (the stored item it replaces)

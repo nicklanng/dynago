@@ -37,6 +37,7 @@ entities:
       Get: get
       Tenant: { counter: TenantCounts }
       Region: { counter: RegionCounts }
+      Export: { scan: true, page: 2, reason: the audit export reads every account }
     writes:
       Open: create
       Activate: { set: { status: active }, when: { status: pending } }

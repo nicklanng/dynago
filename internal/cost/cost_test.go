@@ -62,54 +62,49 @@ func TestWriteCosts(t *testing.T) {
 	if s := find(r, "Member", "SetLoanCap"); s.Transactional || s.ReadFirst {
 		t.Errorf("SetLoanCap = %+v", s)
 	}
-	var msgs []string
-	for _, f := range r.Findings {
-		msgs = append(msgs, f.Message)
-	}
-	all := strings.Join(msgs, "\n")
-	for _, want := range []string{"copies Tool.name", "manual (p99"} {
-		if !strings.Contains(all, want) {
-			t.Errorf("findings lack %q:\n%s", want, all)
+	// Every touch names the family of items it writes, for the partition analysis.
+	for _, tc := range b.Touches {
+		if tc.Target.Entity == nil || tc.Label == "" {
+			t.Errorf("Borrow touch without a target: %+v", tc)
 		}
 	}
 }
 
-func TestFindings(t *testing.T) {
-	src := `
+// Storage follows the declared volumes: a total, or a number per parent multiplied down.
+func TestStorageFollowsVolumes(t *testing.T) {
+	r := Analyze(load(t, "../../examples/toollibrary/toollibrary.dynago.yaml"), DefaultPrices)
+	for _, er := range r.Entities {
+		if er.Entity.Name == "Loan" && (er.Entity.Count != 2000*60*20 || er.StorageGB < 1) {
+			t.Errorf("Loan: count %v, storage %.2f GB", er.Entity.Count, er.StorageGB)
+		}
+	}
+	if r.StorageBytes <= 0 {
+		t.Error("no table storage")
+	}
+}
+
+// A scan's cost per page follows the page size, and its full pass the whole table.
+func TestScanCost(t *testing.T) {
+	m, err := schema.Parse([]byte(`
 dynago: 1
-package: big
-table: { name: big }
+package: things
+table: { name: things }
 entities:
-  Doc:
+  Thing:
     fields:
       id: string
-      body: { type: string, size: 1000/500000 }
-    key: { pk: "DOC#{id}", sk: "DOC" }
-    counters:
-      Total:
-        pk: "TOTAL"
-        sk: "TOTAL"
-        values:
-          n: count
-    writes:
-      Put: { create: true, hot_key_rate: 800 }
-`
-	m, err := schema.Parse([]byte(src))
+      body: { type: string, size: 1000 }
+    key: { pk: "T#{id}", sk: "THING" }
+    access:
+      Export: { scan: true, page: 100, reason: nightly export to the warehouse }
+    volume: 1000000
+`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := Analyze(m, DefaultPrices)
-	var msgs []string
-	for _, f := range r.Findings {
-		msgs = append(msgs, string(f.Severity)+": "+f.Message)
-	}
-	all := strings.Join(msgs, "\n")
-	for _, want := range []string{"error: p99 item size", "error: at 800 writes/s to one Total key"} {
-		if !strings.Contains(all, want) {
-			t.Errorf("missing %q in:\n%s", want, all)
-		}
-	}
-	if !r.HasErrors() {
-		t.Error("HasErrors = false")
+	rc := r.Entities[0].Reads[0]
+	if rc.Requests != "Scan (one page)" || rc.FullPassRRU < 100000 {
+		t.Errorf("scan cost = %+v", rc)
 	}
 }

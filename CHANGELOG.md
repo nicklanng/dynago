@@ -8,6 +8,40 @@ All notable changes to dynago are recorded here. The format follows
 
 First version.
 
+### Analysis and review
+
+- `volume` on entities (a total, or `typical` and `max` per parent, with `by` for the spread over
+  other entities) and `workload` (`peak`, `horizon`) replace `estimate`. Parents are inferred from
+  partition key nesting; `ref` links a field to another entity's key.
+- Partition analysis: every partition family in the base table and each GSI, with items per key,
+  size (typical and largest), growth, the busiest key's capacity at peak, and a risk level.
+- Findings have rule ids and subjects. `accept: { rule: reason }` on the table, an entity, field,
+  index, constraint, counter, read or write records one as deliberate; errors can't be accepted,
+  and stale acceptances are errors. New rules: `hot-partition`, `low-cardinality-key`,
+  `sparse-index`, `unenforced-unique`, `unused-index`, `copy-not-needed`, `transaction-too-large`
+  (4 MB), `scan`, and policy rules; `copy-drift` now reports fan-out.
+- `dynago.policy.yaml`: `fail_on`, rule severities, limits (item and partition size, transaction
+  items, GSIs, indexes per entity) and required declarations (volumes, rates, freshness).
+- `freshness: immediate | eventual` on reads. An index without `strategy` becomes a copy if a read
+  through it needs immediate freshness, a GSI otherwise; the model document shows what the other
+  strategy would cost.
+- `snapshot_of`: a copied value deliberately kept as it was when written.
+- `scan: true` with a `reason`: a declared, paginated scan of the entity's items.
+- The model document leads with a summary, the domain (relationships, guarantees, lifecycles),
+  catalogues of every read and write, the indexes and a partition map, then risks and costs; the
+  per-entity detail moved to a reference section.
+- `dynago diff`: the architectural changes since a git ref or another file, as Markdown, including
+  whether existing items need a new table generation and what migrating them costs.
+- `dynago check -json`: the analysed design as JSON.
+- `dynago vet`: DynamoDB calls outside generated code, with `//dynago:raw <reason>` for exceptions.
+
+- Every row dynago writes carries `_created` and `_updated` (entity items, copies, claims,
+  counters), set on every write path and kept by the migration job; entities expose them as
+  `Timestamps()`.
+- The migration job checks which items of a page are already copied with one BatchGetItem, not a
+  read per item: catch-up passes and `finish` make far fewer round trips.
+- Tests can run against real DynamoDB tables in a test AWS account (`make test-aws`, maintainers).
+
 ### Schema and generator
 
 - Schema files declaring entities, fields, key templates, indexes, uniqueness, counters, access
@@ -33,8 +67,8 @@ First version.
 - `required: true` fields: writes refuse their zero value with `dynago.ErrFieldRequired`.
 - `patch`: optional update fields; `nil` leaves a field unchanged. A call that leaves every field
   feeding a derived item `nil` runs as a single UpdateItem.
-- `copy_of`: declares a field copied from another entity, shown in the model document and warned
-  about by `dynago check`.
+- `copy_of`: declares a field copied from another entity that must stay equal to it, shown in the
+  model document and warned about by `dynago check`.
 - Three update shapes chosen from the schema: a single conditional UpdateItem when nothing derived
   changes; a read-free transaction when the derived changes are known from the call; a read, diff
   and guarded transaction otherwise.
