@@ -249,3 +249,46 @@ func TestEnumReAddedWithFewerValues(t *testing.T) {
 		t.Fatalf("got %v", err)
 	}
 }
+
+// An entity re-versioned with the generation was copied in with its new shape, so what earlier
+// generations stored doesn't constrain later versions.
+func TestRetypedWithTheGeneration(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "      name: string\n      mood: { type: enum, values: [a, b, c] }\n", ""), empty())
+	l2 := apply(t, model(t, 2, 2, "      name: int\n      mood: { type: enum, values: [a] }\n", ""), l1)
+	if !l2.Entities["Thing"].Versions[1].StartsGeneration {
+		t.Fatalf("versions = %+v", l2.Entities["Thing"].Versions)
+	}
+	if _, _, err := Apply(model(t, 2, 3, "      name: int\n      mood: { type: enum, values: [a] }\n      extra: string\n", ""), l2, Options{}); err != nil {
+		t.Fatalf("a later version in the generation: %v", err)
+	}
+}
+
+// The migration job checks expiry of old items by the old table's TTL attribute.
+func TestPreviousRecordsTheOldTTLAttribute(t *testing.T) {
+	src := `
+dynago: 1
+package: things
+table: { name: things, generation: %g, ttl_attribute: %a }
+entities:
+  Thing:
+    version: %d
+    fields:
+      thingId: string
+      expiresAt: time
+    key: { pk: "THING#{thingId}", sk: "THING" }
+    ttl: expiresAt
+`
+	parse := func(gen, version int, attr string) *schema.Model {
+		m, err := schema.Parse([]byte(strings.NewReplacer("%g", strconv.Itoa(gen), "%d", strconv.Itoa(version), "%a", attr).Replace(src)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	l1 := apply(t, parse(1, 1, "expires"), empty())
+	m := parse(2, 2, "ttl")
+	apply(t, m, l1)
+	if m.Previous == nil || m.Previous.TTLAttr != "expires" {
+		t.Fatalf("previous = %+v", m.Previous)
+	}
+}

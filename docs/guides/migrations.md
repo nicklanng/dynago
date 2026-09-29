@@ -43,9 +43,10 @@ table isn't touched, so rolling back means pointing the old version at it again.
    }
    ```
 
-   Needing a conversion is decided field by field: a new required field; a field whose type
-   changed (other than between `string_set` and `string_list`, which both hold `[]string`); enum
-   values that went away; or a field that's gone. A field that's gone might have been
+   Needing a conversion is decided field by field: a new required field, or one made required; a
+   field whose type changed (other than between `string_set` and `string_list`, which both hold
+   `[]string`: a list made a set loses repeated values); enum values that went away; or a field
+   that's gone. A field that's gone might have been
    renamed, and only you know which. The generated doc comment on `Migrate<Entity>` lists the
    reasons, and so does the job's error.
 
@@ -85,7 +86,8 @@ usual environment: credentials, `AWS_REGION`, and `AWS_ENDPOINT_URL_DYNAMODB` fo
 - **`status`** prints the current pass, its progress and any conflicts.
 
 Progress is checkpointed per scan segment in the new table (under a partition of its own), so a
-restarted job resumes where it stopped. `-rate` caps items per second across workers, to spare the
+restarted job resumes where it stopped. A resumed pass keeps its number of segments, even if
+`-workers` changed. `-rate` caps items per second across workers, to spare the
 old table's traffic.
 
 **Cost of a pass.** Every pass reads:
@@ -125,6 +127,12 @@ holds, and a new limit applies to writes made after the cutover.
 Fix the data in the old table, then run the job again. Fixed items are copied, and conflicts for
 items deleted or expired meanwhile are dropped. Fix conflicts during `copy`, while the old version
 still serves, because `finish` runs with it stopped.
+
+**Changing a conversion after `copy`.** The job copies an item again only when its source changes.
+So a fix to a `Migrate<Entity>` that returned wrong values (rather than an error) doesn't reach
+items already copied. To convert everything again, start the new table over: turn off its deletion
+protection, delete it, apply the Terraform to create it again, and run `copy`. The migration's
+progress lives in the new table, so it starts from the beginning.
 
 ## On Kubernetes
 

@@ -54,7 +54,7 @@ func (g *gen) migration() {
 	g.p("st := New(db, TableName(base))")
 	g.p("return &dynago.Migration{DB: db, From: base + \"-g%d\", To: TableName(base),", prev.Generation)
 	g.p("Types: map[string]bool{%s},", strings.Join(types, ", "))
-	g.p("Copy: st.migrateCopy, KeyOf: st.migrateKeyOf, Remove: st.migrateRemove, Check: migrationCheck, TTLAttr: %q}", m.Table.TTLAttr)
+	g.p("Copy: st.migrateCopy, KeyOf: st.migrateKeyOf, Remove: st.migrateRemove, Check: migrationCheck, TTLAttr: %q}", prev.TTLAttr)
 	g.p("}")
 	g.p("")
 	for _, e := range m.Entities {
@@ -109,6 +109,8 @@ func conversionGaps(e *schema.Entity, prev []schema.PreviousField) []string {
 		case !had && f.Required:
 			gaps = append(gaps, fmt.Sprintf("%s is new and required", f.Name))
 		case !had:
+		case f.Required && !pf.Required:
+			gaps = append(gaps, fmt.Sprintf("%s is now required", f.Name))
 		case previousType(pf) != previousType(schema.PreviousField{Type: f.Type}) || (pf.Type == schema.TypeEnum) != (f.Type == schema.TypeEnum):
 			gaps = append(gaps, fmt.Sprintf("%s changed from %s to %s", f.Name, pf.Type, f.Type))
 		case f.Type == schema.TypeEnum:
@@ -152,7 +154,7 @@ func (g *gen) previousStruct(e *schema.Entity, fields []schema.PreviousField) {
 	g.p("var %s func(old %s) (%s, error)", fn, old, e.GoName)
 	g.p("")
 	g.p("// AutoMigrate%s copies the fields of a generation-%d %s that exist in this generation with the", e.GoName, prev.Generation, e.Name)
-	g.p("// same type (enums by value); the others are left zero.")
+	g.p("// same type (enums by value, lists made sets without repeats); the others are left zero.")
 	g.p("func AutoMigrate%s(old %s) %s {", e.GoName, old, e.GoName)
 	have := map[string]schema.PreviousField{}
 	for _, f := range fields {
@@ -165,8 +167,11 @@ func (g *gen) previousStruct(e *schema.Entity, fields []schema.PreviousField) {
 			continue
 		}
 		val := "old." + schema.GoName(pf.Name)
-		if f.Type == schema.TypeEnum {
+		switch {
+		case f.Type == schema.TypeEnum:
 			val = goType(e, f) + "(" + val + ")"
+		case pf.Type == schema.TypeList && f.Type == schema.TypeStringSet:
+			val = "dynago.Distinct(" + val + ")"
 		}
 		kv = append(kv, fmt.Sprintf("%s: %s", f.GoName, val))
 	}
@@ -213,7 +218,7 @@ func (g *gen) migrationCheck() {
 
 func (g *gen) migrationDispatch() {
 	prev := g.m.Previous
-	ttl := g.m.Table.TTLAttr
+	ttl := prev.TTLAttr // items being copied expire by the old table's TTL
 	var carried []*schema.Entity
 	for _, e := range g.m.Entities {
 		if _, ok := prev.Entities[e.Name]; ok {
@@ -375,7 +380,8 @@ func (g *gen) migrateEntity(e *schema.Entity) {
 	g.p("})")
 	g.p("}")
 	g.p("")
-	g.p("// migrateRemove deletes an entity the migration copied, with its derived items.")
+	g.p("// migrateRemove deletes an entity the migration copied, with its derived items, unless it has")
+	g.p("// been rewritten since raw was read: then it is a fresher copy, not the stale one.")
 	g.p("func (s *%sStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {", e.GoName)
 	g.p("return dynago.Retry(ctx, func() error {")
 	g.p("var current dynamo.Item")
@@ -386,6 +392,9 @@ func (g *gen) migrateEntity(e *schema.Entity) {
 	g.p("it, err := %sDecode(current)", lo)
 	g.p("if err != nil {")
 	g.p("return err")
+	g.p("}")
+	g.p("if it.Rev != dynago.ItemRev(raw) {")
+	g.p("return nil")
 	g.p("}")
 	g.p("key := dynago.Key{PK: it.PK, SK: it.SK}")
 	g.p("ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete(\"PK\", key.PK).Range(\"SK\", key.SK).If(\"$ = ?\", \"_rev\", it.Rev), dynago.ErrStale), fence}")

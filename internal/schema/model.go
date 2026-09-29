@@ -59,6 +59,8 @@ func (t Table) GenerationTable(gen int) string { return fmt.Sprintf("%s-g%d", t.
 // The lock file supplies it; it is nil for a first generation.
 type Previous struct {
 	Generation int
+	// TTLAttr is the attribute DynamoDB's TTL used in that generation's table, if any.
+	TTLAttr string
 	// Entities maps entity names to their last shape in that generation: the fields to decode.
 	Entities map[string][]PreviousField
 }
@@ -68,6 +70,7 @@ type PreviousField struct {
 	Name, Attr string
 	Type       FieldType
 	Values     []string // of an enum
+	Required   bool
 }
 
 // FieldType is a normalized field type.

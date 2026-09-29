@@ -60,6 +60,9 @@ type Version struct {
 	Generation  int    `json:"generation,omitempty"`
 	Fingerprint string `json:"fingerprint"`
 	Shape       Shape  `json:"shape"`
+	// StartsGeneration marks a version recorded with a new generation: the migration job copied
+	// that generation's items in with this shape, not an earlier one.
+	StartsGeneration bool `json:"startsGeneration,omitempty"`
 }
 
 func (v Version) gen() int { return max(v.Generation, 1) }
@@ -209,7 +212,7 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 					e.Name, e.Version, m.Output.Lock))
 				continue
 			}
-			h.Versions = append(h.Versions, Version{e.Version, gen, fp, shape})
+			h.Versions = append(h.Versions, Version{e.Version, gen, fp, shape, newGen})
 			continue
 		}
 		last := h.Versions[n-1]
@@ -224,13 +227,16 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 		case e.Version < last.Version:
 			errs = append(errs, fmt.Errorf("entity %s: version %d is older than the recorded version %d; versions only go up", e.Name, e.Version, last.Version))
 		case e.Version == last.Version && same:
-			h.Versions[n-1] = Version{last.Version, last.gen(), fp, shape}
+			h.Versions[n-1] = Version{last.Version, last.gen(), fp, shape, last.StartsGeneration}
 		case e.Version == last.Version:
 			errs = append(errs, fmt.Errorf("entity %s: its storage shape changed but its version is still %d. Set `version: %d` so stored items record which shape wrote them. Changes: %s",
 				e.Name, e.Version, e.Version+1, strings.Join(texts(Changes(last.Shape, shape, e)), "; ")))
 		default:
 			changes := Changes(last.Shape, shape, e)
-			changes = append(changes, reusedAttrs(h, gen, shape)...)
+			if !newGen {
+				// A new generation's table holds only what the migration copies in, in this shape.
+				changes = append(changes, reusedAttrs(h, gen, shape)...)
+			}
 			var misfits []string
 			for _, c := range changes {
 				if !c.Compatible {
@@ -248,7 +254,7 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 			for _, c := range changes {
 				notes = append(notes, Note{e.Name, !c.Compatible, fmt.Sprintf("v%d → v%d: %s", last.Version, e.Version, c.Text)})
 			}
-			h.Versions = append(h.Versions, Version{e.Version, gen, fp, shape})
+			h.Versions = append(h.Versions, Version{e.Version, gen, fp, shape, newGen})
 		}
 	}
 	if newGen && len(errs) == 0 {
@@ -289,7 +295,10 @@ func previous(m *schema.Model, f *File) *schema.Previous {
 	if gen <= 1 {
 		return nil
 	}
-	p := &schema.Previous{Generation: gen - 1, Entities: map[string][]schema.PreviousField{}}
+	p := &schema.Previous{Generation: gen - 1, TTLAttr: m.Table.TTLAttr, Entities: map[string][]schema.PreviousField{}}
+	if spec := f.Table(gen - 1); spec != nil {
+		p.TTLAttr = spec.TTLAttr
+	}
 	for _, e := range m.Entities {
 		h := f.Entities[e.Name]
 		if h == nil {
@@ -306,7 +315,7 @@ func previous(m *schema.Model, f *File) *schema.Previous {
 		}
 		var fields []schema.PreviousField
 		for _, fs := range last.Shape.Fields {
-			fields = append(fields, schema.PreviousField{Name: fs.Name, Attr: fs.Attr, Type: schema.FieldType(fs.Type), Values: fs.Values})
+			fields = append(fields, schema.PreviousField{Name: fs.Name, Attr: fs.Attr, Type: schema.FieldType(fs.Type), Values: fs.Values, Required: fs.Required})
 		}
 		p.Entities[e.Name] = fields
 	}
@@ -479,12 +488,14 @@ func toMap[T any](xs []T, key func(T) string) map[string]string {
 // field removed and later re-added with another type, or one attribute reused by a new field.
 // Existing items may still hold the old value.
 func reusedAttrs(h *History, gen int, now Shape) []Change {
-	// The versions whose items the table can hold: those recorded in this generation, and the
-	// last one before it (the shape the migration copied in, if the entity's version didn't
-	// change with the generation).
+	// The versions whose items the table can hold: those recorded in this generation, and, unless
+	// the entity's version changed with the generation, the last one before it (the shape the
+	// migration copied in).
+	started := slices.ContainsFunc(h.Versions, func(v Version) bool { return v.gen() == gen && v.StartsGeneration })
 	var versions []Version
 	for i, v := range h.Versions {
-		if v.gen() == gen || (v.gen() < gen && (i+1 == len(h.Versions) || h.Versions[i+1].gen() == gen)) {
+		carried := !started && v.gen() < gen && (i+1 == len(h.Versions) || h.Versions[i+1].gen() == gen)
+		if v.gen() == gen || carried {
 			versions = append(versions, v)
 		}
 	}

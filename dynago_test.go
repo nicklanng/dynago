@@ -3,6 +3,7 @@ package dynago
 import (
 	"context"
 	"errors"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -267,5 +268,11 @@ func TestCursorScopeIncludesBounds(t *testing.T) {
 	if cursorScope(QuerySpec{Scope: "s", To: &a}) == cursorScope(QuerySpec{Scope: "s", To: &b}) ||
 		cursorScope(QuerySpec{Scope: "s", From: &a}) == cursorScope(QuerySpec{Scope: "s", To: &a}) {
 		t.Fatal("different bounds give the same cursor scope")
+	}
+}
+
+func TestDistinct(t *testing.T) {
+	if got := Distinct([]string{"b", "a", "b", "c", "a"}); !slices.Equal(got, []string{"b", "a", "c"}) {
+		t.Fatalf("got %q", got)
 	}
 }

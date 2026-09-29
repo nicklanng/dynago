@@ -252,3 +252,18 @@ func TestUniqueSetClaimsEachElement(t *testing.T) {
 		}
 	}
 }
+
+func TestConversionGaps(t *testing.T) {
+	e := &schema.Entity{Fields: []*schema.Field{
+		{Name: "email", Type: schema.TypeString, Required: true},
+		{Name: "tags", Type: schema.TypeStringSet},
+	}}
+	prev := []schema.PreviousField{
+		{Name: "email", Type: schema.TypeString},
+		{Name: "tags", Type: schema.TypeList},
+	}
+	gaps := conversionGaps(e, prev)
+	if len(gaps) != 1 || gaps[0] != "email is now required" {
+		t.Fatalf("gaps = %q", gaps)
+	}
+}

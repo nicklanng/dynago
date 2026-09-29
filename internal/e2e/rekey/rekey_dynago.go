@@ -265,7 +265,7 @@ func NewMigration(db *dynamo.DB, base string) *dynago.Migration {
 	st := New(db, TableName(base))
 	return &dynago.Migration{DB: db, From: base + "-g1", To: TableName(base),
 		Types: map[string]bool{"Person": true},
-		Copy:  st.migrateCopy, KeyOf: st.migrateKeyOf, Remove: st.migrateRemove, Check: migrationCheck, TTLAttr: "ttl"}
+		Copy:  st.migrateCopy, KeyOf: st.migrateKeyOf, Remove: st.migrateRemove, Check: migrationCheck, TTLAttr: ""}
 }
 
 // PersonG1 is a Person as generation 1 stored it: what the migration job reads.
@@ -281,7 +281,7 @@ type PersonG1 struct {
 var MigratePerson func(old PersonG1) (Person, error)
 
 // AutoMigratePerson copies the fields of a generation-1 Person that exist in this generation with the
-// same type (enums by value); the others are left zero.
+// same type (enums by value, lists made sets without repeats); the others are left zero.
 func AutoMigratePerson(old PersonG1) Person {
 	return Person{PersonID: old.PersonID, Email: old.Email, Name: old.Name}
 }
@@ -309,7 +309,7 @@ func convertPerson(raw dynamo.Item) (Person, error) {
 
 // migrateCopy converts one item of the previous generation and writes it into this one.
 func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
-	if dynago.ExpiredItem(raw, "ttl") {
+	if dynago.ExpiredItem(raw, "") {
 		return dynago.ErrUnchanged // expired: gone, even if DynamoDB hasn't deleted it yet
 	}
 	if dynago.ItemType(raw) == "Person" {
@@ -329,7 +329,7 @@ func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item, fence dynago.O
 // migrateKeyOf returns the key an item of the previous generation converts to, or false if it
 // isn't copied.
 func (s *Store) migrateKeyOf(raw dynamo.Item) (dynago.Key, bool, error) {
-	if dynago.ExpiredItem(raw, "ttl") {
+	if dynago.ExpiredItem(raw, "") {
 		return dynago.Key{}, false, nil
 	}
 	if dynago.ItemType(raw) == "Person" {
@@ -403,7 +403,8 @@ func (s *PersonStore) migrate(ctx context.Context, e *Person, src dynago.Key, sr
 	})
 }
 
-// migrateRemove deletes an entity the migration copied, with its derived items.
+// migrateRemove deletes an entity the migration copied, with its derived items, unless it has
+// been rewritten since raw was read: then it is a fresher copy, not the stale one.
 func (s *PersonStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
@@ -414,6 +415,9 @@ func (s *PersonStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence 
 		it, err := personDecode(current)
 		if err != nil {
 			return err
+		}
+		if it.Rev != dynago.ItemRev(raw) {
+			return nil
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}

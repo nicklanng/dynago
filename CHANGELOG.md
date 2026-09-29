@@ -55,7 +55,9 @@ First version.
   a lease, renewed as it runs, fences every write (on a fence item per worker, so workers don't
   contend), and a job that lost it writes nothing more. Copies follow key changes made while the
   old generation serves; conflicts are retried after each pass's removals, and a unique value held
-  by a stale copy is freed, so swapped or rotated values copy cleanly. It rebuilds derived items from the entities, and reports items it can't copy as conflicts. It
+  by a stale copy is freed, so swapped or rotated values copy cleanly. A resumed pass keeps its scan
+  segments whatever `-workers` is, and expiry of old items follows the old table's TTL attribute.
+  It rebuilds derived items from the entities, and reports items it can't copy as conflicts. It
   converts entities field by field, or with a `Migrate<Entity>` function where fields don't carry
   over.
 - Model document with Mermaid diagrams, Terraform JSON (with point-in-time recovery, deletion

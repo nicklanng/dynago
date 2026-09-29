@@ -134,3 +134,94 @@ func TestMigrationSwappedUniqueValues(t *testing.T) {
 		}
 	}
 }
+
+// A pass interrupted with 8 workers (segments 0-3 of 8 done) and resumed with 4 keeps its 8
+// segments: 4 segments of 4 would cover the whole table, and treating them as done would skip
+// half of it.
+func TestResumedPassKeepsItsSegments(t *testing.T) {
+	db := dynagotest.DB(t)
+	base := dynagotest.UniqueName(t, "segs")
+	dynagotest.TableNamed(t, db, base+"-g1", rekey.TableSpec)
+	dynagotest.TableNamed(t, db, rekey.TableName(base), rekey.TableSpec)
+	old := db.Table(base + "-g1")
+	for i := range 40 {
+		id := fmt.Sprintf("p%02d", i)
+		must(t, old.Put(map[string]any{"PK": "P#" + id, "SK": "PERSON", "_t": "Person", "_v": 1, "_rev": 1,
+			"personId": id, "email": id + "@example.org", "name": id}).Run(ctx))
+	}
+	// The interrupted job, by hand: a final pass over 8 segments, with segments 0-3 copied.
+	nt := db.Table(rekey.TableName(base))
+	pk := "_DYNAGO#MIGRATION#" + base + "-g1"
+	must(t, nt.Put(map[string]any{"PK": pk, "SK": "STATE", "_t": "dynago.Migration", "pass": 1, "finishing": true,
+		"passDone": false, "fences": 8, "segments": 8}).Run(ctx))
+	st := rekey.New(db, rekey.TableName(base))
+	for seg := range 4 {
+		var items []map[string]any
+		must(t, old.Scan().Segment(seg, 8).Consistent(true).All(ctx, &items))
+		for _, it := range items {
+			must(t, st.Persons.Add(ctx, &rekey.Person{PersonID: it["personId"].(string), Email: it["email"].(string), Name: it["name"].(string)}))
+		}
+		must(t, nt.Put(map[string]any{"PK": pk, "SK": fmt.Sprintf("PASS#%06d#copy#%03d", 1, seg), "_t": "dynago.Migration",
+			"done": true, "copied": len(items)}).Run(ctx))
+	}
+	m := rekey.NewMigration(db, base)
+	m.Workers, m.Out = 4, &bytes.Buffer{}
+	must(t, m.Run(ctx, "finish"))
+	for i := range 40 {
+		email := fmt.Sprintf("p%02d@example.org", i)
+		if _, err := st.Persons.Get(ctx, rekey.PersonKey{Email: email}); err != nil {
+			t.Fatalf("%s: %v", email, err)
+		}
+	}
+}
+
+// Conflict records hold their source's key whatever characters it contains: two people whose ids
+// contain "|" converting to one email are a conflict, and finish must refuse.
+func TestConflictKeysWithSeparators(t *testing.T) {
+	db := dynagotest.DB(t)
+	base := dynagotest.UniqueName(t, "pipes")
+	dynagotest.TableNamed(t, db, base+"-g1", rekey.TableSpec)
+	dynagotest.TableNamed(t, db, rekey.TableName(base), rekey.TableSpec)
+	old := db.Table(base + "-g1")
+	for _, id := range []string{"a|1", "b|2"} {
+		must(t, old.Put(map[string]any{"PK": "P#" + id, "SK": "PERSON", "_t": "Person", "_v": 1, "_rev": 1,
+			"personId": id, "email": "same@example.org", "name": id}).Run(ctx))
+	}
+	m := rekey.NewMigration(db, base)
+	out := &bytes.Buffer{}
+	m.Workers, m.Out = 1, out
+	if err := m.Run(ctx, "finish"); !errors.Is(err, dynago.ErrMigrationConflict) {
+		t.Fatalf("finish: got %v, want a conflict\n%s", err, out)
+	}
+}
+
+// Removing a copy judged stale spares it if it has been rewritten since: it is then a fresher
+// copy (another worker copied its source again), not the stale one.
+func TestRemovingAStaleCopySparesAFreshOne(t *testing.T) {
+	db := dynagotest.DB(t)
+	base := dynagotest.UniqueName(t, "fresh")
+	dynagotest.TableNamed(t, db, base+"-g1", rekey.TableSpec)
+	dynagotest.TableNamed(t, db, rekey.TableName(base), rekey.TableSpec)
+	old := db.Table(base + "-g1")
+	person := func(name string, rev int) {
+		must(t, old.Put(map[string]any{"PK": "P#p1", "SK": "PERSON", "_t": "Person", "_v": 1, "_rev": rev,
+			"personId": "p1", "email": "ann@example.org", "name": name}).Run(ctx))
+	}
+	m := rekey.NewMigration(db, base)
+	m.Workers, m.Out = 1, &bytes.Buffer{}
+	person("Ann", 1)
+	must(t, m.Run(ctx, "copy"))
+	nt := db.Table(rekey.TableName(base))
+	var stale dynamo.Item
+	must(t, nt.Get("PK", "E#ann@example.org").Range("SK", dynamo.Equal, "PERSON").Consistent(true).One(ctx, &stale))
+	person("Ann B", 2)
+	must(t, m.Run(ctx, "copy")) // rewrites the copy
+	gate := dynago.Key{PK: "GATE", SK: "GATE"}
+	must(t, nt.Put(map[string]any{"PK": gate.PK, "SK": gate.SK}).Run(ctx))
+	fence := dynago.CheckOp(gate, nt.Check("PK", gate.PK).Range("SK", gate.SK).If("attribute_exists($)", "PK"), dynago.ErrLeaseLost)
+	must(t, m.Remove(ctx, stale, fence))
+	p, err := rekey.New(db, rekey.TableName(base)).Persons.Get(ctx, rekey.PersonKey{Email: "ann@example.org"})
+	if err != nil || p.Name != "Ann B" {
+		t.Fatalf("the fresh copy: %+v, %v", p, err)
+	}
+}

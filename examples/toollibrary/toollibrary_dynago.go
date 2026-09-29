@@ -2990,7 +2990,7 @@ type LibraryG1 struct {
 var MigrateLibrary func(old LibraryG1) (Library, error)
 
 // AutoMigrateLibrary copies the fields of a generation-1 Library that exist in this generation with the
-// same type (enums by value); the others are left zero.
+// same type (enums by value, lists made sets without repeats); the others are left zero.
 func AutoMigrateLibrary(old LibraryG1) Library {
 	return Library{LibraryID: old.LibraryID, Name: old.Name, Slug: old.Slug, OpenedAt: old.OpenedAt}
 }
@@ -3014,7 +3014,7 @@ type MemberG1 struct {
 var MigrateMember func(old MemberG1) (Member, error)
 
 // AutoMigrateMember copies the fields of a generation-1 Member that exist in this generation with the
-// same type (enums by value); the others are left zero.
+// same type (enums by value, lists made sets without repeats); the others are left zero.
 func AutoMigrateMember(old MemberG1) Member {
 	return Member{LibraryID: old.LibraryID, MemberID: old.MemberID, Email: old.Email, Name: old.Name, Phone: old.Phone, Role: MemberRole(old.Role), Status: MemberStatus(old.Status), MaxLoans: old.MaxLoans, JoinedAt: old.JoinedAt}
 }
@@ -3038,7 +3038,7 @@ type ToolG1 struct {
 var MigrateTool func(old ToolG1) (Tool, error)
 
 // AutoMigrateTool copies the fields of a generation-1 Tool that exist in this generation with the
-// same type (enums by value); the others are left zero.
+// same type (enums by value, lists made sets without repeats); the others are left zero.
 func AutoMigrateTool(old ToolG1) Tool {
 	return Tool{LibraryID: old.LibraryID, ToolID: old.ToolID, Name: old.Name, Category: ToolCategory(old.Category), Status: ToolStatus(old.Status), Manual: old.Manual, Tags: old.Tags, SerialNumber: old.SerialNumber, AddedAt: old.AddedAt}
 }
@@ -3063,7 +3063,7 @@ type LoanG1 struct {
 var MigrateLoan func(old LoanG1) (Loan, error)
 
 // AutoMigrateLoan copies the fields of a generation-1 Loan that exist in this generation with the
-// same type (enums by value); the others are left zero.
+// same type (enums by value, lists made sets without repeats); the others are left zero.
 func AutoMigrateLoan(old LoanG1) Loan {
 	return Loan{LibraryID: old.LibraryID, ToolID: old.ToolID, LoanID: old.LoanID, MemberID: old.MemberID, ToolName: old.ToolName, Status: LoanStatus(old.Status), BorrowedAt: old.BorrowedAt, DueAt: old.DueAt, ReturnedAt: old.ReturnedAt, Notes: old.Notes}
 }
@@ -3084,7 +3084,7 @@ type HoldG1 struct {
 var MigrateHold func(old HoldG1) (Hold, error)
 
 // AutoMigrateHold copies the fields of a generation-1 Hold that exist in this generation with the
-// same type (enums by value); the others are left zero.
+// same type (enums by value, lists made sets without repeats); the others are left zero.
 func AutoMigrateHold(old HoldG1) Hold {
 	return Hold{LibraryID: old.LibraryID, ToolID: old.ToolID, MemberID: old.MemberID, CodeHash: old.CodeHash, CreatedAt: old.CreatedAt, ExpiresAt: old.ExpiresAt}
 }
@@ -3349,7 +3349,8 @@ func (s *LibraryStore) migrate(ctx context.Context, e *Library, src dynago.Key, 
 	})
 }
 
-// migrateRemove deletes an entity the migration copied, with its derived items.
+// migrateRemove deletes an entity the migration copied, with its derived items, unless it has
+// been rewritten since raw was read: then it is a fresher copy, not the stale one.
 func (s *LibraryStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
@@ -3360,6 +3361,9 @@ func (s *LibraryStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence
 		it, err := libraryDecode(current)
 		if err != nil {
 			return err
+		}
+		if it.Rev != dynago.ItemRev(raw) {
+			return nil
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
@@ -3423,7 +3427,8 @@ func (s *MemberStore) migrate(ctx context.Context, e *Member, src dynago.Key, sr
 	})
 }
 
-// migrateRemove deletes an entity the migration copied, with its derived items.
+// migrateRemove deletes an entity the migration copied, with its derived items, unless it has
+// been rewritten since raw was read: then it is a fresher copy, not the stale one.
 func (s *MemberStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
@@ -3434,6 +3439,9 @@ func (s *MemberStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence 
 		it, err := memberDecode(current)
 		if err != nil {
 			return err
+		}
+		if it.Rev != dynago.ItemRev(raw) {
+			return nil
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
@@ -3497,7 +3505,8 @@ func (s *ToolStore) migrate(ctx context.Context, e *Tool, src dynago.Key, srcRev
 	})
 }
 
-// migrateRemove deletes an entity the migration copied, with its derived items.
+// migrateRemove deletes an entity the migration copied, with its derived items, unless it has
+// been rewritten since raw was read: then it is a fresher copy, not the stale one.
 func (s *ToolStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
@@ -3508,6 +3517,9 @@ func (s *ToolStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dy
 		it, err := toolDecode(current)
 		if err != nil {
 			return err
+		}
+		if it.Rev != dynago.ItemRev(raw) {
+			return nil
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
@@ -3583,7 +3595,8 @@ func (s *LoanStore) migrate(ctx context.Context, e *Loan, src dynago.Key, srcRev
 	})
 }
 
-// migrateRemove deletes an entity the migration copied, with its derived items.
+// migrateRemove deletes an entity the migration copied, with its derived items, unless it has
+// been rewritten since raw was read: then it is a fresher copy, not the stale one.
 func (s *LoanStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
@@ -3594,6 +3607,9 @@ func (s *LoanStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dy
 		it, err := loanDecode(current)
 		if err != nil {
 			return err
+		}
+		if it.Rev != dynago.ItemRev(raw) {
+			return nil
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
@@ -3664,7 +3680,8 @@ func (s *HoldStore) migrate(ctx context.Context, e *Hold, src dynago.Key, srcRev
 	})
 }
 
-// migrateRemove deletes an entity the migration copied, with its derived items.
+// migrateRemove deletes an entity the migration copied, with its derived items, unless it has
+// been rewritten since raw was read: then it is a fresher copy, not the stale one.
 func (s *HoldStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago.Op) error {
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
@@ -3675,6 +3692,9 @@ func (s *HoldStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dy
 		it, err := holdDecode(current)
 		if err != nil {
 			return err
+		}
+		if it.Rev != dynago.ItemRev(raw) {
+			return nil
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}

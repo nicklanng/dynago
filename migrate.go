@@ -164,7 +164,8 @@ type migState struct {
 	Finishing  bool   `dynamo:"finishing"` // the pass in progress is the final one
 	LeaseOwner string `dynamo:"leaseOwner"`
 	LeaseUntil int64  `dynamo:"leaseUntil"`
-	Fences     int    `dynamo:"fences"` // how many fence items jobs have used
+	Fences     int    `dynamo:"fences"`   // how many fence items jobs have used
+	Segments   int    `dynamo:"segments"` // how many scan segments the pass in progress uses
 }
 
 type migFence struct {
@@ -192,6 +193,8 @@ type migConflict struct {
 	T       string `dynamo:"_t"`
 	Item    string `dynamo:"item"`
 	Problem string `dynamo:"problem"`
+	SrcPK   string `dynamo:"srcPK"`
+	SrcSK   string `dynamo:"srcSK"`
 }
 
 // Run runs a migration command: "copy" (bulk copy and catch-up passes, while the old generation
@@ -281,12 +284,12 @@ func (j *job) copyPasses(ctx context.Context, st migState) error {
 	if st.Finishing && !st.PassDone {
 		return fmt.Errorf("dynago migrate: a finish pass is in progress; run finish to complete it")
 	}
-	pass := st.Pass + 1
+	pass, segments := st.Pass+1, j.Workers
 	if st.Pass > 0 && !st.PassDone {
-		pass = st.Pass // resume the interrupted pass
+		pass, segments = st.Pass, st.segments(j.Workers) // resume the interrupted pass
 	}
-	for runs := 1; ; runs, pass = runs+1, pass+1 {
-		changed, err := j.pass(ctx, pass, false)
+	for runs := 1; ; runs, pass, segments = runs+1, pass+1, j.Workers {
+		changed, err := j.pass(ctx, pass, segments, false)
 		if err != nil {
 			return err
 		}
@@ -301,11 +304,11 @@ func (j *job) copyPasses(ctx context.Context, st migState) error {
 // finishPass runs one full pass that started after writes stopped (resuming it if it was
 // interrupted), then marks the migration finished.
 func (j *job) finishPass(ctx context.Context, st migState) error {
-	pass := st.Pass + 1
+	pass, segments := st.Pass+1, j.Workers
 	if st.Finishing && !st.PassDone {
-		pass = st.Pass // resume the interrupted final pass
+		pass, segments = st.Pass, st.segments(j.Workers) // resume the interrupted final pass
 	}
-	if _, err := j.pass(ctx, pass, true); err != nil {
+	if _, err := j.pass(ctx, pass, segments, true); err != nil {
 		return err
 	}
 	conflicts, err := j.liveConflicts(ctx)
@@ -315,17 +318,28 @@ func (j *job) finishPass(ctx context.Context, st migState) error {
 	if len(conflicts) > 0 {
 		return nil // report returns the error
 	}
-	if err := j.setState(ctx, "phase", "finished"); err != nil {
+	// Tidy first: once finished, no job takes the lease again to do it.
+	if err := j.tidy(ctx); err != nil {
 		return err
 	}
-	return j.tidy(ctx)
+	return j.setState(ctx, "phase", "finished")
+}
+
+// segments is how many scan segments the pass in progress uses: a resumed pass keeps its layout
+// whatever the number of workers now, since its checkpoints are per segment.
+func (st migState) segments(workers int) int {
+	if st.Segments > 0 {
+		return st.Segments
+	}
+	return workers
 }
 
 // pass copies every entity of the old table, removes copies whose source is gone or now converts
 // to another key, then retries the items that conflicted. It returns how many items it wrote or
-// removed.
-func (j *job) pass(ctx context.Context, pass int, finishing bool) (int64, error) {
-	err := j.stateUpdate().Set("pass", pass).Set("passDone", false).Set("finishing", finishing).If("$ = ?", "leaseOwner", j.owner).Run(ctx)
+// removed. The table is scanned in segments, up to Workers at a time.
+func (j *job) pass(ctx context.Context, pass, segments int, finishing bool) (int64, error) {
+	err := j.stateUpdate().Set("pass", pass).Set("passDone", false).Set("finishing", finishing).Set("segments", segments).
+		If("$ = ?", "leaseOwner", j.owner).Run(ctx)
 	if err := leaseErr(err); err != nil {
 		return 0, err
 	}
@@ -337,12 +351,15 @@ func (j *job) pass(ctx context.Context, pass int, finishing bool) (int64, error)
 	var mu sync.Mutex
 	for _, phase := range []string{"copy", "remove"} {
 		var wg sync.WaitGroup
-		errs := make([]error, j.Workers)
-		for seg := 0; seg < j.Workers; seg++ {
+		errs := make([]error, segments)
+		workers := make(chan struct{}, j.Workers)
+		for seg := 0; seg < segments; seg++ {
 			wg.Add(1)
 			go func(seg int) {
 				defer wg.Done()
-				n, err := j.segment(ctx, pass, phase, seg, limit)
+				workers <- struct{}{}
+				defer func() { <-workers }()
+				n, err := j.segment(ctx, pass, phase, seg, segments, limit)
 				mu.Lock()
 				changed += n
 				mu.Unlock()
@@ -366,7 +383,7 @@ func (j *job) pass(ctx context.Context, pass int, finishing bool) (int64, error)
 
 // segment scans one segment of the old table (phase "copy") or the new one ("remove"), resuming
 // from its checkpoint.
-func (j *job) segment(ctx context.Context, pass int, phase string, seg int, limit *limiter) (int64, error) {
+func (j *job) segment(ctx context.Context, pass int, phase string, seg, segments int, limit *limiter) (int64, error) {
 	table := j.DB.Table(j.From)
 	if phase == "remove" {
 		table = j.DB.Table(j.To)
@@ -382,7 +399,7 @@ func (j *job) segment(ctx context.Context, pass int, phase string, seg int, limi
 	}
 	cp = migSegment{PK: j.statePK(), SK: sk, T: migType, Next: cp.Next, Copied: cp.Copied, Same: cp.Same, Removed: cp.Removed, Skipped: cp.Skipped}
 	for {
-		scan := table.Scan().Segment(seg, j.Workers).Consistent(true).SearchLimit(100)
+		scan := table.Scan().Segment(seg, segments).Consistent(true).SearchLimit(100)
 		if len(cp.Next) > 0 {
 			scan = scan.StartFrom(pagingKey(cp.Next))
 		}
@@ -403,7 +420,7 @@ func (j *job) segment(ctx context.Context, pass int, phase string, seg int, limi
 		cp.Done = len(next) == 0
 		// The checkpoint is fenced too, so a job that lost the lease can't move it.
 		ops := []Op{PutOp(Key{cp.PK, cp.SK}, j.DB.Table(j.To).Put(cp), nil), j.fence(seg)}
-		if err := leaseErr(Run(ctx, j.DB, ops)); err != nil {
+		if err := j.write(ctx, ops); err != nil {
 			return 0, err
 		}
 		if cp.Done {
@@ -664,17 +681,22 @@ func (j *job) installFences(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	n := max(st.Fences, j.Workers)
+	n := max(st.Fences, j.Workers, st.Segments)
 	for w := 0; w < n; w++ {
 		k := Key{j.statePK(), fmt.Sprintf("FENCE#%03d", w)}
 		put := j.DB.Table(j.To).Put(migFence{PK: k.PK, SK: k.SK, T: migType, Owner: j.owner})
 		state := Key{j.statePK(), "STATE"}
 		check := CheckOp(state, j.DB.Table(j.To).Check(AttrPK, state.PK).Range(AttrSK, state.SK).If("$ = ?", "leaseOwner", j.owner), ErrLeaseLost)
-		if err := leaseErr(Run(ctx, j.DB, []Op{PutOp(k, put, nil), check})); err != nil {
+		if err := j.write(ctx, []Op{PutOp(k, put, nil), check}); err != nil {
 			return err
 		}
 	}
 	return j.setState(ctx, "fences", n)
+}
+
+// write runs the job's own bookkeeping writes, retrying if another transaction holds an item.
+func (j *job) write(ctx context.Context, ops []Op) error {
+	return leaseErr(Retry(ctx, func() error { return Run(ctx, j.DB, ops) }))
 }
 
 // leaseErr turns the failure of a lease-conditioned write into ErrLeaseLost.
@@ -686,7 +708,7 @@ func leaseErr(err error) error {
 }
 
 func (j *job) keepLease(ctx context.Context, cancel context.CancelCauseFunc) {
-	every := j.LeaseFor / 3
+	every := max(j.LeaseFor/3, 100*time.Millisecond)
 	timer := time.NewTimer(every)
 	defer timer.Stop()
 	for {
@@ -731,15 +753,18 @@ func (j *job) loadConflicts(ctx context.Context) error {
 	return nil
 }
 
-func conflictSource(c migConflict) Key {
-	pk, sk, _ := strings.Cut(strings.TrimPrefix(c.SK, "CONFLICT#"), "|")
-	return Key{pk, sk}
+func conflictSource(c migConflict) Key { return Key{c.SrcPK, c.SrcSK} }
+
+// conflictKey is the key of the conflict record for the item at src. The partition key's length
+// keeps it unambiguous whatever characters the source key holds.
+func (j *job) conflictKey(src Key) Key {
+	return Key{j.statePK(), fmt.Sprintf("CONFLICT#%d#%s%s", len(src.PK), src.PK, src.SK)}
 }
 
 func (j *job) recordConflict(ctx context.Context, src Key, problem error, fence Op) error {
-	k := Key{j.statePK(), "CONFLICT#" + src.PK + "|" + src.SK}
-	put := j.DB.Table(j.To).Put(migConflict{PK: k.PK, SK: k.SK, T: migType, Item: src.PK + " / " + src.SK, Problem: problem.Error()})
-	if err := leaseErr(Run(ctx, j.DB, []Op{PutOp(k, put, nil), fence})); err != nil {
+	k := j.conflictKey(src)
+	put := j.DB.Table(j.To).Put(migConflict{PK: k.PK, SK: k.SK, T: migType, Item: src.PK + " / " + src.SK, Problem: problem.Error(), SrcPK: src.PK, SrcSK: src.SK})
+	if err := j.write(ctx, []Op{PutOp(k, put, nil), fence}); err != nil {
 		return err
 	}
 	j.mu.Lock()
@@ -755,9 +780,9 @@ func (j *job) clearConflict(ctx context.Context, src Key, fence Op) error {
 	if !known {
 		return nil
 	}
-	k := Key{j.statePK(), "CONFLICT#" + src.PK + "|" + src.SK}
+	k := j.conflictKey(src)
 	del := j.DB.Table(j.To).Delete(AttrPK, k.PK).Range(AttrSK, k.SK)
-	if err := leaseErr(Run(ctx, j.DB, []Op{DeleteOp(k, del, nil), fence})); err != nil {
+	if err := j.write(ctx, []Op{DeleteOp(k, del, nil), fence}); err != nil {
 		return err
 	}
 	j.mu.Lock()
@@ -807,7 +832,7 @@ func (j *job) tidy(ctx context.Context) error {
 	}
 	for _, s := range segs {
 		del := j.DB.Table(j.To).Delete(AttrPK, s.PK).Range(AttrSK, s.SK)
-		if err := leaseErr(Run(ctx, j.DB, []Op{DeleteOp(Key{s.PK, s.SK}, del, nil), j.fence(0)})); err != nil {
+		if err := j.write(ctx, []Op{DeleteOp(Key{s.PK, s.SK}, del, nil), j.fence(0)}); err != nil {
 			return err
 		}
 	}
@@ -1041,4 +1066,24 @@ func ParseMigrate(args []string, base string) (command, table string, workers, p
 func ItemKey(raw dynamo.Item) Key {
 	k, _, _ := SourceOf(raw)
 	return k
+}
+
+// Distinct returns s without repeated values, keeping the first of each: a list converted to a
+// set, which can't hold duplicates.
+func Distinct(s []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, v := range s {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// ItemRev returns the revision of a raw item.
+func ItemRev(raw dynamo.Item) int64 {
+	_, rev, _ := SourceOf(raw)
+	return rev
 }
