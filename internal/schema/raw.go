@@ -57,6 +57,8 @@ type RawOutput struct {
 	Terraform string `yaml:"terraform"`
 	TableJSON string `yaml:"table_json"`
 	Lock      string `yaml:"lock"`
+	// MigrateCmd is the directory of the generated migration job's main package, if wanted.
+	MigrateCmd string `yaml:"migrate_cmd"`
 }
 
 // RawTable describes the physical table.

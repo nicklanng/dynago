@@ -1,9 +1,79 @@
 {
   "dynago": 1,
-  "generation": 1,
+  "generation": 2,
   "tables": [
     {
       "generation": 1,
+      "spec": {
+        "ttl_attribute": "ttl",
+        "gsis": [
+          {
+            "name": "ByName",
+            "pk": "ByNamePK",
+            "sk": "ByNameSK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "memberId",
+              "name",
+              "role",
+              "status"
+            ]
+          },
+          {
+            "name": "ByCategory",
+            "pk": "ByCategoryPK",
+            "sk": "ByCategorySK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "toolId",
+              "name",
+              "category",
+              "status",
+              "tags"
+            ]
+          },
+          {
+            "name": "Overdue",
+            "pk": "OverduePK",
+            "sk": "OverdueSK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "toolId",
+              "loanId",
+              "memberId",
+              "toolName",
+              "dueAt"
+            ]
+          },
+          {
+            "name": "ByCode",
+            "pk": "ByCodePK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "toolId",
+              "memberId",
+              "codeHash",
+              "expiresAt",
+              "ttl"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "generation": 2,
       "spec": {
         "ttl_attribute": "ttl",
         "gsis": [
@@ -429,6 +499,7 @@
       "versions": [
         {
           "version": 1,
+          "generation": 1,
           "fingerprint": "4f392fef7983e6a7",
           "shape": {
             "fields": [
@@ -548,7 +619,7 @@
         },
         {
           "version": 2,
-          "generation": 1,
+          "generation": 2,
           "fingerprint": "01a4224028a05a11",
           "shape": {
             "fields": [

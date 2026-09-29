@@ -18,6 +18,13 @@ package: toollibrary
 table:
   name: toollibrary
   doc: Libraries, their members and tools, loans and pickup holds.
+  # Generation 2 added tool barcodes, with a unique claim per label: existing tools had no claims,
+  # so the table moved to a new generation. Generation 1 stays for rollback.
+  generation: 2
+  retain: [1]
+
+output:
+  migrate_cmd: cmd/migrate-toollibrary
 
 entities:
   Library:
@@ -101,7 +108,7 @@ entities:
 
   Tool:
     doc: A tool the library lends out.
-    version: 2 # v2 added barcodes
+    version: 2 # v2 (generation 2) added barcodes
     fields:
       libraryId: { type: string, example: lib_1 }
       toolId: { type: string, example: t_42 }

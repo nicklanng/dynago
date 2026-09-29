@@ -12,6 +12,8 @@ import (
 // followed by `go generate ./examples/...`.
 func TestExamplesAreUpToDate(t *testing.T) {
 	schemas, _ := filepath.Glob("../../examples/*/*.dynago.yaml")
+	fixtures, _ := filepath.Glob("../../internal/e2e/fixture/*.dynago.yaml")
+	schemas = append(schemas, fixtures...)
 	if len(schemas) == 0 {
 		t.Fatal("no example schemas")
 	}

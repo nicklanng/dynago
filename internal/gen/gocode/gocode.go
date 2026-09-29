@@ -21,6 +21,10 @@ import (
 func Generate(m *schema.Model, source string) ([]byte, error) {
 	g := &gen{m: m}
 	g.file(source)
+	return formatted(g)
+}
+
+func formatted(g *gen) ([]byte, error) {
 	out, err := format.Source(g.buf.Bytes())
 	if err != nil {
 		return g.buf.Bytes(), fmt.Errorf("gocode: generated code does not parse (this is a dynago bug): %w", err)
@@ -48,6 +52,7 @@ func (g *gen) file(source string) {
 	g.p("import (")
 	g.p(`"context"`)
 	g.p(`"fmt"`)
+	g.p(`"io"`)
 	if g.usesTime() {
 		g.p(`"time"`)
 	}
@@ -62,6 +67,7 @@ func (g *gen) file(source string) {
 	for _, e := range m.Entities {
 		g.entity(e)
 	}
+	g.migration()
 }
 
 func (g *gen) usesTime() bool {
@@ -69,6 +75,15 @@ func (g *gen) usesTime() bool {
 		for _, f := range e.Fields {
 			if f.Type == schema.TypeTime {
 				return true
+			}
+		}
+	}
+	if p := g.m.Previous; p != nil {
+		for _, fields := range p.Entities {
+			for _, f := range fields {
+				if f.Type == schema.TypeTime {
+					return true
+				}
 			}
 		}
 	}

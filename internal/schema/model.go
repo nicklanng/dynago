@@ -36,6 +36,8 @@ type Output struct {
 	Terraform string
 	TableJSON string
 	Lock      string
+	// MigrateCmd is the directory of the migration job's main package ("" for none).
+	MigrateCmd string
 }
 
 // Table is the physical table.

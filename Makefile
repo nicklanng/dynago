@@ -14,7 +14,7 @@ test-unit:
 
 ## generate: regenerate the examples
 generate:
-	go generate ./examples/...
+	go generate ./examples/... ./internal/e2e/fixture/...
 
 ## dynamodb-up: start an in-memory DynamoDB Local for the tests
 dynamodb-up:

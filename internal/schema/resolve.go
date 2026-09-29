@@ -98,11 +98,12 @@ func (r *resolver) resolve() *Model {
 	}
 	base := fileBase(m.Table.Name)
 	m.Output = Output{
-		Go:        orDefault(raw.Output.Go, base+"_dynago.go"),
-		Docs:      orDefault(raw.Output.Docs, base+".model.md"),
-		Terraform: orDefault(raw.Output.Terraform, base+".tf.json"),
-		TableJSON: orDefault(raw.Output.TableJSON, base+".table.json"),
-		Lock:      orDefault(raw.Output.Lock, base+".dynago.lock"),
+		Go:         orDefault(raw.Output.Go, base+"_dynago.go"),
+		Docs:       orDefault(raw.Output.Docs, base+".model.md"),
+		Terraform:  orDefault(raw.Output.Terraform, base+".tf.json"),
+		TableJSON:  orDefault(raw.Output.TableJSON, base+".table.json"),
+		Lock:       orDefault(raw.Output.Lock, base+".dynago.lock"),
+		MigrateCmd: raw.Output.MigrateCmd,
 	}
 	if len(raw.Entities) == 0 {
 		r.errorf("entities: at least one entity is required")

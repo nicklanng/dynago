@@ -1,0 +1,51 @@
+# yaml-language-server: $schema=../../../schema/dynago.schema.json
+#
+# A test-only schema for shapes the example doesn't use. An account hands over to its successor:
+# both change in one transaction, both feed the tenant's counter item (so their changes must be
+# merged into one update), and the successor's region counter is keyed by a field the requirement
+# doesn't pin (so the successor is always read first).
+dynago: 1
+package: fixture
+
+table:
+  name: fixture
+
+entities:
+  Account:
+    fields:
+      tenantId: string
+      accountId: string
+      region: string
+      status: { type: enum, values: [pending, active, closed] }
+      successorId: string
+    key:
+      pk: "T#{tenantId}"
+      sk: "ACCOUNT#{accountId}"
+    counters:
+      TenantCounts:
+        pk: "T#{tenantId}"
+        sk: "COUNTS"
+        values:
+          active: { count: true, where: { status: active } }
+          closed: { count: true, where: { status: closed } }
+      RegionCounts:
+        pk: "R#{region}"
+        sk: "COUNTS"
+        values:
+          active: { count: true, where: { status: active } }
+    access:
+      Get: get
+      Tenant: { counter: TenantCounts }
+      Region: { counter: RegionCounts }
+    writes:
+      Open: create
+      Activate: { set: { status: active }, when: { status: pending } }
+      HandOver:
+        update: [successorId]
+        set: { status: closed }
+        when: { status: active }
+        requires:
+          Account:
+            key: { tenantId: tenantId, accountId: successorId }
+            when: { status: pending }
+            set: { status: active }

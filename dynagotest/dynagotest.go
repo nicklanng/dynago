@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -132,11 +133,25 @@ func Client(t testing.TB) *dynamodb.Client {
 // Table creates a uniquely named table with spec for the duration of the test and returns its name.
 func Table(t testing.TB, db *dynamo.DB, spec dynago.TableSpec) string {
 	t.Helper()
+	name := UniqueName(t, "dynagotest")
+	TableNamed(t, db, name, spec)
+	return name
+}
+
+// UniqueName returns prefix followed by a random suffix, for naming tables in tests: a migration
+// test names its tables base-g1 and base-g2 after one base.
+func UniqueName(t testing.TB, prefix string) string {
+	t.Helper()
 	b := make([]byte, 6)
 	if _, err := rand.Read(b); err != nil {
 		t.Fatal(err)
 	}
-	name := "dynagotest-" + hex.EncodeToString(b)
+	return prefix + "-" + hex.EncodeToString(b)
+}
+
+// TableNamed creates a table called name with spec for the duration of the test.
+func TableNamed(t testing.TB, db *dynamo.DB, name string, spec dynago.TableSpec) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if err := dynago.EnsureTable(ctx, db, name, spec); err != nil {
@@ -145,5 +160,18 @@ func Table(t testing.TB, db *dynamo.DB, spec dynago.TableSpec) string {
 	t.Cleanup(func() {
 		_ = db.Table(name).DeleteTable().Run(context.Background())
 	})
-	return name
+}
+
+// RawItem reads an item as stored, as plain Go values, or nil if it is absent.
+func RawItem(t testing.TB, table dynamo.Table, pk, sk string) map[string]any {
+	t.Helper()
+	var item map[string]any
+	err := table.Get(dynago.AttrPK, pk).Range(dynago.AttrSK, dynamo.Equal, sk).Consistent(true).One(context.Background(), &item)
+	if errors.Is(err, dynamo.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return item
 }

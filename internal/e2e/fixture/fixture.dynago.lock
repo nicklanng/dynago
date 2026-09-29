@@ -1,0 +1,93 @@
+{
+  "dynago": 1,
+  "generation": 1,
+  "tables": [
+    {
+      "generation": 1,
+      "spec": {}
+    }
+  ],
+  "entities": {
+    "Account": {
+      "versions": [
+        {
+          "version": 1,
+          "generation": 1,
+          "fingerprint": "7d7bb978391acab2",
+          "shape": {
+            "fields": [
+              {
+                "name": "tenantId",
+                "attr": "tenantId",
+                "type": "string"
+              },
+              {
+                "name": "accountId",
+                "attr": "accountId",
+                "type": "string"
+              },
+              {
+                "name": "region",
+                "attr": "region",
+                "type": "string"
+              },
+              {
+                "name": "status",
+                "attr": "status",
+                "type": "enum",
+                "values": [
+                  "pending",
+                  "active",
+                  "closed"
+                ]
+              },
+              {
+                "name": "successorId",
+                "attr": "successorId",
+                "type": "string"
+              }
+            ],
+            "pk": "T#{tenantId}",
+            "sk": "ACCOUNT#{accountId}",
+            "counters": [
+              {
+                "name": "TenantCounts",
+                "pk": "T#{tenantId}",
+                "sk": "COUNTS",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "active",
+                    "where": [
+                      "status=active"
+                    ]
+                  },
+                  {
+                    "name": "closed",
+                    "where": [
+                      "status=closed"
+                    ]
+                  }
+                ]
+              },
+              {
+                "name": "RegionCounts",
+                "pk": "R#{region}",
+                "sk": "COUNTS",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "active",
+                    "where": [
+                      "status=active"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

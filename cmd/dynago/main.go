@@ -172,12 +172,25 @@ func build(path string, prices cost.Prices, lockOpts lock.Options) (*schema.Mode
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
+	var migrateCmd []byte
+	if m.Output.MigrateCmd != "" {
+		importPath, err := goImportPath(filepath.Dir(filepath.Join(dir, m.Output.Go)))
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("%s: output.migrate_cmd: %w", path, err)
+		}
+		if migrateCmd, err = gocode.GenerateMigrateCmd(m, importPath, source); err != nil {
+			return nil, nil, nil, nil, err
+		}
+	}
 	outs := []output{
 		{filepath.Join(dir, m.Output.Go), goSrc},
 		{filepath.Join(dir, m.Output.Docs), docs.Generate(m, report, source)},
 		{filepath.Join(dir, m.Output.Terraform), tf},
 		{filepath.Join(dir, m.Output.TableJSON), tableJSON},
 		{filepath.Join(dir, m.Output.Lock), lockData},
+	}
+	if migrateCmd != nil {
+		outs = append(outs, output{filepath.Join(dir, m.Output.MigrateCmd, "main.go"), migrateCmd})
 	}
 	return m, report, notes, outs, nil
 }
@@ -207,6 +220,9 @@ func generate(path string, prices cost.Prices, lockOpts lock.Options, checkOnly 
 		if checkOnly {
 			stale = append(stale, o.path)
 			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(o.path), 0o755); err != nil {
+			return err
 		}
 		if err := os.WriteFile(o.path, o.data, 0o644); err != nil {
 			return err
@@ -289,4 +305,30 @@ func units(u cost.Units) string {
 		return f(u.P50)
 	}
 	return f(u.P50) + "/" + f(u.P99)
+}
+
+// goImportPath returns the import path of the Go package in dir, from the nearest go.mod above it.
+func goImportPath(dir string) (string, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return "", err
+	}
+	for root := abs; ; root = filepath.Dir(root) {
+		data, err := os.ReadFile(filepath.Join(root, "go.mod"))
+		if err == nil {
+			for _, line := range strings.Split(string(data), "\n") {
+				if mod, ok := strings.CutPrefix(strings.TrimSpace(line), "module "); ok {
+					rel, err := filepath.Rel(root, abs)
+					if err != nil {
+						return "", err
+					}
+					return strings.TrimSuffix(strings.Trim(mod, `"`)+"/"+filepath.ToSlash(rel), "/."), nil
+				}
+			}
+			return "", fmt.Errorf("%s has no module line", filepath.Join(root, "go.mod"))
+		}
+		if filepath.Dir(root) == root {
+			return "", fmt.Errorf("no go.mod above %s", abs)
+		}
+	}
 }

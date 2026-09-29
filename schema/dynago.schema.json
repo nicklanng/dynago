@@ -148,6 +148,10 @@
         "lock": {
           "type": "string",
           "description": "Default <table>.dynago.lock"
+        },
+        "migrate_cmd": {
+          "type": "string",
+          "description": "Directory (relative to the schema file) of the generated migration job's main package, for example cmd/migrate-orders. Omit it to call RunMigration from your own command."
         }
       }
     },

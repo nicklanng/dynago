@@ -5,6 +5,7 @@ package toollibrary
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/guregu/dynamo/v2"
@@ -13,13 +14,13 @@ import (
 )
 
 // Generation is the table generation this code reads and writes: its table is
-// <base>-g1 (see TableName). A change existing items don't fit starts a new generation,
+// <base>-g2 (see TableName). A change existing items don't fit starts a new generation,
 // which the migration job fills from the previous one.
-const Generation = 1
+const Generation = 2
 
 // TableName returns the name of this generation's table for a base name, such as "toollibrary".
 func TableName(base string) string {
-	return base + "-g1"
+	return base + "-g2"
 }
 
 // TableSpec is the physical shape of the toollibrary table: base key PK/SK, its global secondary
@@ -2949,4 +2950,591 @@ func (s *HoldStore) Release(ctx context.Context, k HoldKey, opts ...dynago.Write
 	return dynago.Retry(ctx, func() error {
 		return dynago.StaleAs(guard.ExpectRev != 0, dynago.DeleteIfExists(ctx, s.t, key, guard))
 	})
+}
+
+// ---- migration ----
+
+// RunMigration runs the migration job's command line (see dynago.MigrateUsage): it copies the
+// previous table generation into this one. A generated main (output.migrate_cmd) calls it.
+func RunMigration(ctx context.Context, db *dynamo.DB, args []string, out io.Writer) error {
+	command, base, workers, passes, rate, err := dynago.ParseMigrate(args, "toollibrary")
+	if err != nil {
+		return err
+	}
+	mig := NewMigration(db, base)
+	mig.Workers, mig.MaxPasses, mig.Rate, mig.Out = workers, passes, rate, out
+	return mig.Run(ctx, command)
+}
+
+// NewMigration returns the job copying generation 1 of the table into generation 2: base-g1
+// into base-g2. Entities are converted by the Migrate<Entity> functions, where set, and copied
+// field by field otherwise.
+func NewMigration(db *dynamo.DB, base string) *dynago.Migration {
+	st := New(db, TableName(base))
+	return &dynago.Migration{DB: db, From: base + "-g1", To: TableName(base),
+		Types: map[string]bool{"Library": true, "Member": true, "Tool": true, "Loan": true, "Hold": true},
+		Copy:  st.migrateCopy, Remove: st.migrateRemove, Check: migrationCheck}
+}
+
+// LibraryG1 is a Library as generation 1 stored it: what the migration job reads.
+type LibraryG1 struct {
+	LibraryID string    `dynamo:"libraryId"`
+	Name      string    `dynamo:"name"`
+	Slug      string    `dynamo:"slug"`
+	OpenedAt  time.Time `dynamo:"openedAt"`
+}
+
+// MigrateLibrary, if set, converts a generation-1 Library into this generation's. Without it, the
+// migration job uses AutoMigrateLibrary: every field carries over. Set it in a file of your own in
+// this package to fill new fields.
+var MigrateLibrary func(old LibraryG1) (Library, error)
+
+// AutoMigrateLibrary copies the fields of a generation-1 Library that exist in this generation with the
+// same type (enums by value); the others are left zero.
+func AutoMigrateLibrary(old LibraryG1) Library {
+	return Library{LibraryID: old.LibraryID, Name: old.Name, Slug: old.Slug, OpenedAt: old.OpenedAt}
+}
+
+// MemberG1 is a Member as generation 1 stored it: what the migration job reads.
+type MemberG1 struct {
+	LibraryID string    `dynamo:"libraryId"`
+	MemberID  string    `dynamo:"memberId"`
+	Email     string    `dynamo:"email"`
+	Name      string    `dynamo:"name"`
+	Phone     string    `dynamo:"phone"`
+	Role      string    `dynamo:"role"`
+	Status    string    `dynamo:"status"`
+	MaxLoans  int64     `dynamo:"maxLoans"`
+	JoinedAt  time.Time `dynamo:"joinedAt"`
+}
+
+// MigrateMember, if set, converts a generation-1 Member into this generation's. Without it, the
+// migration job uses AutoMigrateMember: every field carries over. Set it in a file of your own in
+// this package to fill new fields.
+var MigrateMember func(old MemberG1) (Member, error)
+
+// AutoMigrateMember copies the fields of a generation-1 Member that exist in this generation with the
+// same type (enums by value); the others are left zero.
+func AutoMigrateMember(old MemberG1) Member {
+	return Member{LibraryID: old.LibraryID, MemberID: old.MemberID, Email: old.Email, Name: old.Name, Phone: old.Phone, Role: MemberRole(old.Role), Status: MemberStatus(old.Status), MaxLoans: old.MaxLoans, JoinedAt: old.JoinedAt}
+}
+
+// ToolG1 is a Tool as generation 1 stored it: what the migration job reads.
+type ToolG1 struct {
+	LibraryID    string    `dynamo:"libraryId"`
+	ToolID       string    `dynamo:"toolId"`
+	Name         string    `dynamo:"name"`
+	Category     string    `dynamo:"category"`
+	Status       string    `dynamo:"status"`
+	Manual       string    `dynamo:"manual"`
+	Tags         []string  `dynamo:"tags"`
+	SerialNumber string    `dynamo:"serialNumber"`
+	AddedAt      time.Time `dynamo:"addedAt"`
+}
+
+// MigrateTool, if set, converts a generation-1 Tool into this generation's. Without it, the
+// migration job uses AutoMigrateTool: every field carries over. Set it in a file of your own in
+// this package to fill new fields.
+var MigrateTool func(old ToolG1) (Tool, error)
+
+// AutoMigrateTool copies the fields of a generation-1 Tool that exist in this generation with the
+// same type (enums by value); the others are left zero.
+func AutoMigrateTool(old ToolG1) Tool {
+	return Tool{LibraryID: old.LibraryID, ToolID: old.ToolID, Name: old.Name, Category: ToolCategory(old.Category), Status: ToolStatus(old.Status), Manual: old.Manual, Tags: old.Tags, SerialNumber: old.SerialNumber, AddedAt: old.AddedAt}
+}
+
+// LoanG1 is a Loan as generation 1 stored it: what the migration job reads.
+type LoanG1 struct {
+	LibraryID  string    `dynamo:"libraryId"`
+	ToolID     string    `dynamo:"toolId"`
+	LoanID     string    `dynamo:"loanId"`
+	MemberID   string    `dynamo:"memberId"`
+	ToolName   string    `dynamo:"toolName"`
+	Status     string    `dynamo:"status"`
+	BorrowedAt time.Time `dynamo:"borrowedAt"`
+	DueAt      time.Time `dynamo:"dueAt"`
+	ReturnedAt time.Time `dynamo:"returnedAt"`
+	Notes      string    `dynamo:"notes"`
+}
+
+// MigrateLoan, if set, converts a generation-1 Loan into this generation's. Without it, the
+// migration job uses AutoMigrateLoan: every field carries over. Set it in a file of your own in
+// this package to fill new fields.
+var MigrateLoan func(old LoanG1) (Loan, error)
+
+// AutoMigrateLoan copies the fields of a generation-1 Loan that exist in this generation with the
+// same type (enums by value); the others are left zero.
+func AutoMigrateLoan(old LoanG1) Loan {
+	return Loan{LibraryID: old.LibraryID, ToolID: old.ToolID, LoanID: old.LoanID, MemberID: old.MemberID, ToolName: old.ToolName, Status: LoanStatus(old.Status), BorrowedAt: old.BorrowedAt, DueAt: old.DueAt, ReturnedAt: old.ReturnedAt, Notes: old.Notes}
+}
+
+// HoldG1 is a Hold as generation 1 stored it: what the migration job reads.
+type HoldG1 struct {
+	LibraryID string    `dynamo:"libraryId"`
+	ToolID    string    `dynamo:"toolId"`
+	MemberID  string    `dynamo:"memberId"`
+	CodeHash  string    `dynamo:"codeHash"`
+	CreatedAt time.Time `dynamo:"createdAt"`
+	ExpiresAt time.Time `dynamo:"expiresAt"`
+}
+
+// MigrateHold, if set, converts a generation-1 Hold into this generation's. Without it, the
+// migration job uses AutoMigrateHold: every field carries over. Set it in a file of your own in
+// this package to fill new fields.
+var MigrateHold func(old HoldG1) (Hold, error)
+
+// AutoMigrateHold copies the fields of a generation-1 Hold that exist in this generation with the
+// same type (enums by value); the others are left zero.
+func AutoMigrateHold(old HoldG1) Hold {
+	return Hold{LibraryID: old.LibraryID, ToolID: old.ToolID, MemberID: old.MemberID, CodeHash: old.CodeHash, CreatedAt: old.CreatedAt, ExpiresAt: old.ExpiresAt}
+}
+
+// migrationCheck reports the conversions the migration job needs but hasn't been given.
+func migrationCheck() error {
+	return nil // every entity carries over field by field
+}
+
+// migrateCopy converts one item of the previous generation and writes it into this one.
+func (s *Store) migrateCopy(ctx context.Context, raw dynamo.Item) error {
+	src, srcRev, err := dynago.SourceOf(raw)
+	if err != nil {
+		return err
+	}
+	if dynago.ExpiredItem(raw, "ttl") {
+		return dynago.ErrUnchanged // expired: gone, even if DynamoDB hasn't deleted it yet
+	}
+	switch dynago.ItemType(raw) {
+	case "Library":
+		var old LibraryG1
+		if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+			return err
+		}
+		e := AutoMigrateLibrary(old)
+		if MigrateLibrary != nil {
+			if e, err = MigrateLibrary(old); err != nil {
+				return fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
+			}
+		}
+		return s.Libraries.migrate(ctx, &e, src, srcRev)
+	case "Member":
+		var old MemberG1
+		if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+			return err
+		}
+		e := AutoMigrateMember(old)
+		if MigrateMember != nil {
+			if e, err = MigrateMember(old); err != nil {
+				return fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
+			}
+		}
+		return s.Members.migrate(ctx, &e, src, srcRev)
+	case "Tool":
+		var old ToolG1
+		if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+			return err
+		}
+		e := AutoMigrateTool(old)
+		if MigrateTool != nil {
+			if e, err = MigrateTool(old); err != nil {
+				return fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
+			}
+		}
+		return s.Tools.migrate(ctx, &e, src, srcRev)
+	case "Loan":
+		var old LoanG1
+		if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+			return err
+		}
+		e := AutoMigrateLoan(old)
+		if MigrateLoan != nil {
+			if e, err = MigrateLoan(old); err != nil {
+				return fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
+			}
+		}
+		return s.Loans.migrate(ctx, &e, src, srcRev)
+	case "Hold":
+		var old HoldG1
+		if err := dynamo.UnmarshalItem(raw, &old); err != nil {
+			return err
+		}
+		e := AutoMigrateHold(old)
+		if MigrateHold != nil {
+			if e, err = MigrateHold(old); err != nil {
+				return fmt.Errorf("%w: %w", dynago.ErrMigrationConflict, err)
+			}
+		}
+		return s.Holds.migrate(ctx, &e, src, srcRev)
+	}
+	return nil
+}
+
+// migrateRemove deletes an entity copied from an item the previous generation no longer has.
+func (s *Store) migrateRemove(ctx context.Context, raw dynamo.Item) error {
+	switch dynago.ItemType(raw) {
+	case "Library":
+		return s.Libraries.migrateRemove(ctx, raw)
+	case "Member":
+		return s.Members.migrateRemove(ctx, raw)
+	case "Tool":
+		return s.Tools.migrateRemove(ctx, raw)
+	case "Loan":
+		return s.Loans.migrateRemove(ctx, raw)
+	case "Hold":
+		return s.Holds.migrateRemove(ctx, raw)
+	}
+	return nil
+}
+
+// migrate writes e, converted from the item at src in the previous generation (revision
+// srcRev), replacing what the new table holds for it, with its derived items.
+func (s *LibraryStore) migrate(ctx context.Context, e *Library, src dynago.Key, srcRev int64) error {
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	return dynago.Retry(ctx, func() error {
+		var raw dynamo.Item
+		found, err := dynago.GetOne(ctx, s.t, key, true, &raw)
+		if err != nil {
+			return err
+		}
+		rev := dynago.NewRev()
+		var before []dynago.Derived
+		if found {
+			same, other := dynago.MigratedFrom(raw, src, srcRev)
+			switch {
+			case other:
+				return fmt.Errorf("%w: another item of the previous generation converts to the same Library key", dynago.ErrMigrationConflict)
+			case same:
+				return dynago.ErrUnchanged
+			}
+			it, err := libraryDecode(raw)
+			if err != nil {
+				return err
+			}
+			before = libraryDerived(&it.Library, key)
+			rev = it.Rev + 1
+		}
+		item, err := dynago.MigrationItem(libraryToItem(e, key, rev), src, srcRev)
+		if err != nil {
+			return err
+		}
+		put := s.t.Put(item).If("attribute_not_exists($)", "PK")
+		if found {
+			put = s.t.Put(item).If("$ = ?", "_rev", rev-1)
+		}
+		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}
+		derived, err := dynago.Diff(s.t, key, before, libraryDerived(e, key))
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		return dynago.Run(ctx, s.db, ops)
+	})
+}
+
+// migrateRemove deletes an entity the migration copied, with its derived items, because its
+// source is gone.
+func (s *LibraryStore) migrateRemove(ctx context.Context, raw dynamo.Item) error {
+	it, err := libraryDecode(raw)
+	if err != nil {
+		return err
+	}
+	key := dynago.Key{PK: it.PK, SK: it.SK}
+	ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+	derived, err := dynago.Diff(s.t, key, libraryDerived(&it.Library, key), nil)
+	if err != nil {
+		return err
+	}
+	ops = append(ops, derived...)
+	return dynago.Run(ctx, s.db, ops)
+}
+
+// migrate writes e, converted from the item at src in the previous generation (revision
+// srcRev), replacing what the new table holds for it, with its derived items.
+func (s *MemberStore) migrate(ctx context.Context, e *Member, src dynago.Key, srcRev int64) error {
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	return dynago.Retry(ctx, func() error {
+		var raw dynamo.Item
+		found, err := dynago.GetOne(ctx, s.t, key, true, &raw)
+		if err != nil {
+			return err
+		}
+		rev := dynago.NewRev()
+		var before []dynago.Derived
+		if found {
+			same, other := dynago.MigratedFrom(raw, src, srcRev)
+			switch {
+			case other:
+				return fmt.Errorf("%w: another item of the previous generation converts to the same Member key", dynago.ErrMigrationConflict)
+			case same:
+				return dynago.ErrUnchanged
+			}
+			it, err := memberDecode(raw)
+			if err != nil {
+				return err
+			}
+			before = memberDerived(&it.Member, key)
+			rev = it.Rev + 1
+		}
+		item, err := dynago.MigrationItem(memberToItem(e, key, rev), src, srcRev)
+		if err != nil {
+			return err
+		}
+		put := s.t.Put(item).If("attribute_not_exists($)", "PK")
+		if found {
+			put = s.t.Put(item).If("$ = ?", "_rev", rev-1)
+		}
+		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}
+		derived, err := dynago.Diff(s.t, key, before, memberDerived(e, key))
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		return dynago.Run(ctx, s.db, ops)
+	})
+}
+
+// migrateRemove deletes an entity the migration copied, with its derived items, because its
+// source is gone.
+func (s *MemberStore) migrateRemove(ctx context.Context, raw dynamo.Item) error {
+	it, err := memberDecode(raw)
+	if err != nil {
+		return err
+	}
+	key := dynago.Key{PK: it.PK, SK: it.SK}
+	ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+	derived, err := dynago.Diff(s.t, key, memberDerived(&it.Member, key), nil)
+	if err != nil {
+		return err
+	}
+	ops = append(ops, derived...)
+	return dynago.Run(ctx, s.db, ops)
+}
+
+// migrate writes e, converted from the item at src in the previous generation (revision
+// srcRev), replacing what the new table holds for it, with its derived items.
+func (s *ToolStore) migrate(ctx context.Context, e *Tool, src dynago.Key, srcRev int64) error {
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	return dynago.Retry(ctx, func() error {
+		var raw dynamo.Item
+		found, err := dynago.GetOne(ctx, s.t, key, true, &raw)
+		if err != nil {
+			return err
+		}
+		rev := dynago.NewRev()
+		var before []dynago.Derived
+		if found {
+			same, other := dynago.MigratedFrom(raw, src, srcRev)
+			switch {
+			case other:
+				return fmt.Errorf("%w: another item of the previous generation converts to the same Tool key", dynago.ErrMigrationConflict)
+			case same:
+				return dynago.ErrUnchanged
+			}
+			it, err := toolDecode(raw)
+			if err != nil {
+				return err
+			}
+			before = toolDerived(&it.Tool, key)
+			rev = it.Rev + 1
+		}
+		item, err := dynago.MigrationItem(toolToItem(e, key, rev), src, srcRev)
+		if err != nil {
+			return err
+		}
+		put := s.t.Put(item).If("attribute_not_exists($)", "PK")
+		if found {
+			put = s.t.Put(item).If("$ = ?", "_rev", rev-1)
+		}
+		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}
+		derived, err := dynago.Diff(s.t, key, before, toolDerived(e, key))
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		return dynago.Run(ctx, s.db, ops)
+	})
+}
+
+// migrateRemove deletes an entity the migration copied, with its derived items, because its
+// source is gone.
+func (s *ToolStore) migrateRemove(ctx context.Context, raw dynamo.Item) error {
+	it, err := toolDecode(raw)
+	if err != nil {
+		return err
+	}
+	key := dynago.Key{PK: it.PK, SK: it.SK}
+	ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+	derived, err := dynago.Diff(s.t, key, toolDerived(&it.Tool, key), nil)
+	if err != nil {
+		return err
+	}
+	ops = append(ops, derived...)
+	return dynago.Run(ctx, s.db, ops)
+}
+
+// migrate writes e, converted from the item at src in the previous generation (revision
+// srcRev), replacing what the new table holds for it, with its derived items.
+func (s *LoanStore) migrate(ctx context.Context, e *Loan, src dynago.Key, srcRev int64) error {
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if e.MemberID == "" {
+		err := fmt.Errorf("%w: Loan.memberId", dynago.ErrFieldRequired)
+		return err
+	}
+	if e.BorrowedAt.IsZero() {
+		err := fmt.Errorf("%w: Loan.borrowedAt", dynago.ErrFieldRequired)
+		return err
+	}
+	if e.DueAt.IsZero() {
+		err := fmt.Errorf("%w: Loan.dueAt", dynago.ErrFieldRequired)
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	return dynago.Retry(ctx, func() error {
+		var raw dynamo.Item
+		found, err := dynago.GetOne(ctx, s.t, key, true, &raw)
+		if err != nil {
+			return err
+		}
+		rev := dynago.NewRev()
+		var before []dynago.Derived
+		if found {
+			same, other := dynago.MigratedFrom(raw, src, srcRev)
+			switch {
+			case other:
+				return fmt.Errorf("%w: another item of the previous generation converts to the same Loan key", dynago.ErrMigrationConflict)
+			case same:
+				return dynago.ErrUnchanged
+			}
+			it, err := loanDecode(raw)
+			if err != nil {
+				return err
+			}
+			before = loanDerived(&it.Loan, key, loanLimits{MemberLoansActive: dynago.Unlimited()})
+			rev = it.Rev + 1
+		}
+		item, err := dynago.MigrationItem(loanToItem(e, key, rev), src, srcRev)
+		if err != nil {
+			return err
+		}
+		put := s.t.Put(item).If("attribute_not_exists($)", "PK")
+		if found {
+			put = s.t.Put(item).If("$ = ?", "_rev", rev-1)
+		}
+		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}
+		derived, err := dynago.Diff(s.t, key, before, loanDerived(e, key, loanLimits{MemberLoansActive: dynago.Unlimited()}))
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		return dynago.Run(ctx, s.db, ops)
+	})
+}
+
+// migrateRemove deletes an entity the migration copied, with its derived items, because its
+// source is gone.
+func (s *LoanStore) migrateRemove(ctx context.Context, raw dynamo.Item) error {
+	it, err := loanDecode(raw)
+	if err != nil {
+		return err
+	}
+	key := dynago.Key{PK: it.PK, SK: it.SK}
+	ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+	derived, err := dynago.Diff(s.t, key, loanDerived(&it.Loan, key, loanLimits{MemberLoansActive: dynago.Unlimited()}), nil)
+	if err != nil {
+		return err
+	}
+	ops = append(ops, derived...)
+	return dynago.Run(ctx, s.db, ops)
+}
+
+// migrate writes e, converted from the item at src in the previous generation (revision
+// srcRev), replacing what the new table holds for it, with its derived items.
+func (s *HoldStore) migrate(ctx context.Context, e *Hold, src dynago.Key, srcRev int64) error {
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if e.MemberID == "" {
+		err := fmt.Errorf("%w: Hold.memberId", dynago.ErrFieldRequired)
+		return err
+	}
+	if e.CodeHash == "" {
+		err := fmt.Errorf("%w: Hold.codeHash", dynago.ErrFieldRequired)
+		return err
+	}
+	if e.ExpiresAt.IsZero() {
+		err := fmt.Errorf("%w: Hold.expiresAt", dynago.ErrFieldRequired)
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	return dynago.Retry(ctx, func() error {
+		var raw dynamo.Item
+		found, err := dynago.GetOne(ctx, s.t, key, true, &raw)
+		if err != nil {
+			return err
+		}
+		rev := dynago.NewRev()
+		var before []dynago.Derived
+		if found {
+			same, other := dynago.MigratedFrom(raw, src, srcRev)
+			switch {
+			case other:
+				return fmt.Errorf("%w: another item of the previous generation converts to the same Hold key", dynago.ErrMigrationConflict)
+			case same:
+				return dynago.ErrUnchanged
+			}
+			it, err := holdDecode(raw)
+			if err != nil {
+				return err
+			}
+			rev = it.Rev + 1
+		}
+		item, err := dynago.MigrationItem(holdToItem(e, key, rev), src, srcRev)
+		if err != nil {
+			return err
+		}
+		put := s.t.Put(item).If("attribute_not_exists($)", "PK")
+		if found {
+			put = s.t.Put(item).If("$ = ?", "_rev", rev-1)
+		}
+		ops := []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}
+		_ = before
+		return dynago.Run(ctx, s.db, ops)
+	})
+}
+
+// migrateRemove deletes an entity the migration copied, with its derived items, because its
+// source is gone.
+func (s *HoldStore) migrateRemove(ctx context.Context, raw dynamo.Item) error {
+	it, err := holdDecode(raw)
+	if err != nil {
+		return err
+	}
+	key := dynago.Key{PK: it.PK, SK: it.SK}
+	ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+	return dynago.Run(ctx, s.db, ops)
 }

@@ -63,7 +63,8 @@ with characters other than letters and digits replaced by `_`.
 | `docs` | `<table>.model.md` | The model document. |
 | `terraform` | `<table>.tf.json` | An `aws_dynamodb_table` resource in Terraform JSON syntax. |
 | `table_json` | `<table>.table.json` | Input for `aws dynamodb create-table --cli-input-json`. |
-| `lock` | `<table>.dynago.lock` | Version history of each entity's storage shape. Commit it. |
+| `lock` | `<table>.dynago.lock` | Version history of each entity's storage shape, and of the table generations. Commit it. |
+| `migrate_cmd` | none | A directory for the migration job's `main` package, e.g. `cmd/migrate-orders`: build it into your image and run it as a job. Without it, call the generated `RunMigration` from a command of your own. See [Migrations](guides/migrations.md). |
 
 ## Entities
 
