@@ -602,23 +602,39 @@ func TestHolds(t *testing.T) {
 	}
 }
 
-// Old code must not overwrite items that newer code wrote, on any write path.
-func TestNewerSchemaIsNotOverwritten(t *testing.T) {
+// Within a table generation, code at an older compatible version can write items that a newer
+// version wrote (after a rollback, or during a rolling deploy), and keeps the fields it doesn't
+// know, on every write path.
+func TestOlderCodeKeepsNewerFields(t *testing.T) {
 	e := setup(t)
 	e.join(t, "alice", toollibrary.MemberRoleSteward, 2)
+	e.join(t, "bob", toollibrary.MemberRoleSteward, 2)
 	e.addTool(t, "t1", "Drill", toollibrary.ToolCategoryPower)
 	e.addTool(t, "t2", "Tent", toollibrary.ToolCategoryCamping)
-	must(t, e.table.Update("PK", "LIB#lib1").Range("SK", "MEMBER#alice").Set("'_v'", 99).Run(ctx))
-	must(t, e.table.Update("PK", "LIB#lib1#TOOL#t1").Range("SK", "TOOL").Set("'_v'", 99).Run(ctx))
+	// A newer version stored fields this code doesn't have.
+	newer := func(pk, sk, attr string) {
+		must(t, e.table.Update("PK", pk).Range("SK", sk).Set(attr, "from v9").Set("'_v'", 9).Run(ctx))
+	}
+	newer("LIB#lib1", "MEMBER#alice", "pronouns")
+	newer("LIB#lib1#TOOL#t1", "TOOL", "colour")
+	newer("LIB#lib1#TOOL#t2", "TOOL", "colour")
 	alice := toollibrary.MemberKey{LibraryID: "lib1", MemberID: "alice"}
-	wantErr(t, e.st.Members.SetLoanCap(ctx, alice, toollibrary.MemberSetLoanCap{MaxLoans: 9}), dynago.ErrNewerSchema)                 // single UpdateItem
-	wantErr(t, e.st.Members.UpdateProfile(ctx, alice, toollibrary.MemberUpdateProfile{Name: dynago.Ptr("x")}), dynago.ErrNewerSchema) // read-first
-	wantErr(t, e.st.Tools.Retire(ctx, toollibrary.ToolKey{LibraryID: "lib1", ToolID: "t1"}), dynago.ErrNewerSchema)                   // read-free
-	// Borrow changes the tool too: its read-free attempt fails, and the read reports why.
-	must(t, e.table.Update("PK", "LIB#lib1").Range("SK", "MEMBER#alice").Set("'_v'", 1).Run(ctx))
-	wantErr(t, e.borrow(t, "l1", "t1", "alice", 2), dynago.ErrNewerSchema)
-	if c := e.toolCounts(t); c != (toollibrary.ToolCounts{Available: 2}) {
-		t.Fatalf("counts changed by a refused write: %+v", c)
+
+	must(t, e.st.Members.SetLoanCap(ctx, alice, toollibrary.MemberSetLoanCap{MaxLoans: 9}))                  // one UpdateItem
+	must(t, e.st.Members.UpdateProfile(ctx, alice, toollibrary.MemberUpdateProfile{Name: dynago.Ptr("Al")})) // read, then rewrite
+	must(t, e.st.Tools.Retire(ctx, toollibrary.ToolKey{LibraryID: "lib1", ToolID: "t1"}))                    // read-free transaction
+	must(t, e.borrow(t, "l1", "t2", "alice", 9))                                                             // changes the tool through requires
+	for _, it := range []struct{ pk, sk, attr string }{
+		{"LIB#lib1", "MEMBER#alice", "pronouns"},
+		{"LIB#lib1#TOOL#t1", "TOOL", "colour"},
+		{"LIB#lib1#TOOL#t2", "TOOL", "colour"},
+	} {
+		if got := e.raw(t, it.pk, it.sk)[it.attr]; got != "from v9" {
+			t.Errorf("%s %s: %s = %v, want it kept", it.pk, it.sk, it.attr, got)
+		}
+	}
+	if a, _ := e.st.Members.Get(ctx, alice); a.Name != "Al" || a.MaxLoans != 9 {
+		t.Fatalf("alice = %+v", a)
 	}
 }
 
@@ -732,44 +748,6 @@ func TestCaseInsensitiveKeys(t *testing.T) {
 	}
 	err = e.st.Members.Join(ctx, &toollibrary.Member{LibraryID: "lib1", MemberID: "m6", Email: decomposed, Status: toollibrary.MemberStatusActive})
 	wantErr(t, err, toollibrary.ErrMemberEmailTaken)
-}
-
-// When the tool can't be changed without reading it (here it is stored at a schema version older
-// than its counters, simulated with _v 0, so its contributions aren't the ones assumed), Borrow
-// reads the tool and the hold, and writes the changes guarded by what it read.
-func TestBorrowFallsBackToReading(t *testing.T) {
-	e := setup(t)
-	e.join(t, "alice", toollibrary.MemberRoleSteward, 2)
-	e.addTool(t, "t1", "Drill", toollibrary.ToolCategoryPower)
-	e.addTool(t, "t2", "Tent", toollibrary.ToolCategoryCamping)
-	for _, id := range []string{"t1", "t2"} {
-		must(t, e.table.Update("PK", "LIB#lib1#TOOL#"+id).Range("SK", "TOOL").Set("'_v'", 0).Run(ctx))
-	}
-	must(t, e.st.Holds.Place(ctx, &toollibrary.Hold{LibraryID: "lib1", ToolID: "t2", MemberID: "alice", CodeHash: pickupCode("K3J-9QZ"),
-		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(48 * time.Hour)}))
-
-	// No hold on t1: the read finds none, and the write checks none appeared in the meantime.
-	if n := e.reads(func() { must(t, e.borrow(t, "l1", "t1", "alice", 2)) }); n != 2 {
-		t.Fatalf("Borrow made %d reads, want 2 (the tool and the hold)", n)
-	}
-	// alice's own hold on t2: the read finds it hers, and the write deletes it.
-	must(t, e.borrow(t, "l2", "t2", "alice", 2))
-	if e.raw(t, "LIB#lib1#TOOL#t2", "HOLD") != nil {
-		t.Fatal("the hold outlived the borrow that collected it")
-	}
-	for _, id := range []string{"t1", "t2"} {
-		if s := e.toolStatus(t, id); s != toollibrary.ToolStatusOnLoan {
-			t.Fatalf("%s status = %q", id, s)
-		}
-	}
-	if c := e.toolCounts(t); c != (toollibrary.ToolCounts{OnLoan: 2}) {
-		t.Fatalf("tool counts = %+v", c)
-	}
-	// Returning reads the tool the same way, and the counts come back.
-	must(t, e.st.Loans.Return(ctx, toollibrary.LoanKey{LibraryID: "lib1", ToolID: "t1", LoanID: "l1"}, toollibrary.LoanReturn{ReturnedAt: time.Now()}))
-	if c := e.toolCounts(t); c != (toollibrary.ToolCounts{Available: 1, OnLoan: 1}) {
-		t.Fatalf("tool counts after return = %+v", c)
-	}
 }
 
 // Barcodes are a set with one claim per element: a tool can carry several labels, and each label

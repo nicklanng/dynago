@@ -106,6 +106,21 @@
           "type": "string",
           "default": "ttl",
           "description": "Attribute holding the expiry time in epoch seconds."
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "The table generation. A change existing items don't fit (a new index, claim or counter, a changed key or field type) needs a new generation: a new table, named <name>-g<generation>, filled by the generated migration job."
+        },
+        "retain": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "uniqueItems": true,
+          "description": "Older generations whose tables stay declared in Terraform, for rollback. Remove one to delete its table."
         }
       }
     },

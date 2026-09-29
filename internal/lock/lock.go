@@ -1,10 +1,13 @@
-// Package lock keeps the history of each entity's storage shape in a checked-in lock file.
+// Package lock keeps the history of each entity's storage shape, and of the table generations, in
+// a checked-in lock file.
 //
-// The storage shape is everything that decides what items look like: fields and attribute
-// names, key templates, indexes, uniqueness claims and counters. Changing it requires bumping the
-// entity's version, so every stored item's _v says which shape wrote it. The history also tells
-// the generator which version introduced each derived item (counter, claim, copy): items written
-// before that version never contributed to it, so writes must not subtract their "contribution".
+// The storage shape is everything that decides what items look like: fields and attribute names,
+// key templates, indexes, uniqueness claims and counters. Changing it requires bumping the
+// entity's version. Within one table generation, a version may only change the shape in ways
+// existing items still fit: add an optional field, remove a field, or drop a derived item. Any
+// other change needs a new generation: a new table, filled by the generated migration job, with
+// the old one kept for rollback. The history tells the generator what the previous generation
+// stored, so the job can read it.
 package lock
 
 import (
@@ -15,16 +18,31 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 
+	"github.com/nicklanng/dynago"
+	"github.com/nicklanng/dynago/internal/gen/infra"
 	"github.com/nicklanng/dynago/internal/schema"
 )
 
 // File is the lock file.
 type File struct {
-	Dynago   int                 `json:"dynago"`
+	Dynago int `json:"dynago"`
+	// Generation is the table generation the schema was last generated at (0 in lock files
+	// written before generations existed, meaning 1).
+	Generation int `json:"generation,omitempty"`
+	// Tables records each generation's physical table, so Terraform can keep declaring the
+	// tables of retained generations.
+	Tables   []TableRecord       `json:"tables,omitempty"`
 	Entities map[string]*History `json:"entities"`
+}
+
+// TableRecord is one generation's physical table.
+type TableRecord struct {
+	Generation int              `json:"generation"`
+	Spec       dynago.TableSpec `json:"spec"`
 }
 
 // History is the recorded versions of one entity, oldest first.
@@ -34,10 +52,14 @@ type History struct {
 
 // Version is one recorded storage shape.
 type Version struct {
-	Version     int    `json:"version"`
+	Version int `json:"version"`
+	// Generation is the table generation the version was recorded in (0 meaning 1).
+	Generation  int    `json:"generation,omitempty"`
 	Fingerprint string `json:"fingerprint"`
 	Shape       Shape  `json:"shape"`
 }
+
+func (v Version) gen() int { return max(v.Generation, 1) }
 
 // Shape is the storage-relevant part of an entity definition.
 type Shape struct {
@@ -136,20 +158,35 @@ type Note struct {
 
 // Options adjusts Apply.
 type Options struct {
-	// NewHistory accepts entities above version 1 with no recorded history, starting their
-	// history at the current version. Only right when no stored item predates that version.
+	// NewHistory accepts a schema whose history the lock file doesn't have (entities above
+	// version 1, or a table above generation 1), starting the history there. Only right when the
+	// lock file was lost and nothing it would have recorded matters.
 	NewHistory bool
 }
 
-// Apply checks the model against the lock, records new versions, and sets the Since version of
-// every derived item on the model. It returns the updated lock (the input is not modified).
+// Apply checks the model against the lock and returns the updated lock (the input is not
+// modified). It sets the model's Previous generation for the migration job.
 func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
-	next := &File{Dynago: 1, Entities: map[string]*History{}}
-	for name, h := range prev.Entities {
-		next.Entities[name] = &History{Versions: append([]Version{}, h.Versions...)}
+	gen := m.Table.Generation
+	prevGen := prev.Generation
+	if prevGen == 0 && len(prev.Entities) > 0 {
+		prevGen = 1 // written before generations existed
 	}
+	next := &File{Dynago: 1, Generation: gen, Tables: slices.Clone(prev.Tables), Entities: map[string]*History{}}
+	for name, h := range prev.Entities {
+		next.Entities[name] = &History{Versions: slices.Clone(h.Versions)}
+	}
+	newGen := prevGen != 0 && gen != prevGen
 	var notes []Note
 	var errs []error
+	switch {
+	case prevGen == 0 && gen > 1 && !opts.NewHistory:
+		errs = append(errs, fmt.Errorf("table: it is at generation %d, but the lock file has no history. Restore %s from version control, or run with -new-history to start the history here", gen, m.Output.Lock))
+	case gen < prevGen:
+		errs = append(errs, fmt.Errorf("table: generation %d is older than the recorded generation %d; generations only go up", gen, prevGen))
+	case newGen && gen != prevGen+1:
+		errs = append(errs, fmt.Errorf("table: generation goes from %d to %d; it must go up by one, since the migration job copies from the previous generation", prevGen, gen))
+	}
 	for _, e := range m.Entities {
 		shape := ShapeOf(e, m.Table.TTLAttr)
 		fp := fingerprint(shape)
@@ -158,213 +195,111 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 			h = &History{}
 			next.Entities[e.Name] = h
 		}
-		if n := len(h.Versions); n > 0 {
-			last := h.Versions[n-1]
-			// Compare shapes, not the stored fingerprint, so a lock written by an older dynago
-			// (another fingerprint, or fields it didn't record yet) stays valid. A matching entry
-			// is refreshed in the current format.
-			if e.Version == last.Version && fingerprint(upgrade(last.Shape, shape)) == fp {
-				h.Versions[n-1] = Version{e.Version, fp, shape}
-				setSince(e, h)
-				continue
-			}
-			switch {
-			case e.Version < last.Version:
-				errs = append(errs, fmt.Errorf("entity %s: version %d is older than the recorded version %d; versions only go up", e.Name, e.Version, last.Version))
-				continue
-			case e.Version == last.Version:
-				errs = append(errs, fmt.Errorf("entity %s: its storage shape changed but its version is still %d. Set `version: %d` so stored items record which shape wrote them. Changes: %s",
-					e.Name, e.Version, e.Version+1, strings.Join(Diff(last.Shape, shape), "; ")))
-				continue
-			case e.Version > last.Version:
-				if bad := inPlaceChanges(last.Shape, shape); len(bad) > 0 {
-					errs = append(errs, fmt.Errorf("entity %s: %s", e.Name, strings.Join(bad, "; ")))
-					continue
-				}
-				changes := Diff(last.Shape, shape)
-				if len(changes) == 0 {
-					notes = append(notes, Note{e.Name, false, fmt.Sprintf("version %d → %d without a storage change", last.Version, e.Version)})
-				}
-				for _, c := range changes {
-					notes = append(notes, Note{e.Name, migrationNeeded(c), fmt.Sprintf("v%d → v%d: %s", last.Version, e.Version, c)})
-				}
-				h.Versions = append(h.Versions, Version{e.Version, fp, shape})
-			}
-		} else {
+		n := len(h.Versions)
+		if n == 0 {
 			if e.Version > 1 && !opts.NewHistory {
-				// The history decides which stored items count towards each counter, claim and
-				// copy. Starting it now would treat everything as introduced at this version, so
-				// deleting an older item would never release what it contributed.
-				errs = append(errs, fmt.Errorf("entity %s: it is at version %d, but the lock file has no history for it. Restore %s from version control. If no stored %s predates version %d (a new entity or a new table), run with -new-history to start its history there",
-					e.Name, e.Version, m.Output.Lock, e.Name, e.Version))
+				errs = append(errs, fmt.Errorf("entity %s: it is at version %d, but the lock file has no history for it. Restore %s from version control, or run with -new-history to start its history here",
+					e.Name, e.Version, m.Output.Lock))
 				continue
 			}
-			h.Versions = append(h.Versions, Version{e.Version, fp, shape})
+			h.Versions = append(h.Versions, Version{e.Version, gen, fp, shape})
+			continue
 		}
-		setSince(e, h)
+		last := h.Versions[n-1]
+		// Compare shapes, not the stored fingerprint, so a lock written by an older dynago
+		// (another fingerprint, or fields it didn't record yet) stays valid. A matching entry is
+		// refreshed in the current format.
+		same := fingerprint(upgrade(last.Shape, shape)) == fp
+		switch {
+		case e.Version < last.Version:
+			errs = append(errs, fmt.Errorf("entity %s: version %d is older than the recorded version %d; versions only go up", e.Name, e.Version, last.Version))
+		case e.Version == last.Version && same:
+			h.Versions[n-1] = Version{last.Version, last.gen(), fp, shape}
+		case e.Version == last.Version:
+			errs = append(errs, fmt.Errorf("entity %s: its storage shape changed but its version is still %d. Set `version: %d` so stored items record which shape wrote them. Changes: %s",
+				e.Name, e.Version, e.Version+1, strings.Join(texts(Changes(last.Shape, shape, e)), "; ")))
+		default:
+			changes := Changes(last.Shape, shape, e)
+			var misfits []string
+			for _, c := range changes {
+				if !c.Compatible {
+					misfits = append(misfits, c.Text)
+				}
+			}
+			if len(misfits) > 0 && !newGen {
+				errs = append(errs, fmt.Errorf("entity %s: existing items don't fit version %d: %s. Start a new table generation (`table.generation: %d`): the generated migration job copies every item into the new table, and the old one stays for rollback",
+					e.Name, e.Version, strings.Join(misfits, "; "), gen+1))
+				continue
+			}
+			if len(changes) == 0 {
+				notes = append(notes, Note{e.Name, false, fmt.Sprintf("version %d → %d without a storage change", last.Version, e.Version)})
+			}
+			for _, c := range changes {
+				notes = append(notes, Note{e.Name, !c.Compatible, fmt.Sprintf("v%d → v%d: %s", last.Version, e.Version, c.Text)})
+			}
+			h.Versions = append(h.Versions, Version{e.Version, gen, fp, shape})
+		}
 	}
-	errs = append(errs, lateLimits(m)...)
+	if newGen && len(errs) == 0 {
+		notes = append(notes, Note{"table", true, fmt.Sprintf("generation %d → %d: a new table, %s. Run the migration job to copy %s into it before this version serves; %s stays for rollback until you remove it",
+			prevGen, gen, m.Table.GenerationTable(gen), m.Table.GenerationTable(prevGen), m.Table.GenerationTable(prevGen))})
+	}
+	// Record this generation's table, and check retained ones are known.
+	spec := infra.Spec(m)
+	next.Tables = slices.DeleteFunc(next.Tables, func(t TableRecord) bool { return t.Generation == gen })
+	next.Tables = append(next.Tables, TableRecord{gen, spec})
+	sort.Slice(next.Tables, func(i, j int) bool { return next.Tables[i].Generation < next.Tables[j].Generation })
+	for _, g := range m.Table.Retain {
+		if next.Table(g) == nil {
+			errs = append(errs, fmt.Errorf("table.retain: the lock file has no record of generation %d's table", g))
+		}
+	}
 	if len(errs) > 0 {
 		return nil, nil, errors.Join(errs...)
 	}
+	m.Previous = previous(m, next)
 	return next, notes, nil
 }
 
-// lateLimits refuses counter values with caller-supplied limits added after version 1 to an
-// entity that other writes change through requires. Items older than the value start counting
-// when they are next rewritten, so such a change can grow the value, but only the entity's own
-// writes take limits: the other write would fail with ErrLimitRequired until a backfill.
-func lateLimits(m *schema.Model) []error {
-	var errs []error
+// Table returns the record of a generation's table, or nil.
+func (f *File) Table(gen int) *dynago.TableSpec {
+	for i := range f.Tables {
+		if f.Tables[i].Generation == gen {
+			return &f.Tables[i].Spec
+		}
+	}
+	return nil
+}
+
+// previous describes the generation before the current one: each entity's last shape in it.
+// Entities new in the current generation have none.
+func previous(m *schema.Model, f *File) *schema.Previous {
+	gen := m.Table.Generation
+	if gen <= 1 {
+		return nil
+	}
+	p := &schema.Previous{Generation: gen - 1, Entities: map[string][]schema.PreviousField{}}
 	for _, e := range m.Entities {
-		for _, w := range e.Writes {
-			for _, rq := range w.Requires {
-				if rq.Target == nil || len(rq.Sets) == 0 {
-					continue
-				}
-				for _, c := range rq.Target.Counters {
-					for _, v := range c.Values {
-						if v.LimitArg && v.Since > 1 && schema.CanGrow(rq.TargetWrite(), v, true) {
-							errs = append(errs, fmt.Errorf("entity %s: counter value %s.%s (limit: arg) is newer than version 1, and %s.%s changes %s items through requires, where no limit can be given: items from before version %d start counting when changed, so %s.%s would fail with ErrLimitRequired. Use a constant limit instead",
-								rq.Target.Name, c.Name, v.Name, e.Name, w.Name, rq.Target.Name, v.Since, e.Name, w.Name))
-						}
-					}
-				}
-			}
-		}
-	}
-	return errs
-}
-
-// setSince finds, for each derived item, the oldest version from which its definition has been
-// unchanged up to now.
-func setSince(e *schema.Entity, h *History) {
-	since := func(key string) int {
-		v := e.Version
-		for i := len(h.Versions) - 1; i >= 0; i-- {
-			if !derivedKeys(h.Versions[i].Shape)[key] {
-				break
-			}
-			v = h.Versions[i].Version
-		}
-		return v
-	}
-	shape := ShapeOf(e, "") // only its derived items matter here
-	for i, ix := range e.Indexes {
-		ix.Since = since(indexKey(shape.Indexes[i]))
-	}
-	for i, u := range e.Uniques {
-		u.Since = since(uniqueKey(shape.Uniques[i]))
-	}
-	for i, c := range e.Counters {
-		cs := shape.Counters[i]
-		c.Since = since(counterKey(cs))
-		for j, v := range c.Values {
-			v.Since = since(counterValueKey(cs, cs.Values[j]))
-		}
-	}
-	// An item written before a limited value existed starts contributing the next time any
-	// read-first write rewrites it, so every read-first write must take that value's limit.
-	for _, w := range e.Writes {
-		if !w.ReadFirst {
+		h := f.Entities[e.Name]
+		if h == nil {
 			continue
 		}
-		for _, c := range e.Counters {
-			for _, v := range c.Values {
-				if v.LimitArg && v.Since > 1 && schema.CanGrow(w, v, true) && !hasValue(w.Limits, v) {
-					w.Limits = append(w.Limits, v)
-				}
+		var last *Version
+		for i := range h.Versions {
+			if h.Versions[i].gen() < gen {
+				last = &h.Versions[i]
 			}
 		}
-	}
-}
-
-func hasValue(vs []*schema.CounterValue, v *schema.CounterValue) bool {
-	for _, x := range vs {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
-// inPlaceChanges lists changes to derived items that existing items would be stranded by. Code
-// only knows the current definitions, so it cannot release a copy, claim or counter contribution
-// that an older item made under a different definition. Such changes must be made as a new
-// derived item under a new name (and the old one removed).
-func inPlaceChanges(a, b Shape) []string {
-	var out []string
-	oldCopies := map[string]IndexShape{}
-	for _, ix := range a.Indexes {
-		if ix.Strategy == string(schema.StrategyCopy) {
-			oldCopies[ix.Name] = ix
-		}
-	}
-	for _, ix := range b.Indexes {
-		if old, ok := oldCopies[ix.Name]; ok && mustJSON(old) != mustJSON(ix) {
-			out = append(out, fmt.Sprintf("copy index %s cannot change in place (older items' copies would never be removed); add it under a new name and remove the old one", ix.Name))
-		}
-	}
-	oldUniques := map[string]UniqueShape{}
-	for _, u := range a.Uniques {
-		oldUniques[u.Name] = u
-	}
-	for _, u := range b.Uniques {
-		if old, ok := oldUniques[u.Name]; ok && mustJSON(old) != mustJSON(u) {
-			out = append(out, fmt.Sprintf("unique claim %s cannot change in place (older items' claims would never be released); add it under a new name and remove the old one", u.Name))
-		}
-	}
-	oldCounters := map[string]CounterShape{}
-	for _, c := range a.Counters {
-		oldCounters[c.Name] = c
-	}
-	for _, c := range b.Counters {
-		old, ok := oldCounters[c.Name]
-		if !ok {
+		if last == nil {
 			continue
 		}
-		if old.PK != c.PK || old.SK != c.SK || old.Shards != c.Shards {
-			out = append(out, fmt.Sprintf("counter %s cannot change its keys or shards in place (older items' contributions are on the old counter items); add a new counter and remove the old one", c.Name))
-			continue
+		var fields []schema.PreviousField
+		for _, fs := range last.Shape.Fields {
+			fields = append(fields, schema.PreviousField{Name: fs.Name, Attr: fs.Attr, Type: schema.FieldType(fs.Type), Values: fs.Values})
 		}
-		oldValues := map[string]CounterAttr{}
-		for _, v := range old.Values {
-			oldValues[v.Name] = v
-		}
-		for _, v := range c.Values {
-			if ov, ok := oldValues[v.Name]; ok && mustJSON(ov) != mustJSON(v) {
-				out = append(out, fmt.Sprintf("counter value %s.%s cannot change what it counts in place (older items contributed under the old definition); add a value with a new name", c.Name, v.Name))
-			}
-		}
+		p.Entities[e.Name] = fields
 	}
-	return out
-}
-
-func derivedKeys(s Shape) map[string]bool {
-	out := map[string]bool{}
-	for _, ix := range s.Indexes {
-		out[indexKey(ix)] = true
-	}
-	for _, u := range s.Uniques {
-		out[uniqueKey(u)] = true
-	}
-	for _, c := range s.Counters {
-		out[counterKey(c)] = true
-		for _, v := range c.Values {
-			out[counterValueKey(c, v)] = true
-		}
-	}
-	return out
-}
-
-func indexKey(x IndexShape) string   { return "index:" + mustJSON(x) }
-func uniqueKey(x UniqueShape) string { return "unique:" + mustJSON(x) }
-func counterKey(x CounterShape) string {
-	return "counter:" + mustJSON([]any{x.Name, x.PK, x.SK, x.Shards})
-}
-
-func counterValueKey(c CounterShape, v CounterAttr) string {
-	return counterKey(c) + ":" + mustJSON(v)
+	return p
 }
 
 // ShapeOf extracts the storage shape of an entity.
@@ -415,44 +350,108 @@ func preds(ps []*schema.Pred) []string {
 	return out
 }
 
-// Diff describes the changes from one shape to another, one sentence per change.
-func Diff(a, b Shape) []string {
-	var out []string
-	if a.PK != b.PK || a.SK != b.SK {
-		out = append(out, fmt.Sprintf("primary key changed from %s / %s to %s / %s (existing items stay under the old key: needs a key rewrite migration)", a.PK, a.SK, b.PK, b.SK))
+// Change is one difference between two versions of a shape. Compatible changes leave existing
+// items valid, so they can happen within a table generation; others need a new generation.
+type Change struct {
+	Text       string
+	Compatible bool
+}
+
+func texts(cs []Change) []string {
+	out := make([]string, len(cs))
+	for i, c := range cs {
+		out[i] = c.Text
 	}
-	if a.TTL != b.TTL {
-		out = append(out, fmt.Sprintf("ttl field changed from %q to %q", a.TTL, b.TTL))
-	}
-	if a.TTLAttr != "" && b.TTLAttr != "" && a.TTLAttr != b.TTLAttr {
-		out = append(out, fmt.Sprintf("table TTL attribute changed from %q to %q (existing items keep their expiry in the old attribute, so they never expire and keep their keys taken: needs a rewrite migration)", a.TTLAttr, b.TTLAttr))
-	}
-	out = append(out, diffNamed("field", toMap(a.Fields, func(f FieldShape) string { return f.Name }), toMap(b.Fields, func(f FieldShape) string { return f.Name }),
-		"", "existing items keep the old attribute or type: needs a rewrite migration", nil)...)
-	const indexNote = "existing items get their entry when next written; a backfill adds the rest"
-	out = append(out, diffNamed("index", toMap(a.Indexes, func(x IndexShape) string { return x.Name }), toMap(b.Indexes, func(x IndexShape) string { return x.Name }),
-		indexNote, indexNote, gsiRebuild(a.Indexes, b.Indexes))...)
-	const claimNote = "existing items are not claimed until next written: needs a backfill before uniqueness holds"
-	out = append(out, diffNamed("unique claim", toMap(a.Uniques, func(x UniqueShape) string { return x.Name }), toMap(b.Uniques, func(x UniqueShape) string { return x.Name }),
-		claimNote, claimNote, nil)...)
-	const counterNote = "existing items are not counted until next written: needs a backfill before the counter is complete"
-	out = append(out, diffNamed("counter", toMap(a.Counters, func(x CounterShape) string { return x.Name }), toMap(b.Counters, func(x CounterShape) string { return x.Name }),
-		counterNote, "new values count only items written from this version: needs a backfill before they are complete", nil)...)
 	return out
 }
 
-func removedNote(kind string) string {
-	switch kind {
-	case "unique claim":
-		return "claims made by existing items stay behind and keep their values taken: needs a cleanup migration"
-	case "index":
-		return "existing items keep their entries or copies until rewritten; a cleanup migration removes them"
+// Changes describes the changes from shape a to shape b of entity e, one per change.
+func Changes(a, b Shape, e *schema.Entity) []Change {
+	var out []Change
+	add := func(compatible bool, format string, args ...any) {
+		out = append(out, Change{fmt.Sprintf(format, args...), compatible})
 	}
-	return ""
+	if a.PK != b.PK || a.SK != b.SK {
+		add(false, "primary key changed from %s / %s to %s / %s", a.PK, a.SK, b.PK, b.SK)
+	}
+	if a.TTL != b.TTL {
+		add(false, "ttl field changed from %q to %q", a.TTL, b.TTL)
+	}
+	if a.TTLAttr != "" && b.TTLAttr != "" && a.TTLAttr != b.TTLAttr {
+		add(false, "table TTL attribute changed from %q to %q (existing items keep their expiry in the old one)", a.TTLAttr, b.TTLAttr)
+	}
+	// Fields.
+	oldFields := map[string]FieldShape{}
+	for _, f := range a.Fields {
+		oldFields[f.Name] = f
+	}
+	for _, f := range b.Fields {
+		old, had := oldFields[f.Name]
+		delete(oldFields, f.Name)
+		switch {
+		case !had && e != nil && e.Field(f.Name) != nil && e.Field(f.Name).Required:
+			add(false, "field %s added as required (existing items don't have it)", f.Name)
+		case !had:
+			add(true, "field %s added", f.Name)
+		case old.Attr != f.Attr || old.Type != f.Type:
+			add(false, "field %s changed from %s %s to %s %s (existing items hold the old one)", f.Name, old.Type, old.Attr, f.Type, f.Attr)
+		case mustJSON(old.Values) != mustJSON(f.Values):
+			var dropped []string
+			for _, v := range old.Values {
+				if !slices.Contains(f.Values, v) {
+					dropped = append(dropped, v)
+				}
+			}
+			if len(dropped) > 0 {
+				add(false, "enum %s no longer has %s (existing items may hold them)", f.Name, strings.Join(dropped, ", "))
+			} else {
+				add(true, "enum %s gained values", f.Name)
+			}
+		}
+	}
+	for _, name := range sortedKeys(oldFields) {
+		add(true, "field %s removed (existing items keep the attribute until the next generation)", name)
+	}
+	// Derived items: existing items have none of a new or changed one, but a dropped one does no
+	// harm (its entries, claims or counts stay, unused, until the next generation).
+	derived := func(kind string, a, b map[string]string) {
+		for _, name := range sortedKeys(b) {
+			switch av, had := a[name]; {
+			case !had:
+				add(false, "%s %s added (existing items don't have it)", kind, name)
+			case av != b[name]:
+				add(false, "%s %s changed (existing items have the old one)", kind, name)
+			}
+		}
+		for _, name := range sortedKeys(a) {
+			if _, has := b[name]; !has {
+				add(true, "%s %s removed (what existing items have of it stays, unused, until the next generation)", kind, name)
+			}
+		}
+	}
+	derived("index", toMap(a.Indexes, func(x IndexShape) string { return x.Name }), toMap(b.Indexes, func(x IndexShape) string { return x.Name }))
+	derived("unique claim", toMap(a.Uniques, func(x UniqueShape) string { return x.Name }), toMap(b.Uniques, func(x UniqueShape) string { return x.Name }))
+	// Counter values are compared one by one, so dropping a value is compatible.
+	counters := func(s Shape) map[string]string {
+		out := map[string]string{}
+		for _, c := range s.Counters {
+			for _, v := range c.Values {
+				out[c.Name+"."+v.Name] = mustJSON([]any{c.PK, c.SK, c.Shards, v})
+			}
+		}
+		return out
+	}
+	derived("counter value", counters(a), counters(b))
+	return out
 }
 
-func migrationNeeded(change string) bool {
-	return strings.Contains(change, "needs a")
+func sortedKeys[V any](m map[string]V) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func toMap[T any](xs []T, key func(T) string) map[string]string {
@@ -470,63 +469,6 @@ func upgrade(old, now Shape) Shape {
 		old.TTLAttr = now.TTLAttr
 	}
 	return old
-}
-
-// gsiRebuild returns, for each GSI whose keys and where are unchanged but whose projection
-// changed, what that change actually means. It returns nil for none.
-func gsiRebuild(a, b []IndexShape) map[string]string {
-	out := map[string]string{}
-	before := map[string]IndexShape{}
-	for _, x := range a {
-		before[x.Name] = x
-	}
-	for _, y := range b {
-		x, ok := before[y.Name]
-		if !ok || x.Strategy != "gsi" || y.Strategy != "gsi" || x.PK != y.PK || x.SK != y.SK || mustJSON(x.Where) != mustJSON(y.Where) {
-			continue
-		}
-		if x.Projection != y.Projection || mustJSON(x.Project) != mustJSON(y.Project) {
-			out[y.Name] = "DynamoDB cannot change a GSI's projection: the index is deleted and re-created (Terraform replaces it), and queries through it fail until DynamoDB has rebuilt it from the table. No data backfill"
-		}
-	}
-	return out
-}
-
-func diffNamed(kind string, a, b map[string]string, addedNote, changedNote string, changedNotes map[string]string) []string {
-	var out []string
-	names := map[string]bool{}
-	for n := range a {
-		names[n] = true
-	}
-	for n := range b {
-		names[n] = true
-	}
-	sorted := make([]string, 0, len(names))
-	for n := range names {
-		sorted = append(sorted, n)
-	}
-	sort.Strings(sorted)
-	note := func(n string) string {
-		if n == "" {
-			return ""
-		}
-		return " (" + n + ")"
-	}
-	for _, n := range sorted {
-		av, inA := a[n]
-		bv, inB := b[n]
-		switch {
-		case !inA:
-			out = append(out, fmt.Sprintf("%s %s added%s", kind, n, note(addedNote)))
-		case !inB:
-			out = append(out, fmt.Sprintf("%s %s removed%s", kind, n, note(removedNote(kind))))
-		case av != bv && changedNotes[n] != "":
-			out = append(out, fmt.Sprintf("%s %s changed%s", kind, n, note(changedNotes[n])))
-		case av != bv:
-			out = append(out, fmt.Sprintf("%s %s changed%s", kind, n, note(changedNote)))
-		}
-	}
-	return out
 }
 
 // fingerprint identifies a shape regardless of declaration order: reordering fields, indexes,

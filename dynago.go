@@ -52,9 +52,6 @@ var (
 	ErrInvalidKey = errors.New("dynago: invalid key")
 	// ErrFieldRequired means a write left a field declared `required: true` at its zero value.
 	ErrFieldRequired = errors.New("dynago: required field is empty")
-	// ErrNewerSchema means the item was written by code at a newer schema version than this code;
-	// rewriting it would drop what the newer version stored. Deploy the new version everywhere.
-	ErrNewerSchema = errors.New("dynago: item was written by a newer schema version")
 	// ErrLimitRequired means a write that takes a caller-supplied limit was not given one.
 	ErrLimitRequired = errors.New("dynago: limit required")
 	// ErrSameItemTwice means a write would touch one item twice in a transaction, which DynamoDB

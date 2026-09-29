@@ -35,7 +35,7 @@ func TestGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tf, err := Terraform(m, "golden.dynago.yaml")
+	tf, err := Terraform(m, "golden.dynago.yaml", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

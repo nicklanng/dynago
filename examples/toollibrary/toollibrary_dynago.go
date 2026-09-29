@@ -12,6 +12,16 @@ import (
 	"github.com/nicklanng/dynago"
 )
 
+// Generation is the table generation this code reads and writes: its table is
+// <base>-g1 (see TableName). A change existing items don't fit starts a new generation,
+// which the migration job fills from the previous one.
+const Generation = 1
+
+// TableName returns the name of this generation's table for a base name, such as "toollibrary".
+func TableName(base string) string {
+	return base + "-g1"
+}
+
 // TableSpec is the physical shape of the toollibrary table: base key PK/SK, its global secondary
 // indexes and its TTL attribute. See also the generated Terraform.
 var TableSpec = dynago.TableSpec{
@@ -71,6 +81,7 @@ type libraryLoaded struct {
 	rev      int64
 	v        int
 	snapshot Library
+	raw      dynamo.Item // as stored, including attributes this code doesn't know
 }
 
 // Version identifies the stored state e was read at, for optimistic concurrency: pass it back
@@ -128,7 +139,12 @@ type libraryItem struct {
 	T   string `dynamo:"_t"`
 	V   int    `dynamo:"_v"`
 	Rev int64  `dynamo:"_rev"`
+
+	raw dynamo.Item // as read, for writes to keep attributes this code doesn't know
 }
+
+// libraryKnown is every attribute this code writes on Library items.
+var libraryKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "libraryId": true, "name": true, "slug": true, "openedAt": true}
 
 func libraryToItem(e *Library, key dynago.Key, rev int64) *libraryItem {
 	it := &libraryItem{Library: *e, PK: key.PK, SK: key.SK, T: "Library", V: libraryVersion, Rev: rev}
@@ -136,9 +152,7 @@ func libraryToItem(e *Library, key dynago.Key, rev int64) *libraryItem {
 }
 
 // libraryDerived returns the counter contributions, claims and copies that exist because of e.
-// v is the schema version e was written at: items written before a derived item was
-// introduced do not contribute to it.
-func libraryDerived(e *Library, owner dynago.Key, v int) []dynago.Derived {
+func libraryDerived(e *Library, owner dynago.Key) []dynago.Derived {
 	_ = owner // only sharded counters use it
 	var d []dynago.Derived
 	// unique Slug
@@ -173,7 +187,8 @@ func libraryDecode(raw dynamo.Item) (*libraryItem, error) {
 	if err := dynamo.UnmarshalItem(raw, &it); err != nil {
 		return nil, err
 	}
-	it.loaded = &libraryLoaded{rev: it.Rev, v: it.V, snapshot: it.clone()}
+	it.raw = raw
+	it.loaded = &libraryLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
 
@@ -224,7 +239,7 @@ func (s *LibraryStore) guard(key dynago.Key, o dynago.WriteOptions, required boo
 	if required && expect == 0 {
 		return dynago.Guard{}, dynago.ErrVersionRequired
 	}
-	return dynago.Guard{ExpectRev: expect, Version: libraryVersion, NotFound: ErrLibraryNotFound}, nil
+	return dynago.Guard{ExpectRev: expect, NotFound: ErrLibraryNotFound}, nil
 }
 
 // start returns the state a read-modify-write starts from: the entity passed with dynago.From
@@ -243,7 +258,7 @@ func (s *LibraryStore) start(ctx context.Context, key dynago.Key, o dynago.Write
 		if expect != 0 && expect != from.loaded.rev {
 			return nil, false, dynago.ErrVersionMismatch
 		}
-		return &libraryItem{Library: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v}, true, nil
+		return &libraryItem{Library: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v, raw: from.loaded.raw}, true, nil
 	}
 	if required && expect == 0 {
 		return nil, false, dynago.ErrVersionRequired
@@ -342,7 +357,7 @@ func (s *LibraryStore) Open(ctx context.Context, e *Library) error {
 	return dynago.Retry(ctx, func() error {
 		put := s.t.Put(libraryToItem(e, key, rev)).If("attribute_not_exists($)", "PK")
 		ops := []dynago.Op{dynago.CreateOp(key, put, ErrLibraryExists, rev)}
-		changes := []dynago.Change{{Owner: key, After: libraryDerived(e, key, libraryVersion)}}
+		changes := []dynago.Change{{Owner: key, After: libraryDerived(e, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -410,14 +425,16 @@ func (s *LibraryStore) ChangeSlug(ctx context.Context, k LibraryKey, v LibraryCh
 		if err != nil {
 			return err
 		}
-		if it.V > libraryVersion {
-			return fmt.Errorf("%w: Library at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, libraryVersion)
-		}
 		before := &it.Library
 		after := before.clone()
 		after.Slug = v.Slug
-		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(libraryToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", libraryVersion), dynago.ErrStale)}
-		changes := []dynago.Change{{Owner: key, Before: libraryDerived(before, key, it.V), After: libraryDerived(&after, key, libraryVersion)}}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, libraryKnown, libraryToItem(&after, key, it.Rev+1))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: libraryDerived(before, key), After: libraryDerived(&after, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -474,6 +491,7 @@ type memberLoaded struct {
 	rev      int64
 	v        int
 	snapshot Member
+	raw      dynamo.Item // as stored, including attributes this code doesn't know
 }
 
 // Version identifies the stored state e was read at, for optimistic concurrency: pass it back
@@ -539,14 +557,19 @@ const memberVersion = 1
 
 type memberItem struct {
 	Member
-	PK       string `dynamo:"PK"`
-	SK       string `dynamo:"SK"`
-	T        string `dynamo:"_t"`
-	V        int    `dynamo:"_v"`
-	Rev      int64  `dynamo:"_rev"`
-	ByNamePK string `dynamo:"ByNamePK,omitempty"`
-	ByNameSK string `dynamo:"ByNameSK,omitempty"`
+	PK  string `dynamo:"PK"`
+	SK  string `dynamo:"SK"`
+	T   string `dynamo:"_t"`
+	V   int    `dynamo:"_v"`
+	Rev int64  `dynamo:"_rev"`
+
+	raw      dynamo.Item // as read, for writes to keep attributes this code doesn't know
+	ByNamePK string      `dynamo:"ByNamePK,omitempty"`
+	ByNameSK string      `dynamo:"ByNameSK,omitempty"`
 }
+
+// memberKnown is every attribute this code writes on Member items.
+var memberKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "libraryId": true, "memberId": true, "email": true, "name": true, "phone": true, "role": true, "status": true, "maxLoans": true, "joinedAt": true, "ByNamePK": true, "ByNameSK": true}
 
 func memberToItem(e *Member, key dynago.Key, rev int64) *memberItem {
 	it := &memberItem{Member: *e, PK: key.PK, SK: key.SK, T: "Member", V: memberVersion, Rev: rev}
@@ -583,9 +606,7 @@ type MemberCountsKey struct {
 }
 
 // memberDerived returns the counter contributions, claims and copies that exist because of e.
-// v is the schema version e was written at: items written before a derived item was
-// introduced do not contribute to it.
-func memberDerived(e *Member, owner dynago.Key, v int) []dynago.Derived {
+func memberDerived(e *Member, owner dynago.Key) []dynago.Derived {
 	_ = owner // only sharded counters use it
 	var d []dynago.Derived
 	// counter MemberCounts
@@ -633,7 +654,8 @@ func memberDecode(raw dynamo.Item) (*memberItem, error) {
 	if err := dynamo.UnmarshalItem(raw, &it); err != nil {
 		return nil, err
 	}
-	it.loaded = &memberLoaded{rev: it.Rev, v: it.V, snapshot: it.clone()}
+	it.raw = raw
+	it.loaded = &memberLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
 
@@ -684,7 +706,7 @@ func (s *MemberStore) guard(key dynago.Key, o dynago.WriteOptions, required bool
 	if required && expect == 0 {
 		return dynago.Guard{}, dynago.ErrVersionRequired
 	}
-	return dynago.Guard{ExpectRev: expect, Version: memberVersion, NotFound: ErrMemberNotFound}, nil
+	return dynago.Guard{ExpectRev: expect, NotFound: ErrMemberNotFound}, nil
 }
 
 // start returns the state a read-modify-write starts from: the entity passed with dynago.From
@@ -703,7 +725,7 @@ func (s *MemberStore) start(ctx context.Context, key dynago.Key, o dynago.WriteO
 		if expect != 0 && expect != from.loaded.rev {
 			return nil, false, dynago.ErrVersionMismatch
 		}
-		return &memberItem{Member: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v}, true, nil
+		return &memberItem{Member: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v, raw: from.loaded.raw}, true, nil
 	}
 	if required && expect == 0 {
 		return nil, false, dynago.ErrVersionRequired
@@ -803,7 +825,7 @@ func (s *MemberStore) Join(ctx context.Context, e *Member) error {
 	return dynago.Retry(ctx, func() error {
 		put := s.t.Put(memberToItem(e, key, rev)).If("attribute_not_exists($)", "PK")
 		ops := []dynago.Op{dynago.CreateOp(key, put, ErrMemberExists, rev)}
-		changes := []dynago.Change{{Owner: key, After: memberDerived(e, key, memberVersion)}}
+		changes := []dynago.Change{{Owner: key, After: memberDerived(e, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -863,9 +885,6 @@ func (s *MemberStore) UpdateProfile(ctx context.Context, k MemberKey, v MemberUp
 		if err != nil {
 			return err
 		}
-		if it.V > memberVersion {
-			return fmt.Errorf("%w: Member at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, memberVersion)
-		}
 		before := &it.Member
 		after := before.clone()
 		if v.Name != nil {
@@ -874,8 +893,13 @@ func (s *MemberStore) UpdateProfile(ctx context.Context, k MemberKey, v MemberUp
 		if v.Phone != nil {
 			after.Phone = *v.Phone
 		}
-		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(memberToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", memberVersion), dynago.ErrStale)}
-		changes := []dynago.Change{{Owner: key, Before: memberDerived(before, key, it.V), After: memberDerived(&after, key, memberVersion)}}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: memberDerived(before, key), After: memberDerived(&after, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -932,17 +956,19 @@ func (s *MemberStore) Suspend(ctx context.Context, k MemberKey, opts ...dynago.W
 		if err != nil {
 			return err
 		}
-		if it.V > memberVersion {
-			return fmt.Errorf("%w: Member at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, memberVersion)
-		}
 		before := &it.Member
 		if before.Status != MemberStatusActive {
 			return ErrMemberSuspendPrecondition
 		}
 		after := before.clone()
 		after.Status = MemberStatusSuspended
-		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(memberToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", memberVersion), dynago.ErrStale)}
-		changes := []dynago.Change{{Owner: key, Before: memberDerived(before, key, it.V), After: memberDerived(&after, key, memberVersion)}}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: memberDerived(before, key), After: memberDerived(&after, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -972,17 +998,19 @@ func (s *MemberStore) Reinstate(ctx context.Context, k MemberKey, opts ...dynago
 		if err != nil {
 			return err
 		}
-		if it.V > memberVersion {
-			return fmt.Errorf("%w: Member at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, memberVersion)
-		}
 		before := &it.Member
 		if before.Status != MemberStatusSuspended {
 			return ErrMemberReinstatePrecondition
 		}
 		after := before.clone()
 		after.Status = MemberStatusActive
-		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(memberToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", memberVersion), dynago.ErrStale)}
-		changes := []dynago.Change{{Owner: key, Before: memberDerived(before, key, it.V), After: memberDerived(&after, key, memberVersion)}}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: memberDerived(before, key), After: memberDerived(&after, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -1012,17 +1040,19 @@ func (s *MemberStore) MakeSteward(ctx context.Context, k MemberKey, opts ...dyna
 		if err != nil {
 			return err
 		}
-		if it.V > memberVersion {
-			return fmt.Errorf("%w: Member at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, memberVersion)
-		}
 		before := &it.Member
 		if before.Role != MemberRoleMember {
 			return ErrMemberMakeStewardPrecondition
 		}
 		after := before.clone()
 		after.Role = MemberRoleSteward
-		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(memberToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", memberVersion), dynago.ErrStale)}
-		changes := []dynago.Change{{Owner: key, Before: memberDerived(before, key, it.V), After: memberDerived(&after, key, memberVersion)}}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: memberDerived(before, key), After: memberDerived(&after, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -1051,17 +1081,19 @@ func (s *MemberStore) StepDown(ctx context.Context, k MemberKey, opts ...dynago.
 		if err != nil {
 			return err
 		}
-		if it.V > memberVersion {
-			return fmt.Errorf("%w: Member at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, memberVersion)
-		}
 		before := &it.Member
 		if before.Role != MemberRoleSteward {
 			return ErrMemberStepDownPrecondition
 		}
 		after := before.clone()
 		after.Role = MemberRoleMember
-		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(memberToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", memberVersion), dynago.ErrStale)}
-		changes := []dynago.Change{{Owner: key, Before: memberDerived(before, key, it.V), After: memberDerived(&after, key, memberVersion)}}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, memberKnown, memberToItem(&after, key, it.Rev+1))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: memberDerived(before, key), After: memberDerived(&after, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -1094,12 +1126,9 @@ func (s *MemberStore) Leave(ctx context.Context, k MemberKey, opts ...dynago.Wri
 		if err != nil {
 			return err
 		}
-		if it.V > memberVersion {
-			return fmt.Errorf("%w: Member at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, memberVersion)
-		}
-		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", memberVersion), dynago.ErrStale)}
+		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
 		e := &it.Member
-		changes := []dynago.Change{{Owner: key, Before: memberDerived(&it.Member, key, it.V)}}
+		changes := []dynago.Change{{Owner: key, Before: memberDerived(&it.Member, key)}}
 		// requires MemberLoans
 		if e.LibraryID == "" || e.MemberID == "" {
 			return fmt.Errorf("%w: Member.Leave requires the MemberLoans, keyed by libraryId and memberId", dynago.ErrFieldRequired)
@@ -1168,6 +1197,7 @@ type toolLoaded struct {
 	rev      int64
 	v        int
 	snapshot Tool
+	raw      dynamo.Item // as stored, including attributes this code doesn't know
 }
 
 // Version identifies the stored state e was read at, for optimistic concurrency: pass it back
@@ -1237,14 +1267,19 @@ const toolVersion = 2
 
 type toolItem struct {
 	Tool
-	PK           string `dynamo:"PK"`
-	SK           string `dynamo:"SK"`
-	T            string `dynamo:"_t"`
-	V            int    `dynamo:"_v"`
-	Rev          int64  `dynamo:"_rev"`
-	ByCategoryPK string `dynamo:"ByCategoryPK,omitempty"`
-	ByCategorySK string `dynamo:"ByCategorySK,omitempty"`
+	PK  string `dynamo:"PK"`
+	SK  string `dynamo:"SK"`
+	T   string `dynamo:"_t"`
+	V   int    `dynamo:"_v"`
+	Rev int64  `dynamo:"_rev"`
+
+	raw          dynamo.Item // as read, for writes to keep attributes this code doesn't know
+	ByCategoryPK string      `dynamo:"ByCategoryPK,omitempty"`
+	ByCategorySK string      `dynamo:"ByCategorySK,omitempty"`
 }
+
+// toolKnown is every attribute this code writes on Tool items.
+var toolKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "libraryId": true, "toolId": true, "name": true, "category": true, "status": true, "manual": true, "tags": true, "serialNumber": true, "barcodes": true, "addedAt": true, "ByCategoryPK": true, "ByCategorySK": true}
 
 func toolToItem(e *Tool, key dynago.Key, rev int64) *toolItem {
 	it := &toolItem{Tool: *e, PK: key.PK, SK: key.SK, T: "Tool", V: toolVersion, Rev: rev}
@@ -1281,9 +1316,7 @@ type ToolCountsKey struct {
 }
 
 // toolDerived returns the counter contributions, claims and copies that exist because of e.
-// v is the schema version e was written at: items written before a derived item was
-// introduced do not contribute to it.
-func toolDerived(e *Tool, owner dynago.Key, v int) []dynago.Derived {
+func toolDerived(e *Tool, owner dynago.Key) []dynago.Derived {
 	_ = owner // only sharded counters use it
 	var d []dynago.Derived
 	// counter ToolCounts
@@ -1304,7 +1337,7 @@ func toolDerived(e *Tool, owner dynago.Key, v int) []dynago.Derived {
 		d = append(d, dynago.Derived{Kind: dynago.KindClaim, Key: dynago.Key{PK: "UNIQUE#Tool.Serial#" + e.LibraryID + "#" + e.SerialNumber, SK: "UNIQUE"}, Type: "Tool.Serial", TakenErr: ErrToolSerialTaken})
 	}
 	// unique Barcode
-	if v >= 2 && e.LibraryID != "" {
+	if e.LibraryID != "" {
 		for _, elem := range e.Barcodes {
 			if elem != "" {
 				d = append(d, dynago.Derived{Kind: dynago.KindClaim, Key: dynago.Key{PK: "UNIQUE#Tool.Barcode#" + e.LibraryID + "#" + elem, SK: "UNIQUE"}, Type: "Tool.Barcode", TakenErr: ErrToolBarcodeTaken})
@@ -1339,7 +1372,8 @@ func toolDecode(raw dynamo.Item) (*toolItem, error) {
 	if err := dynamo.UnmarshalItem(raw, &it); err != nil {
 		return nil, err
 	}
-	it.loaded = &toolLoaded{rev: it.Rev, v: it.V, snapshot: it.clone()}
+	it.raw = raw
+	it.loaded = &toolLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
 
@@ -1390,7 +1424,7 @@ func (s *ToolStore) guard(key dynago.Key, o dynago.WriteOptions, required bool) 
 	if required && expect == 0 {
 		return dynago.Guard{}, dynago.ErrVersionRequired
 	}
-	return dynago.Guard{ExpectRev: expect, Version: toolVersion, NotFound: ErrToolNotFound}, nil
+	return dynago.Guard{ExpectRev: expect, NotFound: ErrToolNotFound}, nil
 }
 
 // start returns the state a read-modify-write starts from: the entity passed with dynago.From
@@ -1409,7 +1443,7 @@ func (s *ToolStore) start(ctx context.Context, key dynago.Key, o dynago.WriteOpt
 		if expect != 0 && expect != from.loaded.rev {
 			return nil, false, dynago.ErrVersionMismatch
 		}
-		return &toolItem{Tool: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v}, true, nil
+		return &toolItem{Tool: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v, raw: from.loaded.raw}, true, nil
 	}
 	if required && expect == 0 {
 		return nil, false, dynago.ErrVersionRequired
@@ -1514,7 +1548,7 @@ func (s *ToolStore) Add(ctx context.Context, e *Tool) error {
 	return dynago.Retry(ctx, func() error {
 		put := s.t.Put(toolToItem(e, key, rev)).If("attribute_not_exists($)", "PK")
 		ops := []dynago.Op{dynago.CreateOp(key, put, ErrToolExists, rev)}
-		changes := []dynago.Change{{Owner: key, After: toolDerived(e, key, toolVersion)}}
+		changes := []dynago.Change{{Owner: key, After: toolDerived(e, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -1576,9 +1610,6 @@ func (s *ToolStore) EditDetails(ctx context.Context, k ToolKey, v ToolEditDetail
 		if err != nil {
 			return err
 		}
-		if it.V > toolVersion {
-			return fmt.Errorf("%w: Tool at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, toolVersion)
-		}
 		before := &it.Tool
 		after := before.clone()
 		if v.Name != nil {
@@ -1590,8 +1621,13 @@ func (s *ToolStore) EditDetails(ctx context.Context, k ToolKey, v ToolEditDetail
 		if v.Tags != nil {
 			after.Tags = *v.Tags
 		}
-		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(toolToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", toolVersion), dynago.ErrStale)}
-		changes := []dynago.Change{{Owner: key, Before: toolDerived(before, key, it.V), After: toolDerived(&after, key, toolVersion)}}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: toolDerived(before, key), After: toolDerived(&after, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -1627,14 +1663,16 @@ func (s *ToolStore) Relabel(ctx context.Context, k ToolKey, v ToolRelabel, opts 
 		if err != nil {
 			return err
 		}
-		if it.V > toolVersion {
-			return fmt.Errorf("%w: Tool at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, toolVersion)
-		}
 		before := &it.Tool
 		after := before.clone()
 		after.Barcodes = v.Barcodes
-		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(toolToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", toolVersion), dynago.ErrStale)}
-		changes := []dynago.Change{{Owner: key, Before: toolDerived(before, key, it.V), After: toolDerived(&after, key, toolVersion)}}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: toolDerived(before, key), After: toolDerived(&after, key)}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -1677,13 +1715,12 @@ func (s *ToolStore) Retire(ctx context.Context, k ToolKey, opts ...dynago.WriteO
 			}
 			u := s.t.Update("PK", key.PK).Range("SK", key.SK)
 			dynago.SetFields(u, sets)
-			dynago.GuardUpdate(u, dynago.Guard{ExpectRev: expect, Version: toolVersion}, dynago.Now())
-			dynago.AtLeastVersion(u, 2)
+			dynago.GuardUpdate(u, dynago.Guard{ExpectRev: expect}, dynago.Now())
 			for _, c := range []dynago.Cond{{Attr: "status", Value: ToolStatusAvailable, Zero: false}} {
 				dynago.CondUpdate(u, c)
 			}
 			ops := []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}
-			changes := []dynago.Change{{Owner: key, Before: toolDerived(&before, key, toolVersion), After: toolDerived(&after, key, toolVersion)}}
+			changes := []dynago.Change{{Owner: key, Before: toolDerived(&before, key), After: toolDerived(&after, key)}}
 			// requires Hold
 			if after.LibraryID != "" && after.ToolID != "" {
 				holdOps, holdChange, err := s.requireRetireHold(ctx, &after, false)
@@ -1710,20 +1747,22 @@ func (s *ToolStore) Retire(ctx context.Context, k ToolKey, opts ...dynago.WriteO
 		if err != nil {
 			return err
 		}
-		if it.V > toolVersion {
-			return fmt.Errorf("%w: Tool at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, toolVersion)
-		}
 		before := &it.Tool
 		if before.Status != ToolStatusAvailable {
 			return ErrToolRetirePrecondition
 		}
 		after := before.clone()
 		after.Status = ToolStatusRetired
-		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(toolToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", toolVersion), dynago.ErrStale)}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
 		base := ops
 		return dynago.StaleAs(versioned, dynago.ReadIfNeeded(func(read bool) error {
 			ops := append([]dynago.Op(nil), base...)
-			changes := []dynago.Change{{Owner: key, Before: toolDerived(before, key, it.V), After: toolDerived(&after, key, toolVersion)}}
+			changes := []dynago.Change{{Owner: key, Before: toolDerived(before, key), After: toolDerived(&after, key)}}
 			// requires Hold
 			if after.LibraryID != "" && after.ToolID != "" {
 				holdOps, holdChange, err := s.requireRetireHold(ctx, &after, read)
@@ -1758,7 +1797,7 @@ func (s *ToolStore) requireRetireHold(ctx context.Context, e *Tool, read bool) (
 	}
 	if !read {
 		req := dynago.Requirement{Key: key, TTLAttr: "ttl", Optional: true}
-		return []dynago.Op{dynago.DeleteOp(key, dynago.ConsumeRequirement(s.t, req, holdVersion), dynago.ErrNeedsRead)}, dynago.Change{}, nil
+		return []dynago.Op{dynago.DeleteOp(key, dynago.ConsumeRequirement(s.t, req), dynago.ErrNeedsRead)}, dynago.Change{}, nil
 	}
 	it, err := (&HoldStore{db: s.db, t: s.t}).load(ctx, key, true)
 	if err == ErrHoldNotFound {
@@ -1768,10 +1807,7 @@ func (s *ToolStore) requireRetireHold(ctx context.Context, e *Tool, read bool) (
 	if err != nil {
 		return nil, dynago.Change{}, err
 	}
-	if it.V > holdVersion {
-		return nil, dynago.Change{}, fmt.Errorf("%w: Hold at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, holdVersion)
-	}
-	return []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", holdVersion), dynago.ErrStale)}, dynago.Change{}, nil
+	return []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}, dynago.Change{}, nil
 }
 
 // ---- Loan ----
@@ -1811,6 +1847,7 @@ type loanLoaded struct {
 	rev      int64
 	v        int
 	snapshot Loan
+	raw      dynamo.Item // as stored, including attributes this code doesn't know
 }
 
 // Version identifies the stored state e was read at, for optimistic concurrency: pass it back
@@ -1883,14 +1920,19 @@ const loanVersion = 1
 
 type loanItem struct {
 	Loan
-	PK        string `dynamo:"PK"`
-	SK        string `dynamo:"SK"`
-	T         string `dynamo:"_t"`
-	V         int    `dynamo:"_v"`
-	Rev       int64  `dynamo:"_rev"`
-	OverduePK string `dynamo:"OverduePK,omitempty"`
-	OverdueSK string `dynamo:"OverdueSK,omitempty"`
+	PK  string `dynamo:"PK"`
+	SK  string `dynamo:"SK"`
+	T   string `dynamo:"_t"`
+	V   int    `dynamo:"_v"`
+	Rev int64  `dynamo:"_rev"`
+
+	raw       dynamo.Item // as read, for writes to keep attributes this code doesn't know
+	OverduePK string      `dynamo:"OverduePK,omitempty"`
+	OverdueSK string      `dynamo:"OverdueSK,omitempty"`
 }
+
+// loanKnown is every attribute this code writes on Loan items.
+var loanKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "libraryId": true, "toolId": true, "loanId": true, "memberId": true, "toolName": true, "status": true, "borrowedAt": true, "dueAt": true, "returnedAt": true, "notes": true, "OverduePK": true, "OverdueSK": true}
 
 func loanToItem(e *Loan, key dynago.Key, rev int64) *loanItem {
 	it := &loanItem{Loan: *e, PK: key.PK, SK: key.SK, T: "Loan", V: loanVersion, Rev: rev}
@@ -1965,9 +2007,7 @@ type LoanBorrowLimits struct {
 }
 
 // loanDerived returns the counter contributions, claims and copies that exist because of e.
-// v is the schema version e was written at: items written before a derived item was
-// introduced do not contribute to it.
-func loanDerived(e *Loan, owner dynago.Key, v int, lim loanLimits) []dynago.Derived {
+func loanDerived(e *Loan, owner dynago.Key, lim loanLimits) []dynago.Derived {
 	var d []dynago.Derived
 	// counter MemberLoans
 	if e.LibraryID != "" && e.MemberID != "" {
@@ -2014,7 +2054,8 @@ func loanDecode(raw dynamo.Item) (*loanItem, error) {
 	if err := dynamo.UnmarshalItem(raw, &it); err != nil {
 		return nil, err
 	}
-	it.loaded = &loanLoaded{rev: it.Rev, v: it.V, snapshot: it.clone()}
+	it.raw = raw
+	it.loaded = &loanLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
 
@@ -2065,7 +2106,7 @@ func (s *LoanStore) guard(key dynago.Key, o dynago.WriteOptions, required bool) 
 	if required && expect == 0 {
 		return dynago.Guard{}, dynago.ErrVersionRequired
 	}
-	return dynago.Guard{ExpectRev: expect, Version: loanVersion, NotFound: ErrLoanNotFound}, nil
+	return dynago.Guard{ExpectRev: expect, NotFound: ErrLoanNotFound}, nil
 }
 
 // start returns the state a read-modify-write starts from: the entity passed with dynago.From
@@ -2084,7 +2125,7 @@ func (s *LoanStore) start(ctx context.Context, key dynago.Key, o dynago.WriteOpt
 		if expect != 0 && expect != from.loaded.rev {
 			return nil, false, dynago.ErrVersionMismatch
 		}
-		return &loanItem{Loan: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v}, true, nil
+		return &loanItem{Loan: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v, raw: from.loaded.raw}, true, nil
 	}
 	if required && expect == 0 {
 		return nil, false, dynago.ErrVersionRequired
@@ -2294,7 +2335,7 @@ func (s *LoanStore) Borrow(ctx context.Context, e *Loan, limits LoanBorrowLimits
 		err := dynago.ReadIfNeeded(func(read bool) error {
 			put := s.t.Put(loanToItem(e, key, rev)).If("attribute_not_exists($)", "PK")
 			ops := []dynago.Op{dynago.CreateOp(key, put, ErrLoanExists, rev)}
-			changes := []dynago.Change{{Owner: key, After: loanDerived(e, key, loanVersion, loanLimits{MemberLoansActive: limits.MemberLoansActive})}}
+			changes := []dynago.Change{{Owner: key, After: loanDerived(e, key, loanLimits{MemberLoansActive: limits.MemberLoansActive})}}
 			// requires Member
 			if e.LibraryID == "" || e.MemberID == "" {
 				return fmt.Errorf("%w: Loan.Borrow requires the Member, keyed by libraryId and memberId", dynago.ErrFieldRequired)
@@ -2358,9 +2399,6 @@ func (s *LoanStore) Return(ctx context.Context, k LoanKey, v LoanReturn, opts ..
 		if err != nil {
 			return err
 		}
-		if it.V > loanVersion {
-			return fmt.Errorf("%w: Loan at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, loanVersion)
-		}
 		before := &it.Loan
 		if before.Status != LoanStatusActive {
 			return ErrLoanReturnPrecondition
@@ -2368,11 +2406,16 @@ func (s *LoanStore) Return(ctx context.Context, k LoanKey, v LoanReturn, opts ..
 		after := before.clone()
 		after.ReturnedAt = v.ReturnedAt
 		after.Status = LoanStatusReturned
-		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(loanToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", loanVersion), dynago.ErrStale)}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, loanKnown, loanToItem(&after, key, it.Rev+1))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
 		base := ops
 		return dynago.StaleAs(versioned, dynago.ReadIfNeeded(func(read bool) error {
 			ops := append([]dynago.Op(nil), base...)
-			changes := []dynago.Change{{Owner: key, Before: loanDerived(before, key, it.V, loanLimits{}), After: loanDerived(&after, key, loanVersion, loanLimits{})}}
+			changes := []dynago.Change{{Owner: key, Before: loanDerived(before, key, loanLimits{}), After: loanDerived(&after, key, loanLimits{})}}
 			// requires Tool
 			if after.LibraryID == "" || after.ToolID == "" {
 				return fmt.Errorf("%w: Loan.Return requires the Tool, keyed by libraryId and toolId", dynago.ErrFieldRequired)
@@ -2422,17 +2465,19 @@ func (s *LoanStore) Extend(ctx context.Context, k LoanKey, v LoanExtend, opts ..
 		if err != nil {
 			return err
 		}
-		if it.V > loanVersion {
-			return fmt.Errorf("%w: Loan at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, loanVersion)
-		}
 		before := &it.Loan
 		if before.Status != LoanStatusActive {
 			return ErrLoanExtendPrecondition
 		}
 		after := before.clone()
 		after.DueAt = v.DueAt
-		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(loanToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", loanVersion), dynago.ErrStale)}
-		changes := []dynago.Change{{Owner: key, Before: loanDerived(before, key, it.V, loanLimits{}), After: loanDerived(&after, key, loanVersion, loanLimits{})}}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, loanKnown, loanToItem(&after, key, it.Rev+1))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: loanDerived(before, key, loanLimits{}), After: loanDerived(&after, key, loanLimits{})}}
 		derived, err := dynago.DiffAll(s.t, changes)
 		if err != nil {
 			return err
@@ -2498,10 +2543,9 @@ func (s *LoanStore) requireBorrowTool(ctx context.Context, e *Loan, read bool) (
 		}
 		u := s.t.Update("PK", key.PK).Range("SK", key.SK)
 		dynago.SetFields(u, sets)
-		dynago.GuardUpdate(u, dynago.Guard{Version: toolVersion}, dynago.Now())
-		dynago.AtLeastVersion(u, 2)
+		dynago.GuardUpdate(u, dynago.Guard{}, dynago.Now())
 		dynago.CondUpdate(u, dynago.Cond{Attr: "status", Value: ToolStatusAvailable, Zero: false})
-		return []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}, dynago.Change{Owner: key, Before: toolDerived(&before, key, toolVersion), After: toolDerived(&after, key, toolVersion)}, nil
+		return []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}, dynago.Change{Owner: key, Before: toolDerived(&before, key), After: toolDerived(&after, key)}, nil
 	}
 	it, err := (&ToolStore{db: s.db, t: s.t}).load(ctx, key, true)
 	if err == ErrToolNotFound {
@@ -2510,16 +2554,17 @@ func (s *LoanStore) requireBorrowTool(ctx context.Context, e *Loan, read bool) (
 	if err != nil {
 		return nil, dynago.Change{}, err
 	}
-	if it.V > toolVersion {
-		return nil, dynago.Change{}, fmt.Errorf("%w: Tool at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, toolVersion)
-	}
 	before := &it.Tool
 	if before.Status != ToolStatusAvailable {
 		return nil, dynago.Change{}, ErrLoanBorrowRequiresTool
 	}
 	after := before.clone()
 	after.Status = ToolStatusOnLoan
-	return []dynago.Op{dynago.PutOp(key, s.t.Put(toolToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", toolVersion), dynago.ErrStale)}, dynago.Change{Owner: key, Before: toolDerived(before, key, it.V), After: toolDerived(&after, key, toolVersion)}, nil
+	item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1))
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	return []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}, dynago.Change{Owner: key, Before: toolDerived(before, key), After: toolDerived(&after, key)}, nil
 }
 
 // requireBorrowHold returns the writes Loan.Borrow makes to the Hold: it requires any Hold to have
@@ -2534,7 +2579,7 @@ func (s *LoanStore) requireBorrowHold(ctx context.Context, e *Loan, read bool) (
 	}
 	if !read {
 		req := dynago.Requirement{Key: key, When: []dynago.Cond{{Attr: "memberId", Value: e.MemberID, Zero: e.MemberID == ""}}, TTLAttr: "ttl", Optional: true}
-		return []dynago.Op{dynago.DeleteOp(key, dynago.ConsumeRequirement(s.t, req, holdVersion), dynago.ErrNeedsRead)}, dynago.Change{}, nil
+		return []dynago.Op{dynago.DeleteOp(key, dynago.ConsumeRequirement(s.t, req), dynago.ErrNeedsRead)}, dynago.Change{}, nil
 	}
 	it, err := (&HoldStore{db: s.db, t: s.t}).load(ctx, key, true)
 	if err == ErrHoldNotFound {
@@ -2544,14 +2589,11 @@ func (s *LoanStore) requireBorrowHold(ctx context.Context, e *Loan, read bool) (
 	if err != nil {
 		return nil, dynago.Change{}, err
 	}
-	if it.V > holdVersion {
-		return nil, dynago.Change{}, fmt.Errorf("%w: Hold at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, holdVersion)
-	}
 	before := &it.Hold
 	if before.MemberID != e.MemberID {
 		return nil, dynago.Change{}, ErrLoanBorrowRequiresHold
 	}
-	return []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", holdVersion), dynago.ErrStale)}, dynago.Change{}, nil
+	return []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}, dynago.Change{}, nil
 }
 
 // requireReturnTool returns the writes Loan.Return makes to the Tool: it requires the Tool to exist
@@ -2573,10 +2615,9 @@ func (s *LoanStore) requireReturnTool(ctx context.Context, e *Loan, read bool) (
 		}
 		u := s.t.Update("PK", key.PK).Range("SK", key.SK)
 		dynago.SetFields(u, sets)
-		dynago.GuardUpdate(u, dynago.Guard{Version: toolVersion}, dynago.Now())
-		dynago.AtLeastVersion(u, 2)
+		dynago.GuardUpdate(u, dynago.Guard{}, dynago.Now())
 		dynago.CondUpdate(u, dynago.Cond{Attr: "status", Value: ToolStatusOnLoan, Zero: false})
-		return []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}, dynago.Change{Owner: key, Before: toolDerived(&before, key, toolVersion), After: toolDerived(&after, key, toolVersion)}, nil
+		return []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}, dynago.Change{Owner: key, Before: toolDerived(&before, key), After: toolDerived(&after, key)}, nil
 	}
 	it, err := (&ToolStore{db: s.db, t: s.t}).load(ctx, key, true)
 	if err == ErrToolNotFound {
@@ -2585,16 +2626,17 @@ func (s *LoanStore) requireReturnTool(ctx context.Context, e *Loan, read bool) (
 	if err != nil {
 		return nil, dynago.Change{}, err
 	}
-	if it.V > toolVersion {
-		return nil, dynago.Change{}, fmt.Errorf("%w: Tool at v%d, this code is v%d", dynago.ErrNewerSchema, it.V, toolVersion)
-	}
 	before := &it.Tool
 	if before.Status != ToolStatusOnLoan {
 		return nil, dynago.Change{}, ErrLoanReturnRequiresTool
 	}
 	after := before.clone()
 	after.Status = ToolStatusAvailable
-	return []dynago.Op{dynago.PutOp(key, s.t.Put(toolToItem(&after, key, it.Rev+1)).If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", toolVersion), dynago.ErrStale)}, dynago.Change{Owner: key, Before: toolDerived(before, key, it.V), After: toolDerived(&after, key, toolVersion)}, nil
+	item, err := dynago.KeepUnknown(it.raw, toolKnown, toolToItem(&after, key, it.Rev+1))
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	return []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}, dynago.Change{Owner: key, Before: toolDerived(before, key), After: toolDerived(&after, key)}, nil
 }
 
 // ---- Hold ----
@@ -2622,6 +2664,7 @@ type holdLoaded struct {
 	rev      int64
 	v        int
 	snapshot Hold
+	raw      dynamo.Item // as stored, including attributes this code doesn't know
 }
 
 // Version identifies the stored state e was read at, for optimistic concurrency: pass it back
@@ -2688,14 +2731,19 @@ const holdVersion = 1
 
 type holdItem struct {
 	Hold
-	PK       string `dynamo:"PK"`
-	SK       string `dynamo:"SK"`
-	T        string `dynamo:"_t"`
-	V        int    `dynamo:"_v"`
-	Rev      int64  `dynamo:"_rev"`
-	ByCodePK string `dynamo:"ByCodePK,omitempty"`
-	TTL      int64  `dynamo:"ttl,omitempty"`
+	PK  string `dynamo:"PK"`
+	SK  string `dynamo:"SK"`
+	T   string `dynamo:"_t"`
+	V   int    `dynamo:"_v"`
+	Rev int64  `dynamo:"_rev"`
+
+	raw      dynamo.Item // as read, for writes to keep attributes this code doesn't know
+	ByCodePK string      `dynamo:"ByCodePK,omitempty"`
+	TTL      int64       `dynamo:"ttl,omitempty"`
 }
+
+// holdKnown is every attribute this code writes on Hold items.
+var holdKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "libraryId": true, "toolId": true, "memberId": true, "codeHash": true, "createdAt": true, "expiresAt": true, "ByCodePK": true, "ttl": true}
 
 func holdToItem(e *Hold, key dynago.Key, rev int64) *holdItem {
 	it := &holdItem{Hold: *e, PK: key.PK, SK: key.SK, T: "Hold", V: holdVersion, Rev: rev}
@@ -2748,7 +2796,8 @@ func holdDecode(raw dynamo.Item) (*holdItem, error) {
 	if err := dynamo.UnmarshalItem(raw, &it); err != nil {
 		return nil, err
 	}
-	it.loaded = &holdLoaded{rev: it.Rev, v: it.V, snapshot: it.clone()}
+	it.raw = raw
+	it.loaded = &holdLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
 	return &it, nil
 }
 
@@ -2799,7 +2848,7 @@ func (s *HoldStore) guard(key dynago.Key, o dynago.WriteOptions, required bool) 
 	if required && expect == 0 {
 		return dynago.Guard{}, dynago.ErrVersionRequired
 	}
-	return dynago.Guard{ExpectRev: expect, Version: holdVersion, TTLAttr: "ttl", NotFound: ErrHoldNotFound}, nil
+	return dynago.Guard{ExpectRev: expect, TTLAttr: "ttl", NotFound: ErrHoldNotFound}, nil
 }
 
 // Get reads a Hold by primary key with one eventually consistent GetItem.

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/nicklanng/dynago"
 	"github.com/nicklanng/dynago/internal/cost"
 	"github.com/nicklanng/dynago/internal/gen/docs"
 	"github.com/nicklanng/dynago/internal/gen/gocode"
@@ -155,7 +156,11 @@ func build(path string, prices cost.Prices, lockOpts lock.Options) (*schema.Mode
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
-	tf, err := infra.Terraform(m, source)
+	retained := map[int]dynago.TableSpec{}
+	for _, g := range m.Table.Retain {
+		retained[g] = *next.Table(g)
+	}
+	tf, err := infra.Terraform(m, source, retained)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}

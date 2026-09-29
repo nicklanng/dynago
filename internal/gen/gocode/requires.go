@@ -185,7 +185,7 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		g.p("if !read {")
 		if rq.Consume {
 			g.p("req := dynago.Requirement{Key: key%s}", g.requirementFields(rq, "e"))
-			g.p("return []dynago.Op{dynago.DeleteOp(key, dynago.ConsumeRequirement(s.t, req, %sVersion), dynago.ErrNeedsRead)}, dynago.Change{}, nil", tlo)
+			g.p("return []dynago.Op{dynago.DeleteOp(key, dynago.ConsumeRequirement(s.t, req), dynago.ErrNeedsRead)}, dynago.Change{}, nil")
 		} else {
 			known := []string{}
 			for _, f := range te.KeyFields() {
@@ -199,16 +199,13 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 			g.targetSets(e, rq)
 			g.p("u := s.t.Update(\"PK\", key.PK).Range(\"SK\", key.SK)")
 			g.p("dynago.SetFields(u, sets)")
-			g.p("dynago.GuardUpdate(u, dynago.Guard{Version: %sVersion%s}, dynago.Now())", tlo, ttlGuard)
-			if te.HasDerived() {
-				g.p("dynago.AtLeastVersion(u, %d)", derivedSince(te))
-			}
+			g.p("dynago.GuardUpdate(u, dynago.Guard{%s}, dynago.Now())", strings.TrimPrefix(ttlGuard, ", "))
 			for _, p := range rq.When {
 				g.p("dynago.CondUpdate(u, dynago.Cond%s)", condLit(te, p, "e"))
 			}
 			ch := "dynago.Change{}"
 			if te.HasDerived() {
-				ch = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(&before, key, %sVersion%s), After: %sDerived(&after, key, %sVersion%s)}", tlo, tlo, limits, tlo, tlo, limits)
+				ch = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(&before, key%s), After: %sDerived(&after, key%s)}", tlo, limits, tlo, limits)
 			}
 			g.p("return []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}, %s, nil", ch)
 		}
@@ -226,9 +223,6 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 	g.p("if err != nil {")
 	g.p("return nil, dynago.Change{}, err")
 	g.p("}")
-	g.p("if it.V > %sVersion {", tlo)
-	g.p("return nil, dynago.Change{}, fmt.Errorf(\"%%w: %s at v%%d, this code is v%%d\", dynago.ErrNewerSchema, it.V, %sVersion)", te.Name, tlo)
-	g.p("}")
 	if len(rq.When) > 0 || te.HasDerived() || !rq.Consume {
 		g.p("before := &it.%s", te.GoName)
 	}
@@ -241,11 +235,11 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		g.p("return nil, dynago.Change{}, %s", rq.ErrName)
 		g.p("}")
 	}
-	guard := fmt.Sprintf(`.If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", %sVersion)`, tlo)
+	guard := `.If("$ = ?", "_rev", it.Rev)`
 	ch := "dynago.Change{}"
 	if rq.Consume {
 		if te.HasDerived() {
-			ch = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(before, key, it.V%s)}", tlo, limits)
+			ch = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(before, key%s)}", tlo, limits)
 		}
 		g.p("return []dynago.Op{dynago.DeleteOp(key, s.t.Delete(\"PK\", key.PK).Range(\"SK\", key.SK)%s, dynago.ErrStale)}, %s, nil", guard, ch)
 	} else {
@@ -258,9 +252,13 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		g.requiredChecks(te, changed, "after", "return nil, dynago.Change{}, err")
 		g.keyPartChecks(changed, func(f *schema.Field) string { return "after." + f.GoName }, "return nil, dynago.Change{}, err")
 		if te.HasDerived() {
-			ch = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(before, key, it.V%s), After: %sDerived(&after, key, %sVersion%s)}", tlo, limits, tlo, tlo, limits)
+			ch = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(before, key%s), After: %sDerived(&after, key%s)}", tlo, limits, tlo, limits)
 		}
-		g.p("return []dynago.Op{dynago.PutOp(key, s.t.Put(%sToItem(&after, key, it.Rev+1))%s, dynago.ErrStale)}, %s, nil", tlo, guard, ch)
+		g.p("item, err := dynago.KeepUnknown(it.raw, %sKnown, %sToItem(&after, key, it.Rev+1))", tlo, tlo)
+		g.p("if err != nil {")
+		g.p("return nil, dynago.Change{}, err")
+		g.p("}")
+		g.p("return []dynago.Op{dynago.PutOp(key, s.t.Put(item)%s, dynago.ErrStale)}, %s, nil", guard, ch)
 	}
 	g.p("}")
 	g.p("")
@@ -293,27 +291,6 @@ func (g *gen) targetSets(e *schema.Entity, rq *schema.Require) {
 			g.p("sets = append(sets, dynago.Set{Attr: %q, Value: dynago.UnixTTL(%s), Remove: %s.IsZero()})", g.m.Table.TTLAttr, x, x)
 		}
 	}
-}
-
-// derivedSince returns the latest version that introduced any of an entity's counters, counter
-// values or claims: items older than it may not contribute everything the current code assumes.
-func derivedSince(e *schema.Entity) int {
-	since := 1
-	for _, c := range e.Counters {
-		for _, v := range c.Values {
-			since = max(since, v.Since)
-		}
-		since = max(since, c.Since)
-	}
-	for _, u := range e.Uniques {
-		since = max(since, u.Since)
-	}
-	for _, ix := range e.Indexes {
-		if ix.Strategy == schema.StrategyCopy {
-			since = max(since, ix.Since)
-		}
-	}
-	return since
 }
 
 // requiredChecks emits a check that each of fields declared required is not its zero value.

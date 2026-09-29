@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/nicklanng/dynago/internal/lock"
 	"github.com/nicklanng/dynago/internal/schema"
 )
 
@@ -43,37 +42,29 @@ func parse(t *testing.T, version, extra string) *schema.Model {
 	return m
 }
 
-// A counter added in version 2 must ignore items still at version 1: they never contributed, so
-// deleting or updating one must not subtract from it.
-func TestDerivedItemsAreGatedByIntroductionVersion(t *testing.T) {
-	l1, _, err := lock.Apply(parse(t, "1", ""), &lock.File{Entities: map[string]*lock.History{}}, lock.Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	m2 := parse(t, "2", counter)
-	if _, _, err := lock.Apply(m2, l1, lock.Options{}); err != nil {
-		t.Fatal(err)
-	}
-	out, err := Generate(m2, "things.dynago.yaml")
+// Read-modify-writes keep attributes they don't know: within a table generation, newer
+// compatible code may have written fields this code has never heard of.
+func TestRewritesKeepUnknownAttributes(t *testing.T) {
+	m := parse(t, "1", counter)
+	out, err := Generate(m, "things.dynago.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
 	code := string(out)
 	for _, want := range []string{
-		"const thingVersion = 2",
-		"if v >= 2 && e.TenantID != \"\" {",
-		"thingDerived(before, key, it.V)",
-		"thingDerived(&after, key, thingVersion)",
+		`var thingKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "tenantId": true, "thingId": true, "kind": true}`,
+		"item, err := dynago.KeepUnknown(it.raw, thingKnown, thingToItem(&after, key, it.Rev+1))",
+		`s.t.Put(item).If("$ = ?", "_rev", it.Rev)`,
 		// Revisions start random so a delete + re-create cannot satisfy a stale revision guard.
 		"rev := dynago.NewRev()",
 		"dynago.CreateOp(key, put, ErrThingExists, rev)",
-		// Code never rewrites an item that newer code wrote.
-		"if it.V > thingVersion {",
-		`If("$ = ? AND (attribute_not_exists($) OR $ <= ?)", "_rev", it.Rev, "_v", "_v", thingVersion)`,
 	} {
 		if !strings.Contains(code, want) {
 			t.Errorf("generated code lacks %q", want)
 		}
+	}
+	if strings.Contains(code, "ErrNewerSchema") || strings.Contains(code, "AtLeastVersion") {
+		t.Error("generated code still refuses items written by newer code")
 	}
 }
 

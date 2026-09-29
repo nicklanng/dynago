@@ -15,19 +15,19 @@ import (
 // TableSpec is the physical shape of a table: its GSIs and TTL attribute. The base key is always
 // PK (hash) and SK (range), both strings. Billing is on-demand.
 type TableSpec struct {
-	TTLAttr string
-	GSIs    []GSISpec
+	TTLAttr string    `json:"ttl_attribute,omitempty"`
+	GSIs    []GSISpec `json:"gsis,omitempty"`
 }
 
 // GSISpec is one global secondary index.
 type GSISpec struct {
-	Name   string
-	PKAttr string
+	Name   string `json:"name"`
+	PKAttr string `json:"pk"`
 	// SKAttr is "" for an index without a sort key.
-	SKAttr string
+	SKAttr string `json:"sk,omitempty"`
 	// Projection is "ALL" or "INCLUDE".
-	Projection  string
-	NonKeyAttrs []string
+	Projection  string   `json:"projection"`
+	NonKeyAttrs []string `json:"non_key_attributes,omitempty"`
 }
 
 // CreateTableInput builds the CreateTable request for a table named name.

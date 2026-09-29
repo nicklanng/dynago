@@ -3,6 +3,8 @@
 package schema
 
 import (
+	"fmt"
+
 	"github.com/nicklanng/dynago/internal/keytmpl"
 )
 
@@ -23,6 +25,8 @@ type Model struct {
 	Output   Output
 	Entities []*Entity
 	GSIs     []*GSI
+	// Previous is the generation the migration job copies from, set by the lock.
+	Previous *Previous
 }
 
 // Output holds the paths of generated files, relative to the schema file's directory.
@@ -36,9 +40,32 @@ type Output struct {
 
 // Table is the physical table.
 type Table struct {
+	// Name is the base name: each generation's table is Name-g<Generation>.
 	Name    string
 	Doc     string
 	TTLAttr string
+	// Generation is the current table generation (1 for a new schema).
+	Generation int
+	// Retain lists older generations whose tables are kept for rollback.
+	Retain []int
+}
+
+// GenerationTable returns the name of a generation's table.
+func (t Table) GenerationTable(gen int) string { return fmt.Sprintf("%s-g%d", t.Name, gen) }
+
+// Previous describes the table generation before the current one, which the migration job reads.
+// The lock file supplies it; it is nil for a first generation.
+type Previous struct {
+	Generation int
+	// Entities maps entity names to their last shape in that generation: the fields to decode.
+	Entities map[string][]PreviousField
+}
+
+// PreviousField is a field as the previous generation stored it.
+type PreviousField struct {
+	Name, Attr string
+	Type       FieldType
+	Values     []string // of an enum
 }
 
 // FieldType is a normalized field type.
@@ -231,7 +258,6 @@ type Index struct {
 	Where      []*Pred
 	Doc        string
 	GSI        *GSI
-	Since      int
 	// PKAttr and SKAttr are the attribute names holding the rendered keys: the GSI's key
 	// attributes, or PK/SK for copy items.
 	PKAttr, SKAttr string
@@ -284,7 +310,6 @@ type Unique struct {
 	Set     *Field
 	PK, SK  Template
 	Doc     string
-	Since   int
 	ErrName string
 }
 
@@ -297,7 +322,6 @@ type Counter struct {
 	Shards int
 	Values []*CounterValue
 	Doc    string
-	Since  int
 }
 
 // KeyFields returns the fields that address the counter item.
@@ -319,8 +343,6 @@ type CounterValue struct {
 	MinErrName string
 	Doc        string
 	ErrName    string
-	// Since is the schema version from which items contribute to this value.
-	Since int
 }
 
 // Limited reports whether increments are bounded.

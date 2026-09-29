@@ -64,7 +64,8 @@ func (r *resolver) claimType(name, owner string) {
 func (r *resolver) resolve() *Model {
 	raw := r.raw
 	r.typeNames = map[string]string{"Store": "the generated store", "TableSpec": "the table spec",
-		"New": "the generated constructor", "EnsureTable": "the generated EnsureTable"}
+		"New": "the generated constructor", "EnsureTable": "the generated EnsureTable",
+		"Generation": "the generated Generation constant", "TableName": "the generated TableName function"}
 	m := &Model{Package: raw.Package}
 	if raw.Dynago != 1 {
 		r.errorf("dynago: schema format version must be 1 (got %d)", raw.Dynago)
@@ -72,7 +73,23 @@ func (r *resolver) resolve() *Model {
 	if !rePackage.MatchString(raw.Package) {
 		r.errorf("package: %q is not a valid Go package name", raw.Package)
 	}
-	m.Table = Table{Name: raw.Table.Name, Doc: raw.Table.Doc, TTLAttr: raw.Table.TTLAttribute}
+	m.Table = Table{Name: raw.Table.Name, Doc: raw.Table.Doc, TTLAttr: raw.Table.TTLAttribute, Generation: raw.Table.Generation, Retain: raw.Table.Retain}
+	if m.Table.Generation == 0 {
+		m.Table.Generation = 1
+	}
+	if m.Table.Generation < 0 {
+		r.errorf("table.generation must be positive")
+	}
+	retained := map[int]bool{}
+	for _, g := range m.Table.Retain {
+		switch {
+		case g < 1 || g >= m.Table.Generation:
+			r.errorf("table.retain: %d is not an older generation (the current one is %d)", g, m.Table.Generation)
+		case retained[g]:
+			r.errorf("table.retain: %d is listed twice", g)
+		}
+		retained[g] = true
+	}
 	if m.Table.Name == "" {
 		r.errorf("table.name is required")
 	}
@@ -427,7 +444,7 @@ func (r *resolver) index(e *Entity, name string, raw RawIndex) *Index {
 		r.errorf("%s: index names must be PascalCase", where)
 		return nil
 	}
-	ix := &Index{Name: name, GoName: name, Entity: e, Doc: raw.Doc, Since: e.Version}
+	ix := &Index{Name: name, GoName: name, Entity: e, Doc: raw.Doc}
 	switch Strategy(orDefault(raw.Strategy, string(StrategyGSI))) {
 	case StrategyGSI:
 		ix.Strategy = StrategyGSI
@@ -506,7 +523,7 @@ func (r *resolver) unique(e *Entity, name string, raw RawUnique) *Unique {
 		r.errorf("%s: unique names must be PascalCase", where)
 		return nil
 	}
-	u := &Unique{Name: name, GoName: name, Entity: e, Doc: raw.Doc, Since: e.Version,
+	u := &Unique{Name: name, GoName: name, Entity: e, Doc: raw.Doc,
 		ErrName: "Err" + e.GoName + name + "Taken"}
 	if len(raw.Fields) == 0 {
 		r.errorf("%s: fields is required", where)
@@ -571,7 +588,7 @@ func (r *resolver) counter(e *Entity, name string, raw RawCounter) *Counter {
 		r.errorf("%s: counter names must be PascalCase", where)
 		return nil
 	}
-	c := &Counter{Name: name, GoName: name, Entity: e, Doc: raw.Doc, Shards: raw.Shards, Since: e.Version}
+	c := &Counter{Name: name, GoName: name, Entity: e, Doc: raw.Doc, Shards: raw.Shards}
 	r.claimType(c.GoName, where)
 	r.claimType(c.GoName+"Key", where)
 	if c.Shards == 0 {
@@ -599,7 +616,7 @@ func (r *resolver) counter(e *Entity, name string, raw RawCounter) *Counter {
 			r.errorf("%s: value names must be camelCase", vw)
 			continue
 		}
-		v := &CounterValue{Name: rv.Key, GoName: GoName(rv.Key), Attr: rv.Key, Counter: c, Doc: rv.Value.Doc, Since: e.Version,
+		v := &CounterValue{Name: rv.Key, GoName: GoName(rv.Key), Attr: rv.Key, Counter: c, Doc: rv.Value.Doc,
 			ErrName: "Err" + c.GoName + GoName(rv.Key) + "Limit"}
 		switch {
 		case rv.Value.Count && rv.Value.Sum != "":

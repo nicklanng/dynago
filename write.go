@@ -262,8 +262,6 @@ type Cond struct {
 type Guard struct {
 	// ExpectRev, if non-zero, is the revision the caller read (a document version).
 	ExpectRev int64
-	// Version is the schema version of the code writing: items written by newer code are refused.
-	Version int
 	// TTLAttr, if set, makes an expired item count as absent.
 	TTLAttr string
 	// NotFound is returned if the item is absent (or expired).
@@ -307,10 +305,21 @@ func SetFields(u *dynamo.Update, sets []Set) {
 	u.Add(Path(AttrRev), 1)
 }
 
-// AtLeastVersion conditions an update on the item having been written at schema version v or
-// later, so its derived contributions are the ones the current code would compute.
-func AtLeastVersion(u *dynamo.Update, v int) {
-	u.If("$ >= ?", AttrVer, v)
+// KeepUnknown returns item, marshalled, with every attribute of raw (the stored item it replaces)
+// that known doesn't name. Code at an older compatible version rewriting an item that newer code
+// wrote must not drop the fields it doesn't know: within a table generation, versions only add
+// or remove plain fields, so keeping what it doesn't know is always safe.
+func KeepUnknown(raw dynamo.Item, known map[string]bool, item any) (dynamo.Item, error) {
+	out, err := dynamo.MarshalItem(item)
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range raw {
+		if _, set := out[k]; !set && !known[k] {
+			out[k] = v
+		}
+	}
+	return out, nil
 }
 
 // Requirement is the state a write requires of another item, checked in the write's transaction.
@@ -369,11 +378,9 @@ func CheckRequirement(t dynamo.Table, r Requirement) *dynamo.ConditionCheck {
 	return c
 }
 
-// ConsumeRequirement builds the deletion of another item that meets a requirement. Items written
-// by a newer schema than version are refused, like every other write.
-func ConsumeRequirement(t dynamo.Table, r Requirement, version int) *dynamo.Delete {
-	d := t.Delete(AttrPK, r.Key.PK).Range(AttrSK, r.Key.SK).
-		If("attribute_not_exists($) OR $ <= ?", AttrVer, AttrVer, version)
+// ConsumeRequirement builds the deletion of another item that meets a requirement.
+func ConsumeRequirement(t dynamo.Table, r Requirement) *dynamo.Delete {
+	d := t.Delete(AttrPK, r.Key.PK).Range(AttrSK, r.Key.SK)
 	if expr, args := r.condition(Now()); expr != "" {
 		d.If(expr, args...)
 	}
@@ -421,7 +428,6 @@ func NeedsRead(err error) bool { return errors.Is(err, ErrNeedsRead) }
 // GuardUpdate adds a Guard's conditions to an update.
 func GuardUpdate(u *dynamo.Update, g Guard, now int64) {
 	u.If("attribute_exists($)", AttrPK)
-	u.If("attribute_not_exists($) OR $ <= ?", AttrVer, AttrVer, g.Version)
 	if g.TTLAttr != "" {
 		u.If("attribute_not_exists($) OR $ > ?", g.TTLAttr, g.TTLAttr, now)
 	}
@@ -440,11 +446,10 @@ func CondUpdate(u *dynamo.Update, c Cond) {
 }
 
 // DeleteIfExists deletes an item that has no derived items, returning the Guard's errors if it is
-// absent, expired, at another revision, or written by newer code.
+// absent, expired or at another revision.
 func DeleteIfExists(ctx context.Context, t dynamo.Table, key Key, g Guard) error {
 	now := Now()
-	d := t.Delete(AttrPK, key.PK).Range(AttrSK, key.SK).If("attribute_exists($)", AttrPK).
-		If("attribute_not_exists($) OR $ <= ?", AttrVer, AttrVer, g.Version)
+	d := t.Delete(AttrPK, key.PK).Range(AttrSK, key.SK).If("attribute_exists($)", AttrPK)
 	if g.TTLAttr != "" {
 		d.If("attribute_not_exists($) OR $ > ?", g.TTLAttr, g.TTLAttr, now)
 	}
@@ -470,7 +475,6 @@ func whyFailed(ctx context.Context, t dynamo.Table, key Key, g Guard, now int64,
 	}
 	var probe struct {
 		Rev int64 `dynamo:"_rev"`
-		V   int   `dynamo:"_v"`
 	}
 	if err := dynamo.UnmarshalItem(raw, &probe); err != nil {
 		return err
@@ -484,8 +488,6 @@ func whyFailed(ctx context.Context, t dynamo.Table, key Key, g Guard, now int64,
 		}
 	}
 	switch {
-	case probe.V > g.Version:
-		return fmt.Errorf("%w: item at v%d, this code is v%d", ErrNewerSchema, probe.V, g.Version)
 	case g.ExpectRev != 0 && probe.Rev != g.ExpectRev:
 		return ErrVersionMismatch
 	case precondition != nil:

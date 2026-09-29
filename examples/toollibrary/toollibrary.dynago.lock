@@ -1,10 +1,84 @@
 {
   "dynago": 1,
+  "generation": 1,
+  "tables": [
+    {
+      "generation": 1,
+      "spec": {
+        "ttl_attribute": "ttl",
+        "gsis": [
+          {
+            "name": "ByName",
+            "pk": "ByNamePK",
+            "sk": "ByNameSK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "memberId",
+              "name",
+              "role",
+              "status"
+            ]
+          },
+          {
+            "name": "ByCategory",
+            "pk": "ByCategoryPK",
+            "sk": "ByCategorySK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "toolId",
+              "name",
+              "category",
+              "status",
+              "tags"
+            ]
+          },
+          {
+            "name": "Overdue",
+            "pk": "OverduePK",
+            "sk": "OverdueSK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "toolId",
+              "loanId",
+              "memberId",
+              "toolName",
+              "dueAt"
+            ]
+          },
+          {
+            "name": "ByCode",
+            "pk": "ByCodePK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "toolId",
+              "memberId",
+              "codeHash",
+              "expiresAt",
+              "ttl"
+            ]
+          }
+        ]
+      }
+    }
+  ],
   "entities": {
     "Hold": {
       "versions": [
         {
           "version": 1,
+          "generation": 1,
           "fingerprint": "05e37472cd3872a4",
           "shape": {
             "fields": [
@@ -63,6 +137,7 @@
       "versions": [
         {
           "version": 1,
+          "generation": 1,
           "fingerprint": "ca3837d612625a76",
           "shape": {
             "fields": [
@@ -107,6 +182,7 @@
       "versions": [
         {
           "version": 1,
+          "generation": 1,
           "fingerprint": "a63d3dff9a242916",
           "shape": {
             "fields": [
@@ -232,6 +308,7 @@
       "versions": [
         {
           "version": 1,
+          "generation": 1,
           "fingerprint": "1de4c215aad80d00",
           "shape": {
             "fields": [
@@ -471,6 +548,7 @@
         },
         {
           "version": 2,
+          "generation": 1,
           "fingerprint": "01a4224028a05a11",
           "shape": {
             "fields": [

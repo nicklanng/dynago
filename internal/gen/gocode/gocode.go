@@ -76,6 +76,17 @@ func (g *gen) usesTime() bool {
 }
 
 func (g *gen) tableSpec() {
+	t := g.m.Table
+	g.p("// Generation is the table generation this code reads and writes: its table is")
+	g.p("// <base>-g%d (see TableName). A change existing items don't fit starts a new generation,", t.Generation)
+	g.p("// which the migration job fills from the previous one.")
+	g.p("const Generation = %d", t.Generation)
+	g.p("")
+	g.p("// TableName returns the name of this generation's table for a base name, such as %q.", t.Name)
+	g.p("func TableName(base string) string {")
+	g.p("return base + \"-g%d\"", t.Generation)
+	g.p("}")
+	g.p("")
 	spec := infra.Spec(g.m)
 	g.p("// TableSpec is the physical shape of the %s table: base key PK/SK, its global secondary", g.m.Table.Name)
 	g.p("// indexes and its TTL attribute. See also the generated Terraform.")
@@ -160,6 +171,7 @@ func (g *gen) entity(e *schema.Entity) {
 	g.p("rev      int64")
 	g.p("v        int")
 	g.p("snapshot %s", e.GoName)
+	g.p("raw      dynamo.Item // as stored, including attributes this code doesn't know")
 	g.p("}")
 	g.p("")
 	g.p("// Version identifies the stored state e was read at, for optimistic concurrency: pass it back")
@@ -211,6 +223,8 @@ func (g *gen) entity(e *schema.Entity) {
 	g.p("T string `dynamo:\"_t\"`")
 	g.p("V int `dynamo:\"_v\"`")
 	g.p("Rev int64 `dynamo:\"_rev\"`")
+	g.p("")
+	g.p("raw dynamo.Item // as read, for writes to keep attributes this code doesn't know")
 	for _, ix := range e.Indexes {
 		if ix.Strategy != schema.StrategyGSI {
 			continue
@@ -225,6 +239,7 @@ func (g *gen) entity(e *schema.Entity) {
 	}
 	g.p("}")
 	g.p("")
+	g.knownAttrs(e)
 	g.p("func %sToItem(e *%s, key dynago.Key, rev int64) *%sItem {", lo, e.GoName, lo)
 	g.p("it := &%sItem{%s: *e, PK: key.PK, SK: key.SK, T: %q, V: %sVersion, Rev: rev}", lo, e.GoName, e.Name, lo)
 	for _, ix := range e.Indexes {
@@ -291,7 +306,8 @@ func (g *gen) entity(e *schema.Entity) {
 	g.p("if err := dynamo.UnmarshalItem(raw, &it); err != nil {")
 	g.p("return nil, err")
 	g.p("}")
-	g.p("it.loaded = &%sLoaded{rev: it.Rev, v: it.V, snapshot: it.clone()}", lo)
+	g.p("it.raw = raw")
+	g.p("it.loaded = &%sLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}", lo)
 	g.p("return &it, nil")
 	g.p("}")
 	g.p("")
@@ -472,9 +488,7 @@ func (g *gen) derived(e *schema.Entity) {
 		limitsParam = fmt.Sprintf(", lim %sLimits", lo)
 	}
 	g.p("// %sDerived returns the counter contributions, claims and copies that exist because of e.", lo)
-	g.p("// v is the schema version e was written at: items written before a derived item was")
-	g.p("// introduced do not contribute to it.")
-	g.p("func %sDerived(e *%s, owner dynago.Key, v int%s) []dynago.Derived {", lo, e.GoName, limitsParam)
+	g.p("func %sDerived(e *%s, owner dynago.Key%s) []dynago.Derived {", lo, e.GoName, limitsParam)
 	sharded := false
 	for _, c := range e.Counters {
 		sharded = sharded || c.Shards > 1
@@ -485,9 +499,6 @@ func (g *gen) derived(e *schema.Entity) {
 	g.p("var d []dynago.Derived")
 	for _, c := range e.Counters {
 		conds := []string{}
-		if c.Since > 1 {
-			conds = append(conds, fmt.Sprintf("v >= %d", c.Since))
-		}
 		if pc := presence(c.KeyFields(), "e"); pc != "" {
 			conds = append(conds, pc)
 		}
@@ -516,9 +527,6 @@ func (g *gen) derived(e *schema.Entity) {
 			stmt := fmt.Sprintf("d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: %q, Attr: %q, Amount: %s%s})",
 				c.Name, v.Attr, amount, extra)
 			var vconds []string
-			if v.Since > c.Since {
-				vconds = append(vconds, fmt.Sprintf("v >= %d", v.Since))
-			}
 			if len(v.Where) > 0 {
 				vconds = append(vconds, whereExpr(e, v.Where, "e"))
 			}
@@ -534,9 +542,6 @@ func (g *gen) derived(e *schema.Entity) {
 	}
 	for _, u := range e.Uniques {
 		conds := []string{}
-		if u.Since > 1 {
-			conds = append(conds, fmt.Sprintf("v >= %d", u.Since))
-		}
 		if pc := presence(u.Fields, "e"); pc != "" {
 			conds = append(conds, pc)
 		}
@@ -563,9 +568,6 @@ func (g *gen) derived(e *schema.Entity) {
 			continue
 		}
 		conds := []string{}
-		if ix.Since > 1 {
-			conds = append(conds, fmt.Sprintf("v >= %d", ix.Since))
-		}
 		if pc := presenceAndWhere(e, templateFields(ix.PK, ix.SK, true), ix.Where, "e"); pc != "true" {
 			conds = append(conds, pc)
 		}
@@ -948,7 +950,7 @@ func (g *gen) create(w *schema.Write) {
 	g.p("ops := []dynago.Op{dynago.CreateOp(key, put, Err%sExists, rev)}", e.GoName)
 	own := ""
 	if e.HasDerived() {
-		own = fmt.Sprintf("dynago.Change{Owner: key, After: %sDerived(e, key, %sVersion%s)}", lo, lo, conv)
+		own = fmt.Sprintf("dynago.Change{Owner: key, After: %sDerived(e, key%s)}", lo, conv)
 	}
 	g.requiresAndDerived(w, "e", "read", own)
 	if tw {
@@ -1218,7 +1220,6 @@ func (g *gen) update(w *schema.Write) {
 	g.p("if err != nil {")
 	g.p("return err")
 	g.p("}")
-	g.newerGuard(e)
 	g.p("before := &it.%s", e.GoName)
 	if len(w.When) > 0 {
 		g.p("if %s {", negate(whereExpr(e, w.When, "before")))
@@ -1228,10 +1229,15 @@ func (g *gen) update(w *schema.Write) {
 	g.p("after := before.clone()")
 	g.applyChanges(w)
 	g.changedKeyPartChecks(w)
-	g.p("ops := []dynago.Op{dynago.PutOp(key, s.t.Put(%sToItem(&after, key, it.Rev+1)).If(\"$ = ? AND (attribute_not_exists($) OR $ <= ?)\", \"_rev\", it.Rev, \"_v\", \"_v\", %sVersion), dynago.ErrStale)}", lo, lo)
+	g.p("// Keep attributes this code doesn't know: a newer compatible version may have written them.")
+	g.p("item, err := dynago.KeepUnknown(it.raw, %sKnown, %sToItem(&after, key, it.Rev+1))", lo, lo)
+	g.p("if err != nil {")
+	g.p("return err")
+	g.p("}")
+	g.p("ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If(\"$ = ?\", \"_rev\", it.Rev), dynago.ErrStale)}")
 	own := ""
 	if e.HasDerived() {
-		own = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(before, key, it.V%s), After: %sDerived(&after, key, %sVersion%s)}", lo, beforeConv, lo, lo, conv)
+		own = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(before, key%s), After: %sDerived(&after, key%s)}", lo, beforeConv, lo, conv)
 	}
 	g.runWithRequires(w, "after", own, func() {
 		g.p("o.Written(it.Rev + 1)")
@@ -1325,10 +1331,7 @@ func (g *gen) transition(w *schema.Write, when, beforeConv, conv string) {
 	if e.TTL != nil {
 		ttl = fmt.Sprintf(", TTLAttr: %q", g.m.Table.TTLAttr)
 	}
-	g.p("dynago.GuardUpdate(u, dynago.Guard{ExpectRev: expect, Version: %sVersion%s}, dynago.Now())", lo, ttl)
-	if e.HasDerived() {
-		g.p("dynago.AtLeastVersion(u, %d)", derivedSince(e))
-	}
+	g.p("dynago.GuardUpdate(u, dynago.Guard{ExpectRev: expect%s}, dynago.Now())", ttl)
 	if len(w.When) > 0 {
 		g.p("for _, c := range %s {", when)
 		g.p("dynago.CondUpdate(u, c)")
@@ -1337,7 +1340,7 @@ func (g *gen) transition(w *schema.Write, when, beforeConv, conv string) {
 	g.p("ops := []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}")
 	own := ""
 	if e.HasDerived() {
-		own = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(&before, key, %sVersion%s), After: %sDerived(&after, key, %sVersion%s)}", lo, lo, beforeConv, lo, lo, conv)
+		own = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(&before, key%s), After: %sDerived(&after, key%s)}", lo, beforeConv, lo, conv)
 	}
 	// Other items are assumed to be in the state required too; any doubt goes to the read path.
 	g.requiresAndDerived(w, "after", "false", own)
@@ -1384,15 +1387,14 @@ func (g *gen) delete(w *schema.Write) {
 	g.p("if err != nil {")
 	g.p("return err")
 	g.p("}")
-	g.newerGuard(e)
-	g.p("ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete(\"PK\", key.PK).Range(\"SK\", key.SK).If(\"$ = ? AND (attribute_not_exists($) OR $ <= ?)\", \"_rev\", it.Rev, \"_v\", \"_v\", %sVersion), dynago.ErrStale)}", lo)
+	g.p("ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete(\"PK\", key.PK).Range(\"SK\", key.SK).If(\"$ = ?\", \"_rev\", it.Rev), dynago.ErrStale)}")
 	own := ""
 	if e.HasDerived() {
 		beforeConv := ""
 		if hasLimitArgs(e) {
 			beforeConv = fmt.Sprintf(", %sLimits{}", lo)
 		}
-		own = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(&it.%s, key, it.V%s)}", lo, e.GoName, beforeConv)
+		own = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(&it.%s, key%s)}", lo, e.GoName, beforeConv)
 	}
 	if len(w.Requires) > 0 {
 		g.p("e := &it.%s", e.GoName)
@@ -1660,7 +1662,7 @@ func (g *gen) versionHelpers(e *schema.Entity) {
 		g.p("if required && expect == 0 {")
 		g.p("return dynago.Guard{}, dynago.ErrVersionRequired")
 		g.p("}")
-		g.p("return dynago.Guard{ExpectRev: expect, Version: %sVersion%s, NotFound: Err%sNotFound}, nil", lo, ttl, e.GoName)
+		g.p("return dynago.Guard{ExpectRev: expect%s, NotFound: Err%sNotFound}, nil", ttl, e.GoName)
 		g.p("}")
 		g.p("")
 	}
@@ -1681,7 +1683,7 @@ func (g *gen) versionHelpers(e *schema.Entity) {
 		g.p("if expect != 0 && expect != from.loaded.rev {")
 		g.p("return nil, false, dynago.ErrVersionMismatch")
 		g.p("}")
-		g.p("return &%sItem{%s: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v}, true, nil", lo, e.GoName)
+		g.p("return &%sItem{%s: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v, raw: from.loaded.raw}, true, nil", lo, e.GoName)
 		g.p("}")
 		g.p("if required && expect == 0 {")
 		g.p("return nil, false, dynago.ErrVersionRequired")
@@ -1699,13 +1701,31 @@ func (g *gen) versionHelpers(e *schema.Entity) {
 	}
 }
 
-// newerGuard refuses to rewrite an item that newer code wrote: this code would drop what the newer
-// schema stored and compute its derived items with the older definitions.
-func (g *gen) newerGuard(e *schema.Entity) {
-	lo := lowerFirst(e.GoName)
-	g.p("if it.V > %sVersion {", lo)
-	g.p("return fmt.Errorf(\"%%w: %s at v%%d, this code is v%%d\", dynago.ErrNewerSchema, it.V, %sVersion)", e.Name, lo)
-	g.p("}")
+// knownAttrs emits the attributes this code writes on an entity's items. Rewrites keep any others:
+// a newer compatible version of the code may have written them.
+func (g *gen) knownAttrs(e *schema.Entity) {
+	attrs := []string{schema.AttrPK, schema.AttrSK, schema.AttrType, schema.AttrVer, schema.AttrRev}
+	for _, f := range e.Fields {
+		attrs = append(attrs, f.Attr)
+	}
+	for _, ix := range e.Indexes {
+		if ix.Strategy == schema.StrategyGSI {
+			attrs = append(attrs, ix.PKAttr)
+			if ix.HasSK {
+				attrs = append(attrs, ix.SKAttr)
+			}
+		}
+	}
+	if e.TTL != nil {
+		attrs = append(attrs, g.m.Table.TTLAttr)
+	}
+	var kv []string
+	for _, a := range attrs {
+		kv = append(kv, fmt.Sprintf("%q: true", a))
+	}
+	g.p("// %sKnown is every attribute this code writes on %s items.", lowerFirst(e.GoName), e.Name)
+	g.p("var %sKnown = map[string]bool{%s}", lowerFirst(e.GoName), strings.Join(kv, ", "))
+	g.p("")
 }
 
 func (g *gen) docComment(name, doc, generated string) {

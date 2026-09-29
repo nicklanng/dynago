@@ -64,6 +64,10 @@ type RawTable struct {
 	Name         string `yaml:"name"`
 	Doc          string `yaml:"doc"`
 	TTLAttribute string `yaml:"ttl_attribute"`
+	// Generation numbers the physical table: a change existing items don't fit starts a new one.
+	Generation int `yaml:"generation"`
+	// Retain lists older generations whose tables are kept (declared in Terraform) for rollback.
+	Retain []int `yaml:"retain"`
 }
 
 // RawEntity describes one entity and everything derived from it.

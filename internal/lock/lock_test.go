@@ -1,7 +1,6 @@
 package lock
 
 import (
-	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -12,7 +11,7 @@ import (
 const v1 = `
 dynago: 1
 package: things
-table: { name: things }
+table: { name: things, generation: %g }
 entities:
   Thing:
     version: %d
@@ -20,7 +19,7 @@ entities:
       tenantId: string
       thingId: string
       kind: { type: enum, values: [a, b] }
-    key: { pk: "T#{tenantId}", sk: "THING#{thingId}" }
+%f    key: { pk: "T#{tenantId}", sk: "THING#{thingId}" }
 %s`
 
 const counter = `    counters:
@@ -31,186 +30,142 @@ const counter = `    counters:
           a: { count: true, where: { kind: a } }
 `
 
-func model(t *testing.T, version int, extra string) *schema.Model {
+// model parses the test schema at a table generation and entity version, with extra fields and
+// extra entity sections.
+func model(t *testing.T, gen, version int, fields, extra string) *schema.Model {
 	t.Helper()
-	src := strings.Replace(strings.Replace(v1, "%d", strconv.Itoa(version), 1), "%s", extra, 1)
-	m, err := schema.Parse([]byte(src))
+	r := strings.NewReplacer("%g", strconv.Itoa(gen), "%d", strconv.Itoa(version), "%f", fields, "%s", extra)
+	m, err := schema.Parse([]byte(r.Replace(v1)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return m
 }
 
-func TestFirstGenerateRecordsVersion(t *testing.T) {
-	empty := &File{Dynago: 1, Entities: map[string]*History{}}
-	m := model(t, 1, counter)
-	next, notes, err := Apply(m, empty, Options{})
-	if err != nil || len(notes) != 0 {
-		t.Fatalf("apply: %v %v", notes, err)
+func empty() *File { return &File{Dynago: 1, Entities: map[string]*History{}} }
+
+func apply(t *testing.T, m *schema.Model, prev *File) *File {
+	t.Helper()
+	next, _, err := Apply(m, prev, Options{})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if h := next.Entities["Thing"]; len(h.Versions) != 1 || h.Versions[0].Version != 1 {
+	return next
+}
+
+func TestFirstGenerateRecordsVersionAndTable(t *testing.T) {
+	next := apply(t, model(t, 1, 1, "", counter), empty())
+	if h := next.Entities["Thing"]; len(h.Versions) != 1 || h.Versions[0].Version != 1 || h.Versions[0].gen() != 1 {
 		t.Fatalf("history = %+v", h)
 	}
-	if m.Entities[0].Counters[0].Since != 1 {
-		t.Fatalf("since = %d", m.Entities[0].Counters[0].Since)
+	if next.Generation != 1 || next.Table(1) == nil {
+		t.Fatalf("generation %d, tables %+v", next.Generation, next.Tables)
 	}
 }
 
 func TestShapeChangeNeedsVersionBump(t *testing.T) {
-	empty := &File{Dynago: 1, Entities: map[string]*History{}}
-	lock1, _, err := Apply(model(t, 1, ""), empty, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Same version, new counter: refused, with the change named.
-	_, _, err = Apply(model(t, 1, counter), lock1, Options{})
-	if err == nil || !strings.Contains(err.Error(), "version: 2") || !strings.Contains(err.Error(), "counter Kinds added") {
-		t.Fatalf("want a bump error, got %v", err)
-	}
-	// Versions never go backwards.
-	lock2, _, err := Apply(model(t, 2, ""), lock1, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := Apply(model(t, 1, ""), lock2, Options{}); err == nil || !strings.Contains(err.Error(), "older than") {
-		t.Fatalf("want a backwards error, got %v", err)
-	}
-}
-
-func TestNewCounterOnlyCountsNewVersions(t *testing.T) {
-	empty := &File{Dynago: 1, Entities: map[string]*History{}}
-	lock1, _, err := Apply(model(t, 1, ""), empty, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	m2 := model(t, 2, counter)
-	lock2, notes, err := Apply(m2, lock1, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Items written at v1 never contributed to the counter.
-	if got := m2.Entities[0].Counters[0].Since; got != 2 {
-		t.Fatalf("since = %d, want 2", got)
-	}
-	if len(notes) != 1 || !notes[0].Warning || !strings.Contains(notes[0].Message, "needs a backfill") {
-		t.Fatalf("notes = %+v", notes)
-	}
-	// A later version that keeps the counter unchanged keeps its introduction version.
-	m3 := model(t, 3, counter)
-	if _, _, err := Apply(m3, lock2, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	if got := m3.Entities[0].Counters[0].Since; got != 2 {
-		t.Fatalf("since after v3 = %d, want 2", got)
-	}
-	// Unchanged schema at the same version is a no-op.
-	again, notes, err := Apply(model(t, 2, counter), lock2, Options{})
-	if err != nil || len(notes) != 0 || len(again.Entities["Thing"].Versions) != 2 {
-		t.Fatalf("re-apply: %+v %v %v", again, notes, err)
-	}
-}
-
-const counterPlus = `    counters:
-      Kinds:
-        pk: "K#{tenantId}"
-        sk: "KINDS"
-        values:
-          a: { count: true, where: { kind: a } }
-          b: { count: true, where: { kind: b } }
-`
-
-// Adding a value to an existing counter must not re-gate the values older items already count.
-func TestGatingIsPerCounterValue(t *testing.T) {
-	empty := &File{Dynago: 1, Entities: map[string]*History{}}
-	l1, _, err := Apply(model(t, 1, counter), empty, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	m2 := model(t, 2, counterPlus)
-	if _, _, err := Apply(m2, l1, Options{}); err != nil {
-		t.Fatal(err)
-	}
-	c := m2.Entities[0].Counters[0]
-	if c.Since != 1 || c.Values[0].Since != 1 || c.Values[1].Since != 2 {
-		t.Fatalf("since: counter %d, a %d, b %d", c.Since, c.Values[0].Since, c.Values[1].Since)
-	}
-}
-
-func TestInPlaceChangesAreRefused(t *testing.T) {
-	empty := &File{Dynago: 1, Entities: map[string]*History{}}
-	l1, _, err := Apply(model(t, 1, counter), empty, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	changed := strings.Replace(counter, "where: { kind: a }", "where: { kind: b }", 1)
-	if _, _, err := Apply(model(t, 2, changed), l1, Options{}); err == nil || !strings.Contains(err.Error(), "cannot change what it counts in place") {
-		t.Fatalf("want refusal, got %v", err)
-	}
-	moved := strings.Replace(counter, `pk: "K#{tenantId}"`, `pk: "K2#{tenantId}"`, 1)
-	if _, _, err := Apply(model(t, 2, moved), l1, Options{}); err == nil || !strings.Contains(err.Error(), "cannot change its keys") {
-		t.Fatalf("want refusal, got %v", err)
-	}
-}
-
-// A lost lock file must not silently restart history: everything would look introduced at the
-// current version, and deleting older items would never release what they contributed.
-func TestMissingHistoryAboveVersionOneIsRefused(t *testing.T) {
-	empty := &File{Dynago: 1, Entities: map[string]*History{}}
-	_, _, err := Apply(model(t, 3, counter), empty, Options{})
-	if err == nil || !strings.Contains(err.Error(), "no history for it") {
+	l1 := apply(t, model(t, 1, 1, "", ""), empty())
+	if _, _, err := Apply(model(t, 1, 1, "      note: string\n", ""), l1, Options{}); err == nil || !strings.Contains(err.Error(), "version: 2") {
 		t.Fatalf("got %v", err)
 	}
-	next, _, err := Apply(model(t, 3, counter), empty, Options{NewHistory: true})
+	l2 := apply(t, model(t, 1, 2, "      note: string\n", ""), l1)
+	if _, _, err := Apply(model(t, 1, 1, "", ""), l2, Options{}); err == nil || !strings.Contains(err.Error(), "older than") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// Changes existing items still fit stay in the table generation; others need a new one.
+func TestCompatibleChangesStayInTheGeneration(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "      old: string\n", counter), empty())
+	for name, fields := range map[string]string{
+		"optional field added": "      old: string\n      note: string\n",
+		"field removed":        "",
+	} {
+		if _, _, err := Apply(model(t, 1, 2, fields, counter), l1, Options{}); err != nil {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if _, _, err := Apply(model(t, 1, 2, "      old: string\n", ""), l1, Options{}); err != nil {
+		t.Errorf("counter removed: %v", err)
+	}
+}
+
+func TestIncompatibleChangesNeedANewGeneration(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "      old: string\n", ""), empty())
+	for name, c := range map[string]struct{ fields, extra, want string }{
+		"counter added":        {"      old: string\n", counter, "counter value Kinds.a added"},
+		"required field added": {"      old: string\n      must: { type: string, required: true }\n", "", "field must added as required"},
+		"field type changed":   {"      old: int\n", "", "field old changed"},
+		"attribute renamed":    {"      old: { type: string, attr: o }\n", "", "field old changed"},
+		"unique claim added":   {"      old: string\n", "    unique:\n      Old: { fields: [old] }\n", "unique claim Old added"},
+	} {
+		_, _, err := Apply(model(t, 1, 2, c.fields, c.extra), l1, Options{})
+		if err == nil || !strings.Contains(err.Error(), c.want) || !strings.Contains(err.Error(), "table.generation: 2") {
+			t.Errorf("%s: got %v", name, err)
+		}
+		// In a new generation the same change is fine, and the previous shapes are known.
+		m := model(t, 2, 2, c.fields, c.extra)
+		if _, _, err := Apply(m, l1, Options{}); err != nil {
+			t.Errorf("%s in a new generation: %v", name, err)
+			continue
+		}
+		if m.Previous == nil || m.Previous.Generation != 1 || len(m.Previous.Entities["Thing"]) != 4 {
+			t.Errorf("%s: previous = %+v", name, m.Previous)
+		}
+	}
+	src := strings.Replace(v1, "values: [a, b]", "values: [a]", 1)
+	m, err := schema.Parse([]byte(strings.NewReplacer("%g", "1", "%d", "2", "%f", "      old: string\n", "%s", "").Replace(src)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Apply(m, l1, Options{}); err == nil || !strings.Contains(err.Error(), "enum kind no longer has b") {
+		t.Errorf("enum value removed: got %v", err)
+	}
+}
+
+func TestGenerationsGoUpByOne(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "", ""), empty())
+	if _, _, err := Apply(model(t, 3, 1, "", ""), l1, Options{}); err == nil || !strings.Contains(err.Error(), "must go up by one") {
+		t.Fatalf("got %v", err)
+	}
+	l2 := apply(t, model(t, 2, 1, "", ""), l1)
+	if _, _, err := Apply(model(t, 1, 1, "", ""), l2, Options{}); err == nil || !strings.Contains(err.Error(), "only go up") {
+		t.Fatalf("got %v", err)
+	}
+	if l2.Table(1) == nil || l2.Table(2) == nil {
+		t.Fatalf("tables = %+v", l2.Tables)
+	}
+}
+
+func TestRetainNeedsARecordedTable(t *testing.T) {
+	src := strings.Replace(v1, "generation: %g }", "generation: %g, retain: [1] }", 1)
+	m, err := schema.Parse([]byte(strings.NewReplacer("%g", "2", "%d", "1", "%f", "", "%s", "").Replace(src)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Apply(m, empty(), Options{NewHistory: true}); err == nil || !strings.Contains(err.Error(), "no record of generation 1") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// A lost lock file must not silently restart the history.
+func TestMissingHistoryIsRefused(t *testing.T) {
+	if _, _, err := Apply(model(t, 1, 3, "", counter), empty(), Options{}); err == nil || !strings.Contains(err.Error(), "no history for it") {
+		t.Fatalf("got %v", err)
+	}
+	if _, _, err := Apply(model(t, 2, 1, "", ""), empty(), Options{}); err == nil || !strings.Contains(err.Error(), "generation 2, but the lock file has no history") {
+		t.Fatalf("got %v", err)
+	}
+	next, _, err := Apply(model(t, 1, 3, "", counter), empty(), Options{NewHistory: true})
 	if err != nil || next.Entities["Thing"].Versions[0].Version != 3 {
 		t.Fatalf("with NewHistory: %v", err)
 	}
 }
 
-func TestLateCallerLimitOnARequiredEntityIsRefused(t *testing.T) {
-	src := func(version int, value string) *schema.Model {
-		m, err := schema.Parse([]byte(fmt.Sprintf(`
-dynago: 1
-package: things
-table: { name: things }
-entities:
-  Box:
-    version: %d
-    fields:
-      boxId: string
-      state: { type: enum, values: [empty, full] }
-    key: { pk: "BOX#{boxId}", sk: "BOX" }
-    counters:
-      Boxes: { pk: "BOXES", sk: "C", values: { empty: count%s } }
-  Fill:
-    fields:
-      boxId: string
-    key: { pk: "FILL#{boxId}", sk: "FILL" }
-    writes:
-      Do: { create: true, requires: { Box: { key: { boxId: boxId }, when: { state: empty }, set: { state: full } } } }
-`, version, value)))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return m
-	}
-	l1, _, err := Apply(src(1, ""), &File{Dynago: 1, Entities: map[string]*History{}}, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, _, err = Apply(src(2, ", all: { count: true, limit: arg }"), l1, Options{})
-	if err == nil || !strings.Contains(err.Error(), "Fill.Do would fail with ErrLimitRequired") {
-		t.Fatalf("got %v", err)
-	}
-}
-
 // Reordering fields changes nothing stored, so it needs no version bump.
 func TestFieldOrderIsNotAShapeChange(t *testing.T) {
-	empty := &File{Dynago: 1, Entities: map[string]*History{}}
-	l1, _, err := Apply(model(t, 1, counter), empty, Options{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	m := model(t, 1, counter)
+	l1 := apply(t, model(t, 1, 1, "", counter), empty())
+	m := model(t, 1, 1, "", counter)
 	e := m.Entities[0]
 	e.Fields[0], e.Fields[len(e.Fields)-1] = e.Fields[len(e.Fields)-1], e.Fields[0]
 	if _, _, err := Apply(m, l1, Options{}); err != nil {
@@ -221,15 +176,21 @@ func TestFieldOrderIsNotAShapeChange(t *testing.T) {
 func TestShapeRecordsTheTTLAttribute(t *testing.T) {
 	a := Shape{TTL: "expiresAt", TTLAttr: "ttl"}
 	b := Shape{TTL: "expiresAt", TTLAttr: "expires"}
-	if d := strings.Join(Diff(a, b), "\n"); !strings.Contains(d, `TTL attribute changed from "ttl" to "expires"`) {
-		t.Fatalf("diff = %s", d)
+	cs := Changes(a, b, nil)
+	if len(cs) != 1 || cs[0].Compatible || !strings.Contains(cs[0].Text, `TTL attribute changed from "ttl" to "expires"`) {
+		t.Fatalf("changes = %+v", cs)
 	}
 }
 
-func TestGSIProjectionChangeIsARebuild(t *testing.T) {
-	a := Shape{Indexes: []IndexShape{{Name: "ByName", Strategy: "gsi", PK: "N#{name}", Projection: "include", Project: []string{"a"}}}}
-	b := Shape{Indexes: []IndexShape{{Name: "ByName", Strategy: "gsi", PK: "N#{name}", Projection: "include", Project: []string{"a", "b"}}}}
-	if d := strings.Join(Diff(a, b), "\n"); !strings.Contains(d, "deleted and re-created") {
-		t.Fatalf("diff = %s", d)
+// A lock written before generations existed reads as generation 1.
+func TestLocksFromBeforeGenerations(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "", ""), empty())
+	l1.Generation, l1.Tables = 0, nil
+	for i := range l1.Entities["Thing"].Versions {
+		l1.Entities["Thing"].Versions[i].Generation = 0
+	}
+	next := apply(t, model(t, 1, 1, "", ""), l1)
+	if next.Generation != 1 || next.Entities["Thing"].Versions[0].gen() != 1 {
+		t.Fatalf("upgraded lock = %+v", next)
 	}
 }
