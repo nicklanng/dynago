@@ -47,7 +47,7 @@ err = st.Loans.Extend(ctx, key, toollibrary.LoanExtend{DueAt: loan.DueAt.Add(wee
 ```go
 // GET /tools/{id}
 tool, _ := st.Tools.Get(ctx, key)
-w.Header().Set("ETag", strconv.Quote(tool.Version())) // ETags are quoted strings (RFC 7232)
+w.Header().Set("ETag", strconv.Quote(tool.Version())) // ETags are quoted strings (RFC 9110)
 
 // PATCH /tools/{id}
 var version string

@@ -46,7 +46,7 @@ written.
 | Flag | Default | Meaning |
 |---|---|---|
 | `-check` | off | `generate` only: fail instead of writing when outputs are stale. |
-| `-prices` | `0.625,0.125,0.25` | On-demand prices: dollars per million WRU, per million RRU, per GB-month. The default is us-east-1. |
+| `-prices` | `0.625,0.125,0.25` | On-demand prices: dollars per million WRU, per million RRU, per GB-month. The default is us-east-1's Standard table class as published in September 2026; prices change, so check yours. |
 | `-new-history` | off | Accept a schema whose history the lock file doesn't have (entities above version 1, or a table above generation 1), starting the history there. Only right for a new table; otherwise restore the lock file. See [Schema changes](guides/schema-changes.md#the-lock-file). |
 
 ## Exit status

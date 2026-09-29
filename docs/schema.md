@@ -50,7 +50,7 @@ is on-demand. Several entities can share a table; dynago checks they can never b
 | `doc` | no | | Shown at the top of the model document and on the generated `Store`. |
 | `ttl_attribute` | no | `ttl` | Attribute DynamoDB's TTL reads (epoch seconds). Only enabled if an entity declares `ttl`. |
 | `generation` | no | `1` | The table generation. Changes existing items don't fit need a new generation: a new table, filled by the generated migration job. See [Migrations](guides/migrations.md). |
-| `retain` | no | | Older generations whose tables stay in the Terraform, for rollback: `[2]`. Remove a generation to delete its table. |
+| `retain` | no | | Older generations whose tables stay in the Terraform, for rollback: `[2]`. To delete one, turn off its deletion protection outside the Terraform (the generated Terraform always enables it), then remove it here. |
 
 ## Output
 
@@ -148,7 +148,8 @@ value remove the attribute.
 An enum `status` on entity `Loan` generates `type LoanStatus string` and constants such as
 `LoanStatusActive`.
 
-A field may not be called `key` (it would clash with the generated `Key()` method).
+A field may not be called `key` or `version` (the entity's generated `Key()` and `Version()`
+methods), nor `pk`, `sk`, `t`, `v`, `rev` or `ttl` (the stored item's own attributes).
 
 ## Keys
 
@@ -228,13 +229,14 @@ Behaviour:
 - **Copies** are stored in the base table under the index's keys. Their keys must include every
   key field of the entity, without a transform (so each entity has its own copy: `{id|lower}`
   would give "Bob" and "bob" one copy). Entities read through a copy have no version.
-- **Limits.** DynamoDB allows 100 projected attributes per table, summed across all GSIs (dynago's
-  `_t` and `_v`, and the TTL attribute, count in each), and a field's `attr` can't be a GSI's key
-  attribute (`ByCategoryPK`).
+- **Limits.** DynamoDB allows 100 attributes in `INCLUDE` projections per table, summed across its
+  secondary indexes; `ALL` projections don't count. dynago's `_t` and `_v`, and the TTL attribute,
+  count in each `INCLUDE` GSI. A field's `attr` can't be a GSI's key attribute (`ByCategoryPK`).
 - **Results.** A query through an index with `project: all` returns entities; otherwise it returns
   a generated `<Entity><Index>` struct holding the projected fields.
 
-Limits: 20 GSIs per table and 100 projected attributes across a table's GSIs (DynamoDB's defaults).
+Limits: 20 GSIs per table (a default quota AWS can raise), and 100 attributes in `INCLUDE`
+projections across a table's indexes (a fixed limit).
 
 ## Unique
 
@@ -298,7 +300,7 @@ the stored attribute names.
 |---|---|---|---|
 | `pk` | yes | | Counter partition key template, over the entity's fields. |
 | `sk` | yes | | Counter sort key template. Must start with literal text. |
-| `shards` | no | `1` | Spread the counter over this many items (1–100) to raise its write throughput; a read sums them with one BatchGetItem. Bounded values cannot be sharded. |
+| `shards` | no | `1` | Spread the counter over this many items (1–100) to raise its write throughput; a read sums them with a BatchGetItem. Bounded values cannot be sharded. |
 | `values` | yes | | At least one value. |
 | `doc` | no | | Shown in the model document and on the Go type. |
 
@@ -336,12 +338,12 @@ and `counter`.
 |---|---|---|---|
 | `get` | | | `key`: one GetItem by primary key (short form: `Name: get`). `{ unique: Name }`: find the entity holding a unique value — a consistent read of the claim, then of the item. |
 | `query` | | | `key`: query the entity's own partition (items matched by its sort key prefix). An index name: query that index. Exactly one Query request per page. |
-| `counter` | | | Read a counter: one GetItem, or one BatchGetItem over its shards. The counter may belong to any entity of the table, so a library can offer its member counts. |
+| `counter` | | | Read a counter: one GetItem, or a BatchGetItem over its shards. The counter may belong to any entity of the table, so a library can offer its member counts. |
 | `order` | query | `asc` | `asc` or `desc`, by sort key. |
 | `page` | query | `50` | Default page size (items evaluated per request). |
 | `max_page` | query | `max(100, page)` | Largest page a caller may ask for (≤ 1000). |
 | `range` | query | | A field that directly follows the sort key's literal prefix. Adds optional inclusive `From` / `To` bounds to the query. |
-| `consistent` | get, query, counter | `false` | Strongly consistent read (twice the cost). Not allowed on a `gsi` index. |
+| `consistent` | get, query, counter | `false`; `true` for a query through a `copy` index | Strongly consistent read (twice the cost). Not allowed on a `gsi` index. A copy index is read consistently unless it says `consistent: false`: read-your-writes is why it's a copy. |
 | `project` | `query: key` | all fields | Read only these fields (plus key fields): `[name, status]`, or `keys`. Returns a generated `<Entity><Access>Item` type. Saves bandwidth and keeps other fields (secrets, large text) from callers; **DynamoDB still bills the whole item**, so for cheaper lists use an index with a narrow projection. |
 | `doc` | all | | Shown in the model document and on the method. |
 | `rate` | all | | Average calls per second, for the monthly cost estimate. |

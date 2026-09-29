@@ -61,8 +61,10 @@ Either way:
   fields of its index keys are set and `where` holds. `where: { status: active }` gives an index of
   active loans only, so returned loans drop out of the overdue list with no filtering.
 - **Several entities can share a GSI** by using the same index name, when their sort keys are
-  distinguishable by prefix. Each pays for the others' projected attributes, which is usually not
-  worth it: GSIs are cheap to add (up to 20 per table).
+  distinguishable by prefix. The index projects the union of their fields, but an item only carries
+  the attributes it has, so entities don't pay for each other's. The shared costs are the table's
+  budget of 100 projected attributes and the risk of two entities meaning different things by one
+  attribute name. Separate GSIs are usually clearer (up to 20 per table).
 
 A query that only needs a different **order within the same partition** can often use the sort
 key itself: pick the sort key for the most common order and an index for the rest.
@@ -122,19 +124,20 @@ Against that, LSIs have table-wide costs:
 - **They can only be created with the table**, never added or removed. With dynago that's a new
   table generation and a generated migration (see [Migrations](migrations.md)): workable, but a
   full copy of the table each time.
-- **Every partition is capped at 10 GB** (its items plus their LSI entries) as soon as the table has
-  any LSI, including partitions whose items never use it. Writes that would exceed the cap fail.
-  Without LSIs, a partition can grow without limit.
+- **Every partition key value is capped at 10 GB** (its items plus their LSI entries, an "item
+  collection") as soon as the table has any LSI, including values whose items never use it. Writes
+  that would exceed the cap fail with `ItemCollectionSizeLimitExceededException`. Without LSIs, a
+  partition key value's items can grow without limit.
 - **At most 5 per table, with projections fixed at creation.** You must choose between `ALL`, which
   stores each item twice, and a narrower projection, before you know what the index is for.
 
 A common workaround is to create all five up front as generic spares, "in case we need them". That
-has the worst of both: the 10 GB cap from day one on every partition, projections chosen blind,
+has the worst of both: the 10 GB cap from day one on every partition key value, projections chosen blind,
 and index names like `LSI3SK` that tell reviewers nothing. The spares also tend to get used up by
 unrelated features.
 
 Declare an LSI when a domain has a concrete, high-volume need for a consistent sort order within
-a partition, and its partitions will stay well under 10 GB. Otherwise a GSI or a copy index is the
+a partition, and no partition key value's items will come near 10 GB. Otherwise a GSI or a copy index is the
 lighter choice: neither caps partitions, and dropping one needs no new table.
 
 ## 4. Uniqueness: claims

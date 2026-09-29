@@ -97,7 +97,7 @@
         "name": {
           "type": "string",
           "minLength": 1,
-          "description": "Default physical table name (the Terraform variable's default)."
+          "description": "Base table name: each generation's table is <name>-g<generation>. Also the default of the Terraform variable for the base name, and the base of output file names."
         },
         "doc": {
           "$ref": "#/$defs/doc"
@@ -120,7 +120,7 @@
             "minimum": 1
           },
           "uniqueItems": true,
-          "description": "Older generations whose tables stay declared in Terraform, for rollback. Remove one to delete its table."
+          "description": "Older generations whose tables stay declared in Terraform, for rollback. To delete one, turn off its deletion protection outside the Terraform (the generated Terraform always enables it), then remove it here."
         }
       }
     },
@@ -610,7 +610,7 @@
             },
             "consistent": {
               "type": "boolean",
-              "default": false
+              "description": "Strongly consistent read (twice the cost). Default false, except for queries through a copy index, which default to true. Not allowed on a GSI."
             },
             "doc": {
               "$ref": "#/$defs/doc"

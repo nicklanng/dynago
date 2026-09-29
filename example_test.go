@@ -86,7 +86,7 @@ func ExampleIfVersion() {
 	key := toollibrary.ToolKey{LibraryID: "lib_1", ToolID: "t_42"}
 	get := func(w http.ResponseWriter, r *http.Request) {
 		tool, _ := st.Tools.Get(r.Context(), key)
-		w.Header().Set("ETag", strconv.Quote(tool.Version())) // ETags are quoted (RFC 7232)
+		w.Header().Set("ETag", strconv.Quote(tool.Version())) // ETags are quoted (RFC 9110)
 	}
 	put := func(w http.ResponseWriter, r *http.Request) {
 		var version string

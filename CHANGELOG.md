@@ -14,8 +14,8 @@ First version.
   patterns and writes; validation with actionable errors, and a JSON Schema for editors.
 - Generated Go stores on guregu/dynamo v2: one method per declared read and write, typed keys, enum
   types, views for projected indexes and queries, entity-specific errors wrapping `dynago` sentinels.
-- Indexes as GSIs (maintained by DynamoDB) or copies (written in the same transaction), sparse by
-  empty key fields and `where`.
+- Indexes as GSIs (maintained by DynamoDB) or copies (written in the same transaction, and read
+  consistently by default), sparse by empty key fields and `where`.
 - Uniqueness claims, including composite and optional values, moved atomically on change, and
   one claim per element of a `string_set`. Claims point back to their owner.
 - Counters maintained atomically from every write: counts and sums, conditional (`where`), upper
@@ -43,14 +43,18 @@ First version.
 - Document versions for optimistic concurrency: `Version()`, `dynago.From`, `dynago.IfVersion`,
   `dynago.ReturnVersion`, and `versioned: required` writes. Creates set the entity's version.
 - Schema versions stored on every item, a lock file of storage shapes, and required version bumps.
-- Table generations: a change existing items don't fit (a new index, claim or counter, a new key or
-  field type) needs a new generation, a new table named `<name>-g<n>`, with older ones retained
+- Table generations: a change existing items don't fit (a new, changed or dropped index, claim or
+  counter; a new key; a field's type, a reused attribute, or a field made required) needs a new
+  generation, a new table named `<name>-g<n>`, with older ones retained
   for rollback (`table.retain`, declared in the Terraform). Within a generation, rewrites keep
   attributes the code doesn't know, so compatible versions can share a table during rolling
   deploys and rollbacks.
 - A generated migration job (`RunMigration`, and a `main` package with `output.migrate_cmd`):
   `copy` makes a bulk pass and catch-up passes while the old generation serves, and `finish` a
-  last pass with writes stopped. It is resumable, rate-limited and safe to run from several pods.
+  last pass with writes stopped. It is resumable, rate-limited and safe to run from several pods:
+  a lease, renewed as it runs, fences every write, so a job that lost it writes nothing more.
+  Copies follow key changes made while the old generation serves, and conflicts are retried after
+  each pass's removals.
   It rebuilds derived items from the entities, and reports items it can't copy as conflicts. It
   converts entities field by field, or with a `Migrate<Entity>` function where fields don't carry
   over.

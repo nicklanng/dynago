@@ -53,9 +53,11 @@ table isn't touched, so rolling back means pointing the old version at it again.
 
 5. **Run the job, then roll out.** See below.
 
-6. **Later, clean up.** Once you're sure you won't roll back, remove the generation from `retain`.
-   Terraform will then delete the old table. Deletion protection is on, so disable it first,
-   deliberately.
+6. **Later, clean up.** Once you're sure you won't roll back:
+   1. Turn off the old table's deletion protection outside the generated Terraform, for example
+      with `aws dynamodb update-table --table-name prod-toollibrary-g1 --no-deletion-protection-enabled`.
+      The generated Terraform always enables it, so it can't be turned off there.
+   2. Remove the generation from `retain` and apply the Terraform, which then deletes the table.
 
 ## The job
 
@@ -83,22 +85,35 @@ usual environment: credentials, `AWS_REGION`, and `AWS_ENDPOINT_URL_DYNAMODB` fo
 
 Progress is checkpointed per scan segment in the new table (under a partition of its own), so a
 restarted job resumes where it stopped. `-rate` caps items per second across workers, to spare the
-old table's traffic. Every pass reads the whole old table, and for each entity also reads its copy
-in the new table.
+old table's traffic.
+
+**Cost of a pass.** Every pass reads:
+- the whole old table;
+- for each entity, its copy in the new table;
+- the whole new table, to find copies whose source is gone or now converts to another key, along
+  with the sources of those copies.
+
+It writes only what changed. The job holds a lease, renewed as it runs, and every write it makes
+checks it. A job that loses the lease (a paused or partitioned pod) stops without writing more.
 
 ### Conflicts
 
 Some items can't be copied until someone fixes the data in the old table:
 - two old items claiming a value that is now unique;
-- a count past a new constant `limit`;
 - a key value the new schema can't take;
 - an empty required field;
 - two old items converting to the same new key;
 - an error your conversion returns.
 
 The job copies everything else, lists these, and **exits with an error**, so a rollout gated on it
-waits. Fix the data through the old version, then run the job again: fixed items are copied, and
-conflicts for items deleted meanwhile are dropped.
+waits. Order within a pass doesn't cause conflicts: items that conflicted are retried after the
+pass's removals. Say a member left and another joined with the same email; that's fine. Counter
+limits and minimums aren't checked while copying: the counts record what the old table holds, and
+a new limit applies to writes made after the cutover.
+
+Fix the data in the old table, then run the job again. Fixed items are copied, and conflicts for
+items deleted or expired meanwhile are dropped. Fix conflicts during `copy`, while the old version
+still serves, because `finish` runs with it stopped.
 
 ## On Kubernetes
 
@@ -150,6 +165,27 @@ spec:
 - **Rolling back:** deploy the old version, which uses the old table. Writes made to the new table
   after the cutover don't exist in the old one: rollback loses them. To keep them, you'd migrate
   back.
+
+## Permissions
+
+The job and the service need different access. On EKS, give each its own IAM role through IRSA or
+EKS Pod Identity: the AWS SDK's default credential chain, which the generated command uses, picks
+up either.
+
+| Who | Previous generation's table | Current generation's table |
+|---|---|---|
+| The service | none | `GetItem`, `BatchGetItem`, `Query`, `PutItem`, `UpdateItem`, `DeleteItem`, `ConditionCheckItem` |
+| The migration job | `Scan`, `GetItem`, `BatchGetItem` | the service's, plus `Scan` |
+
+- **Resources:** the table ARNs, plus `<table-arn>/index/*` for GSI queries.
+- **Transactions have no IAM action of their own.** Each item in one is authorised by its own
+  action, which is why `ConditionCheckItem` is on the list.
+- **The service never needs `Scan`,** because dynago never scans.
+- **Rollback:** a rolled-back version needs its old access, to the previous table. Keep that in
+  the service's policy while the generation is retained.
+- **The init container in the example runs as the service's service account.** So `finish` run
+  that way needs the job's access in the service's role. The alternative is running `finish` as
+  a second Job, with its own role, between scaling the old version down and starting the new one.
 
 ## Limits
 

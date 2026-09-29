@@ -142,6 +142,6 @@ counter or value is compatible: its counts stay on the counter item, unused.
 
 - **TTL**: an item deleted by TTL is not subtracted, so a counter over an expiring entity counts
   items created, not items that exist. `dynago check` warns.
-- **Several bounded values on one counter item**: if a write breaks one, DynamoDB cannot say which,
-  so the error matches all of their sentinels.
+- **Several bounded values on one counter item**: if a write breaks one, DynamoDB reports that the
+  item's condition failed, not which clause, so the error matches all of their sentinels.
 - Counters count one entity's items. Counting across entities means one counter per entity type.

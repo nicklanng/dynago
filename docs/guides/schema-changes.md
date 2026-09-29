@@ -38,11 +38,13 @@ items record which shape wrote them. Changes: field pronouns added
 | Add an optional field | Read back with the zero value until written | Same table |
 | Add enum values | Hold the old values, which are still valid | Same table |
 | Remove a field | Keep the attribute (unused) | Same table |
-| Remove an index, claim, counter or counter value | Keep their entries, claims or counts, unused | Same table |
+| Re-add a removed field with its old type | Hold values of that type, which are still valid | Same table |
+| Remove an index, claim, counter or counter value | Keep them, and an older version still running (a rolling deploy, a rollback) keeps maintaining them while the new one doesn't | New generation |
 | Add or change an index (GSI or copy) | Have no entry, or the old one | New generation |
 | Add or change a unique claim | Aren't claimed; duplicates possible | New generation |
 | Add or change a counter or counter value | Aren't counted | New generation |
-| Add a required field | Don't have it | New generation |
+| Add a required field, or make a field required | Don't have it | New generation |
+| Store another type in an attribute used earlier in the generation (a removed field re-added with another type, or its attribute reused) | Hold the old type | New generation |
 | Change a field's type or attribute | Hold the old one | New generation |
 | Remove enum values | May hold them | New generation |
 | Change the primary key or TTL field | Are under the old key, or expire by the old field | New generation |

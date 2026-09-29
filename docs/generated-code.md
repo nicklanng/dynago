@@ -81,10 +81,10 @@ And, from the runtime directly:
 | `dynago.ErrConflict` | The item kept changing, or other transactions kept holding its items (a single-item write can be blocked by a transaction too), until retries ran out (about half a second by default; `dynago.SetRetries` changes the policy). | it is the result of retries |
 | `dynago.ErrMigrationConflict` | The migration job couldn't copy some items (see [Migrations](guides/migrations.md#conflicts)). | no: fix the data and run it again |
 | `dynago.ErrSameItemTwice` | A write would touch one item twice in a transaction, which DynamoDB rejects. dynago refuses the schema shapes that cause it, so this means a bug: please report it. | no |
-| `dynago.ErrTooManyItems` | The write would exceed DynamoDB's 100-item transaction limit. | no |
+| `dynago.ErrTooManyItems` | The write would exceed DynamoDB's 100-item transaction limit. (Transactions are also limited to 4 MB in total, which DynamoDB itself reports.) | no |
 
-When several bounded values of one counter item are checked in a single write, DynamoDB cannot say
-which one failed, so the error matches each of their sentinels.
+When several bounded values of one counter item are checked in a single write, DynamoDB reports that
+the item's condition failed, not which clause, so the error matches each of their sentinels.
 
 ## Reads
 
@@ -153,7 +153,8 @@ projected base queries the `<Entity><Access>Item` type.
 func (s *LibraryStore) MemberStats(ctx context.Context, k MemberCountsKey) (MemberCounts, error)
 ```
 
-One GetItem, or one BatchGetItem over all shards of a sharded counter, summed. A counter that
+One GetItem, or a BatchGetItem over all shards of a sharded counter, summed (DynamoDB may return
+some keys unprocessed, which are fetched again). A counter that
 nothing has written reads as zero. The method can live on any entity's store (here the library
 reads the member counts).
 
