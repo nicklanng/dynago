@@ -133,11 +133,10 @@ to check: put them in a counter of their own.
 
 ## Adding a counter to existing data
 
-A counter value added in schema version 3 only counts items written at version 3 or later: older
-items never contributed, so updating or deleting them doesn't subtract anything. Each older item
-starts contributing the next time any write rewrites it, and that write takes the value's limit
-too. Until every older item has been rewritten (a backfill, see the roadmap), a new counter
-undercounts. `dynago generate` says so when you add one. See [Schema changes](schema-changes.md).
+Existing items were never counted, so a new counter, a new value, or a changed definition needs a
+new table generation. The migration job copies every entity into the new table, and each copy
+adds its contribution, so the counter starts exact. See [Migrations](migrations.md). Removing a
+counter or value is compatible: its counts stay on the counter item, unused.
 
 ## Caveats
 

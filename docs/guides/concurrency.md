@@ -99,9 +99,10 @@ real entity, the planned fix is marking such writes as not changing the user-fac
 
 - **Delete and re-create.** Revisions start at a random value, so an item deleted and re-created
   between your read and your write is detected as a change, never mistaken for the one you read.
-- **Rolling deploys.** On every write path, an old instance refuses to change an item a newer
-  instance wrote (`dynago.ErrNewerSchema`), so it cannot drop fields or skip counter changes it
-  doesn't know about.
+- **Rolling deploys.** Code at two compatible versions shares a table (see
+  [Schema changes](schema-changes.md)). When an older version rewrites an item a newer one wrote, it
+  keeps the attributes it doesn't know, so it can't drop the newer version's fields. Incompatible
+  changes use a new table, so old and new code never disagree about derived items.
 - **SDK retries.** Transactions carry an idempotency token, and a single-item create recognises its
   own item (by its random revision) if the SDK retries it after it succeeded. So the AWS SDK's
   automatic retries can neither apply a write twice nor turn a success into "already exists".

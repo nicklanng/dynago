@@ -87,7 +87,7 @@ entities:
 | Key | Required | Default | Meaning |
 |---|---|---|---|
 | `doc` | no | | Documentation for the Go type and the model document. A noun phrase with an article ("A member borrowing a tool.") reads as "Loan is a member borrowing a tool."; anything else becomes its own paragraph after a generated first sentence. |
-| `version` | no | `1` | Storage shape version. **Bump it whenever fields, keys, indexes, claims or counters change**; `dynago generate` refuses otherwise. See [Schema changes](guides/schema-changes.md). |
+| `version` | no | `1` | Storage shape version. **Bump it whenever fields, keys, indexes, claims or counters change**; `dynago generate` refuses otherwise. A change existing items don't fit also needs a new table generation. See [Schema changes](guides/schema-changes.md). |
 | `fields` | yes | | The entity's attributes. See [Fields](#fields). |
 | `key` | yes | | The primary key templates: `pk` and `sk`. See [Keys](#keys). |
 | `ttl` | no | | A `time` field. DynamoDB deletes the item after that time. Expired items do **not** update counters or release claims and copies (`dynago check` warns). |
@@ -519,6 +519,7 @@ Checked by `dynago` beyond the JSON Schema:
   DynamoDB deletes them (which can take days); a create may replace an expired item.
 - **Consistency.** `consistent: true` is not allowed on a GSI query.
 - **Transactions.** `dynago check` reports writes that could exceed 100 items.
-- **Versions.** Changing an entity's storage shape (fields and their attributes and types, keys,
-  TTL, indexes, claims, counters) requires a higher `version`. Some changes are refused even with a
-  bump because existing items would be stranded; see [Schema changes](guides/schema-changes.md).
+- **Versions and generations.** Changing an entity's storage shape (fields and their attributes
+  and types, keys, TTL, indexes, claims, counters) requires a higher `version`. A change existing
+  items don't fit also needs a new `table.generation`, filled by the migration job; see
+  [Schema changes](guides/schema-changes.md).

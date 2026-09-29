@@ -102,24 +102,26 @@ access:
   so no index can sort by it: write the value onto the item (a periodic job, for example), or use a
   search engine.
 
-Adding an order to a table that already has data needs a backfill: dynago stores index keys as
-their own attributes, which older items don't have until something rewrites them.
+Adding an order to a table that already has data needs a new table generation: dynago stores
+index keys as their own attributes, which older items don't have. The migration job copies every
+item into a new table with the new index. See [Migrations](migrations.md).
 
-### Why no LSIs?
+### LSIs
 
 A local secondary index (LSI) is another sort order on the same partition key, maintained by
-DynamoDB in step with the item. dynago doesn't support them, deliberately.
+DynamoDB in step with the item. dynago doesn't support them yet; they're next on the roadmap.
 
 An LSI's one unique feature is a combination: strongly consistent reads, in another order, within
-one partition, without a transaction on each write. Drop any one of those and something you can add
-or remove at any time covers it: a GSI (if a moment's lag is fine) or a copy index (if it isn't).
+one partition, without a transaction on each write. Drop any one of those and something without an
+LSI's costs covers it: a GSI (if a moment's lag is fine) or a copy index (if it isn't).
 The price of a copy instead of an LSI is that affected writes become transactions. For a small item
 that's about 4 WRU per write instead of 2, usually a few dollars a month.
 
-Against that, LSIs are permanent and have table-wide costs:
+Against that, LSIs have table-wide costs:
 
-- **They can only be created with the table**, never added or removed. A missed sort order means a
-  new table and a data migration.
+- **They can only be created with the table**, never added or removed. With dynago that's a new
+  table generation and a generated migration (see [Migrations](migrations.md)): workable, but a
+  full copy of the table each time.
 - **Every partition is capped at 10 GB** (its items plus their LSI entries) as soon as the table has
   any LSI, including partitions whose items never use it. Writes that would exceed the cap fail.
   Without LSIs, a partition can grow without limit.
@@ -131,11 +133,9 @@ has the worst of both: the 10 GB cap from day one on every partition, projection
 and index names like `LSI3SK` that tell reviewers nothing. The spares also tend to get used up by
 unrelated features.
 
-The decision is made per table, when the table is created. With a table per domain, that is when
-the domain is designed and its access patterns are best known. If a domain ever has a concrete,
-high-volume need for a consistent sort order within a partition, `strategy: lsi` can be added to
-dynago for new tables then. Until that need exists, the options you can take back are the safer
-choice.
+Declare an LSI when a domain has a concrete, high-volume need for a consistent sort order within
+a partition, and its partitions will stay well under 10 GB. Otherwise a GSI or a copy index is the
+lighter choice: neither caps partitions, and dropping one needs no new table.
 
 ## 4. Uniqueness: claims
 

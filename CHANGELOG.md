@@ -42,9 +42,18 @@ First version.
 - `{field|lower}` key template transform, for case-insensitive ordering and uniqueness.
 - Document versions for optimistic concurrency: `Version()`, `dynago.From`, `dynago.IfVersion`,
   `dynago.ReturnVersion`, and `versioned: required` writes. Creates set the entity's version.
-- Schema versions stored on every item, a lock file of storage shapes, required version bumps,
-  gating of counter values, claims and copies by the version that introduced them, and refusal of
-  in-place changes that would strand existing items.
+- Schema versions stored on every item, a lock file of storage shapes, and required version bumps.
+- Table generations: a change existing items don't fit (a new index, claim or counter, a new key or
+  field type) needs a new generation, a new table named `<name>-g<n>`, with older ones retained
+  for rollback (`table.retain`, declared in the Terraform). Within a generation, rewrites keep
+  attributes the code doesn't know, so compatible versions can share a table during rolling
+  deploys and rollbacks.
+- A generated migration job (`RunMigration`, and a `main` package with `output.migrate_cmd`):
+  `copy` makes a bulk pass and catch-up passes while the old generation serves, and `finish` a
+  last pass with writes stopped. It is resumable, rate-limited and safe to run from several pods.
+  It rebuilds derived items from the entities, and reports items it can't copy as conflicts. It
+  converts entities field by field, or with a `Migrate<Entity>` function where fields don't carry
+  over.
 - Model document with Mermaid diagrams, Terraform JSON (with point-in-time recovery, deletion
   protection and TTL) and CreateTable JSON.
 - Read-free writes only when the key of every counter they change is known; `versioned: required`
@@ -53,10 +62,8 @@ First version.
   reserved field names, `when` on key fields, requires touching an item twice, copy keys that
   transform the entity key, more than 100 projected attributes across GSIs, fields named like GSI
   key attributes.
-- Lock file: refuses a missing history above version 1 (`-new-history` to start one), records the
-  TTL attribute, ignores declaration order, explains GSI projection changes as rebuilds, refuses
-  late `limit: arg` values on entities changed through requires, and upgrades older lock files in
-  place.
+- Lock file: refuses a missing history (`-new-history` to start one), records the TTL attribute and
+  each generation's table, ignores declaration order, and upgrades older lock files in place.
 - CLI flags may follow the schema files.
 - Cost and risk report: sizes, capacity per call (including condition checks), monthly cost from
   declared rates, storage, and findings (item size, large fields, transaction size, hot and
@@ -68,8 +75,7 @@ First version.
   `dynago.ErrLimitRequired`.
 - Retry-safe writes: idempotent transactions, and single-item creates that recognise their own item
   after an SDK retry.
-- Random starting revisions; refusal to change items written by a newer schema version on every
-  write path; configurable, capped retries (`dynago.SetRetries`).
+- Random starting revisions; configurable, capped retries (`dynago.SetRetries`).
 - TTL-aware reads and writes: expired items are absent before DynamoDB deletes them, and a create
   may replace one.
 - Key values containing the separator that follows them in a key identifying an item are rejected;
@@ -89,6 +95,7 @@ First version.
 ### Example
 
 - `toollibrary`, a fictional neighbourhood tool library using every feature: borrowing and
-  returning change the tool atomically, and holds reserve a tool until they lapse. End-to-end tests
+  returning change the tool atomically, and holds reserve a tool until they lapse. It is at table
+  generation 2 (barcodes), with its migration command. End-to-end tests
   (`internal/e2e`) show a refused borrow leaves the table unchanged and ten racing borrowers get
   one tool.

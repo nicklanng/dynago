@@ -94,7 +94,7 @@ import (
     "example.com/todo/tasks"
 )
 
-st := tasks.New(dynamo.New(awsConfig), "tasks")
+st := tasks.New(dynamo.New(awsConfig), tasks.TableName("tasks"))   // the table "tasks-g1"
 
 err := st.Tasks.Add(ctx, &tasks.Task{ProjectID: "p1", TaskID: "t1", Title: "Write docs"})
 
@@ -158,10 +158,10 @@ To create the table by hand instead (for running your app locally):
 ```sh
 aws dynamodb create-table --cli-input-json file://tasks.table.json --endpoint-url http://localhost:8000
 # CreateTable can't enable TTL; if an entity has `ttl:`, turn it on separately:
-aws dynamodb update-time-to-live --table-name tasks --time-to-live-specification Enabled=true,AttributeName=ttl --endpoint-url http://localhost:8000
+aws dynamodb update-time-to-live --table-name tasks-g1 --time-to-live-specification Enabled=true,AttributeName=ttl --endpoint-url http://localhost:8000
 ```
 
-or call `tasks.EnsureTable(ctx, db, "tasks")` at startup in development.
+or call `tasks.EnsureTable(ctx, db, tasks.TableName("tasks"))` at startup in development.
 
 ## 6. Commit everything, and check it in CI
 

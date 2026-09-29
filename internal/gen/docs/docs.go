@@ -42,6 +42,20 @@ func (d *doc) render(source string) {
 		d.p("%s", m.Table.Doc)
 		d.p("")
 	}
+	gen := fmt.Sprintf("Table generation **%d**: `%s`.", m.Table.Generation, m.Table.GenerationTable(m.Table.Generation))
+	if p := m.Previous; p != nil {
+		gen += fmt.Sprintf(" It is filled from generation %d (`%s`) by the migration job (`RunMigration`)", p.Generation, m.Table.GenerationTable(p.Generation))
+		if len(m.Table.Retain) > 0 {
+			var kept []string
+			for _, g := range m.Table.Retain {
+				kept = append(kept, "`"+m.Table.GenerationTable(g)+"`")
+			}
+			gen += "; " + strings.Join(kept, ", ") + " stays for rollback"
+		}
+		gen += ". See the [migrations guide](https://github.com/nicklanng/dynago/blob/main/docs/guides/migrations.md)."
+	}
+	d.p("%s", gen)
+	d.p("")
 	contents := []string{"[Table](#table)"}
 	for _, e := range m.Entities {
 		contents = append(contents, "["+e.Name+"](#"+strings.ToLower(e.Name)+")")
@@ -455,7 +469,8 @@ func (d *doc) primer() {
 - **Access patterns** are the only reads the code can do: each is one request (or two for a lookup by a unique value). A query nobody declared does not exist as a method, so every new way of reading data shows up in review as a schema change.
 - **Costs** are in DynamoDB capacity units: a write costs 1 WRU per KB, a read 1 RRU per 4 KB (half for eventually consistent reads), and transactions cost double.
 - **Document versions** guard against lost updates. Every entity the store returns knows the version it was read at (` + "`Version()`" + `, an opaque string suitable for an ETag). Passing it back with a write (` + "`dynago.IfVersion`" + `, or the entity itself with ` + "`dynago.From`" + `) makes the write fail if anyone changed the item since, rather than silently overwriting their change. Writes marked *required* refuse to run without one.
-- **Schema versions** are stored on every item (` + "`_v`" + `), along with the entity type (` + "`_t`" + `) and a revision counter (` + "`_rev`" + `) that guards read-modify-write updates.`)
+- **Schema versions** are stored on every item (` + "`_v`" + `), along with the entity type (` + "`_t`" + `) and a revision counter (` + "`_rev`" + `) that guards read-modify-write updates.
+- **Table generations.** A schema change that existing items don't fit (a new index, claim or counter, a changed key) moves the data to a new table, ` + "`<name>-g<generation>`" + `, copied by a generated migration job; the old table stays for rollback.`)
 	d.p("")
 }
 

@@ -19,16 +19,18 @@ configurable with [`output`](schema.md#output)):
 |---|---|
 | `<table>_dynago.go` | The typed store. See [Generated code](generated-code.md). |
 | `<table>.model.md` | The data model document: items, keys, indexes, access patterns, writes, costs, risks, diagrams. |
-| `<table>.tf.json` | Terraform (JSON syntax): a variable for the table name, the `aws_dynamodb_table` resource with its GSIs, TTL, point-in-time recovery and deletion protection, and the table ARN output. |
+| `<table>.tf.json` | Terraform (JSON syntax): a variable for the base name, an `aws_dynamodb_table` resource (`<base>-g<generation>`) with its GSIs, TTL, point-in-time recovery and deletion protection for the current table generation and each one in `retain`, and their ARNs. |
 | `<table>.table.json` | The same keys and indexes as input for `aws dynamodb create-table --cli-input-json`, for local development. CreateTable can't set TTL or point-in-time recovery: enable TTL with `aws dynamodb update-time-to-live` (or `EnsureTable`). Production tables belong in the Terraform, which sets TTL, point-in-time recovery and deletion protection. |
-| `<table>.dynago.lock` | Each entity's storage shape per version. See [Schema changes](guides/schema-changes.md). |
+| `<table>.dynago.lock` | Each entity's storage shape per version, and each table generation. See [Schema changes](guides/schema-changes.md). |
+| `<migrate_cmd>/main.go` | With `output.migrate_cmd` set: the migration job's main package. See [Migrations](guides/migrations.md). |
 
 Files whose content hasn't changed are not rewritten. Nothing is written if the schema is invalid,
-if its storage shape changed without a version bump, or if the cost report has errors (such as an
-item that can exceed 400 KB).
+if its storage shape changed without a version bump, if a change existing items don't fit is made
+without a new table generation, or if the cost report has errors (such as an item that can exceed
+400 KB).
 
 It also prints a note for each change since the last recorded version, marked as a warning where
-existing data needs a backfill or cleanup.
+it needs the new generation's migration job.
 
 `-check` writes nothing and fails if any file is out of date. Run it in CI so the committed
 model document and code always match the schema.
@@ -45,7 +47,7 @@ written.
 |---|---|---|
 | `-check` | off | `generate` only: fail instead of writing when outputs are stale. |
 | `-prices` | `0.625,0.125,0.25` | On-demand prices: dollars per million WRU, per million RRU, per GB-month. The default is us-east-1. |
-| `-new-history` | off | Accept entities above version 1 that the lock file has no history for, starting their history at the current version. Only right when no stored item predates that version (a new table); otherwise restore the lock file. See [Schema changes](guides/schema-changes.md#the-lock-file). |
+| `-new-history` | off | Accept a schema whose history the lock file doesn't have (entities above version 1, or a table above generation 1), starting the history there. Only right for a new table; otherwise restore the lock file. See [Schema changes](guides/schema-changes.md#the-lock-file). |
 
 ## Exit status
 

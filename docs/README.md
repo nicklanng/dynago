@@ -21,7 +21,10 @@
 - [Counters](guides/counters.md): exact counts, limits, lower bounds, sharding.
 - [Concurrency](guides/concurrency.md): what dynago guarantees, and preventing lost updates with
   document versions.
-- [Schema changes](guides/schema-changes.md): versions, the lock file, and changing a live schema.
+- [Schema changes](guides/schema-changes.md): versions, table generations, the lock file, and which
+  changes need a new table.
+- [Migrations](guides/migrations.md): the generated job that fills a new table generation, and
+  running it on Kubernetes.
 - [Costs and risks](guides/costs.md): how the estimates are made and what the findings mean.
 
 **Project**

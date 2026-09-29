@@ -13,14 +13,18 @@ counter `MemberLoans`, index `Overdue`, and so on.
 
 | Name | What it is |
 |---|---|
+| `Generation`, `TableName(base) string` | The table generation this code uses, and its table's name for a base name: `TableName("prod-toollibrary")` is `"prod-toollibrary-g2"`. See [Schema changes](guides/schema-changes.md). |
 | `TableSpec` | The table's physical shape (GSIs, TTL attribute), a `dynago.TableSpec`. |
 | `Store` | One field per entity, named as the plural of the entity: `Store.Loans`, `Store.Libraries`. |
 | `New(db *dynamo.DB, tableName string) *Store` | Returns a store for the named table. The table name is a parameter, so environments can differ. |
 | `EnsureTable(ctx, db, tableName) error` | Creates the table (and enables TTL) if it does not exist. For local development and tests; production tables belong in the generated Terraform. |
+| `RunMigration(ctx, db, args, out) error` | The migration job's command line: `copy`, `finish` or `status`. Generation 1 has nothing to migrate. See [Migrations](guides/migrations.md). |
+| `NewMigration(db, base) *dynago.Migration` | The migration job, for running it from your own code. Generation 2 and later. |
+| `ToolG1`, `MigrateTool`, `AutoMigrateTool` | Per entity, generation 2 and later: how the previous generation stored it; the conversion you set when fields can't carry over by themselves; the field-by-field conversion. |
 
 ```go
 db := dynamo.New(cfg)                                   // guregu/dynamo
-st := toollibrary.New(db, "toollibrary-prod")
+st := toollibrary.New(db, toollibrary.TableName("prod-toollibrary"))
 tool, err := st.Tools.Get(ctx, toollibrary.ToolKey{LibraryID: lib, ToolID: id})
 ```
 
@@ -74,8 +78,8 @@ And, from the runtime directly:
 | `dynago.ErrInvalidCursor` | A page cursor is malformed, came from another query, partition or schema version, or fails its signature. | no |
 | `dynago.ErrVersionMismatch` | A version was supplied and the item has changed since. | no: the caller decides |
 | `dynago.ErrVersionRequired` | The write is `versioned: required` and no version was supplied. | no |
-| `dynago.ErrNewerSchema` | The item was written by code at a newer schema version (a rolling deploy in progress). | no |
 | `dynago.ErrConflict` | The item kept changing, or other transactions kept holding its items (a single-item write can be blocked by a transaction too), until retries ran out (about half a second by default; `dynago.SetRetries` changes the policy). | it is the result of retries |
+| `dynago.ErrMigrationConflict` | The migration job couldn't copy some items (see [Migrations](guides/migrations.md#conflicts)). | no: fix the data and run it again |
 | `dynago.ErrSameItemTwice` | A write would touch one item twice in a transaction, which DynamoDB rejects. dynago refuses the schema shapes that cause it, so this means a bug: please report it. | no |
 | `dynago.ErrTooManyItems` | The write would exceed DynamoDB's 100-item transaction limit. | no |
 
@@ -246,9 +250,10 @@ released in the same transaction.
 - **Retries are safe.** Transactions carry an idempotency token. A single-item create that the SDK
   retries after it had already succeeded recognises its own item by its random revision and
   reports success.
-- **Rolling deploys.** No write path, including single updates and deletes, rewrites an item that
-  newer code wrote (`dynago.ErrNewerSchema`). An old instance cannot drop attributes or counts a new
-  one stored.
+- **Rolling deploys and rollbacks.** Code at two compatible versions shares a table. A rewrite
+  keeps the attributes this code doesn't know, so an older version never drops a field a newer one
+  stored. Changes to derived items need a new table generation, so two versions sharing a table
+  always agree on them.
 - **Expired items are absent.** Updates and deletes treat an item past its `ttl` as not found, and
   a create may replace one.
 - **No key collisions.** A string or enum value containing the character that follows it in a key
@@ -259,8 +264,8 @@ released in the same transaction.
   `requires` key share their checks: a loan's `toolId` appears mid-key in its MyLoans copy, so
   `Tools.Add` refuses a `toolId` containing `#`, rather than every later borrow of that tool
   failing.
-- **Exact counters across schema versions.** An item only contributes to counter values, claims and
-  copies that existed at the version it was written at. See
+- **Exact counters across schema changes.** A new counter, claim or index starts in a new table
+  generation, built from every entity by the migration job. See
   [Schema changes](guides/schema-changes.md).
 - **Limits are never silently off.** A missing caller-supplied limit is an error.
 

@@ -83,7 +83,7 @@ Loan:
 ```
 
 ```go
-st := toollibrary.New(db, "toollibrary-prod")
+st := toollibrary.New(db, toollibrary.TableName("prod-toollibrary"))   // prod-toollibrary-g2
 
 err := st.Loans.Borrow(ctx, loan, toollibrary.LoanBorrowLimits{MemberLoansActive: dynago.Max(member.MaxLoans)})
 switch {
@@ -142,12 +142,16 @@ walks through it end to end.
   - a transaction or create that the SDK retries after it succeeded is not applied twice or
     reported as failed (a single-item update or delete retried that way may report a failed
     condition for a change that did go through);
-  - old code refuses to overwrite items written by a newer schema during a rolling deploy;
+  - during a rolling deploy or after a rollback, older code keeps the fields a newer version
+    stored when it rewrites an item;
   - TTL-expired items are treated as gone before DynamoDB deletes them;
   - key values can't collide through separators;
   - cursors can be signed.
-- **Schema changes are explicit:** versions, a lock file, and refusal of changes that would strand
-  existing items.
+- **Schema changes are explicit, and migrations are generated.** Entities have versions, and a lock
+  file records every shape. A change existing items don't fit (a new index, claim or counter, a new
+  key) moves the table to a new generation. A generated job copies the old table into the new one
+  while the old version serves, catches up, and makes a short final pass with writes stopped. The
+  old table stays for rollback. See [Migrations](docs/guides/migrations.md).
 
 ## Documentation
 
@@ -160,7 +164,7 @@ walks through it end to end.
 - [Command line](docs/cli.md).
 - Guides: [modelling](docs/guides/modelling.md), [counters](docs/guides/counters.md),
   [concurrency](docs/guides/concurrency.md), [schema changes](docs/guides/schema-changes.md),
-  [costs](docs/guides/costs.md).
+  [migrations](docs/guides/migrations.md), [costs](docs/guides/costs.md).
 - [Contributing](CONTRIBUTING.md) and [changelog](CHANGELOG.md).
 
 ## Testing your store
@@ -182,13 +186,11 @@ silently); `make test-unit` needs no Docker.
 Local.
 
 **Next:**
-1. **Migrations.**
-   - `dynago migrate plan`: classify changes and print the ordered deploy, backfill and enable steps.
-   - A backfill runner that rewrites items below the current version through the generated write
-     path. It is idempotent and resumable, because writes are conditioned on `_v`.
-   - Gating reads of a new counter or index until the backfill is done.
-2. **Runtime checks.** Compare consumed capacity per access pattern with the estimates.
-3. **Lint.** Fail when DynamoDB is called anywhere except generated code.
+1. **LSIs** (`strategy: lsi`). Now that a new table generation can add or drop them, they're no
+   longer a decision you can't undo.
+2. **Importing from another table**, such as a legacy single table, through the same job engine.
+3. **Runtime checks.** Compare consumed capacity per access pattern with the estimates.
+4. **Lint.** Fail when DynamoDB is called anywhere except generated code.
 
 **Known limits:**
 - **TTL expiry bypasses the generated code.** An expired item does not decrement its counters or
@@ -196,7 +198,10 @@ Local.
   about each case. Design expiring items to own nothing else, as the example's holds do.
 - **Background writes change an item's version too**, so a form left open on an item that jobs
   update often will see conflicts.
-- **Not supported:** LSIs ([deliberately](docs/guides/modelling.md#why-no-lsis)), custom Go field types, batch writes, multi-valued index keys.
+- **Migrations read the whole table on every pass.** For very large, old tables, a table copy
+  per structural change may stop being practical.
+- **Not supported yet:** LSIs (see the roadmap), custom Go field types, batch writes,
+  multi-valued index keys.
 
 ## License
 

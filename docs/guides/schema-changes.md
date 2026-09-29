@@ -1,8 +1,13 @@
-# Schema changes, versions and the lock file
+# Schema changes: versions, generations and the lock file
 
 Items in DynamoDB don't change when the schema does. An item written last year has last year's
 shape until something rewrites it. dynago makes that explicit, so changing a live schema is safe
-and reviewable.
+and reviewable. There are two kinds of change:
+
+- **Compatible changes** leave existing items valid. They happen in place, in the same table.
+- **Changes existing items don't fit** start a new **table generation**: a new table, filled from
+  the old one by a generated migration job, with the old table kept for rollback. See
+  [Migrations](migrations.md) for running the job.
 
 ## Versions
 
@@ -22,82 +27,76 @@ Changing them never needs a version bump.
 change:
 
 ```
-entity Loan: its storage shape changed but its version is still 1. Set `version: 2` so stored
-items record which shape wrote them. Changes: counter MemberLoans changed (new values count only
-items written from this version: needs a backfill before they are complete)
+entity Member: its storage shape changed but its version is still 1. Set `version: 2` so stored
+items record which shape wrote them. Changes: field pronouns added
 ```
+
+## Compatible changes and generations
+
+| Change | Existing items | Where it happens |
+|---|---|---|
+| Add an optional field | Read back with the zero value until written | Same table |
+| Add enum values | Hold the old values, which are still valid | Same table |
+| Remove a field | Keep the attribute (unused) | Same table |
+| Remove an index, claim, counter or counter value | Keep their entries, claims or counts, unused | Same table |
+| Add or change an index (GSI or copy) | Have no entry, or the old one | New generation |
+| Add or change a unique claim | Aren't claimed; duplicates possible | New generation |
+| Add or change a counter or counter value | Aren't counted | New generation |
+| Add a required field | Don't have it | New generation |
+| Change a field's type or attribute | Hold the old one | New generation |
+| Remove enum values | May hold them | New generation |
+| Change the primary key or TTL field | Are under the old key, or expire by the old field | New generation |
+
+A change that needs a new generation, made without one, is refused, and the error says what to do:
+
+```
+entity Tool: existing items don't fit version 2: unique claim Barcode added (existing items don't
+have it). Start a new table generation (`table.generation: 2`): the generated migration job copies
+every item into the new table, and the old one stays for rollback
+```
+
+### Within a generation
+
+Code at two compatible versions can share a table, which happens during a rolling deploy, or after
+a rollback. When a write rewrites an item, it **keeps attributes it doesn't know**, so an older
+version never drops a field a newer one stored. A field removed from the schema stays on existing
+items until the next generation.
+
+### A new generation
+
+```yaml
+table:
+  name: toollibrary
+  generation: 2      # was 1
+  retain: [1]        # keep toollibrary-g1 for rollback
+```
+
+Each generation's table is named `<name>-g<generation>`: generated code has `Generation` and
+`TableName(base)`, and the Terraform declares the current table and every retained one. A
+generation may change anything. The migration job copies each entity from the previous generation,
+converting it, and rebuilds every index entry, claim, copy and count in the new table from the
+entities, so they are exact whatever the old table held. Generations go up one at a time.
 
 ## The lock file
 
-`<table>.dynago.lock` records every version of every entity's shape. Commit it, and review its diff
-like a migration. `dynago generate -check` in CI fails if it (or any generated file) is out of date.
+`<table>.dynago.lock` records every version of every entity's shape, which generation each
+belongs to, and each generation's physical table. Commit it, and review its diff like a migration.
+`dynago generate -check` in CI fails if it (or any generated file) is out of date.
 
-The generator uses the history to work out **which version introduced each counter value, claim and
-copy**. Generated writes only count an item towards a counter value (or give it a claim or copy) if
-the item was written at or after that version. This is what makes adding a counter to existing
-data safe:
+The generator uses it to decide whether a change is compatible, to describe the previous
+generation's items for the migration job, and to keep declaring retained tables.
 
-- an old item that never contributed is never subtracted when it is updated or deleted;
-- when any write rewrites an old item, it moves to the current version and starts contributing,
-  with limits applied.
-
-**Don't lose the lock file.** Without it, every counter value, claim and copy would look new at
-the current version, so deleting an older item would never release what it contributed. `dynago
-generate` refuses an entity above version 1 with no history: restore the file from version control.
-For a new table whose entities start above version 1, `-new-history` starts the history there.
+**Don't lose it.** Without it, dynago can't tell whether a change is compatible, so a new
+generation needed for existing items could be missed. `dynago generate` refuses a schema above
+version or generation 1 with no history. Restore the file from version control. For a new table
+whose entities start above version 1, `-new-history` starts the history there.
 
 The shape records what is stored, not how the schema is written: reordering fields, indexes or
-counters is not a change. It also records the table's TTL attribute, since renaming it would leave
-existing items' expiry in the old attribute (they would never expire). A lock file written by an
-older dynago is upgraded in place when nothing has changed.
+counters is not a change. A lock file written by an older dynago is upgraded in place.
 
-## What each kind of change means for existing data
+## Deploying
 
-| Change | Existing items | What to do |
-|---|---|---|
-| Add a field | Read back with the zero value until written | Nothing. |
-| Remove a field | Keep the attribute until rewritten (unused) | Nothing, or a cleanup. |
-| Change a field's attribute or type | Keep the old attribute or type | Needs a rewrite migration; add a new field instead where possible. |
-| Change the primary key | Stay under the old key: the new code can't find them | Needs a key rewrite migration. Avoid. |
-| Add a GSI index | No entry until rewritten (DynamoDB backfills the index, but old items lack the key attributes) | Backfill if queries must see old items. |
-| Change a GSI index's keys or `where` | Old entries keep the old keys until rewritten | Backfill. |
-| Change a GSI index's projection | DynamoDB can't change a projection: the index is deleted and re-created (Terraform replaces it), and queries through it fail until DynamoDB has rebuilt it | Plan for the gap; no data backfill. |
-| Add a counter or counter value | Not counted until rewritten; the value undercounts | Backfill before relying on it. |
-| Add a unique claim | Not claimed until rewritten; duplicates with old items possible | Backfill before relying on it. |
-| Add a copy index | No copy until rewritten | Backfill. |
-| Remove a claim | Old claims stay, keeping their values taken | Cleanup migration. |
-| Remove a copy index | Old copies stay (unused) | Cleanup migration. |
-
-`dynago generate` prints each change with this guidance, marked as a warning where data needs work.
-
-## Changes that are refused
-
-Some changes would strand existing items, because the code only knows the current definition and
-can't release what an item contributed under an old one. They are refused even with a version bump:
-
-- changing an existing **copy index** (its keys, projection or `where`);
-- changing an existing **unique claim** (its fields or keys);
-- changing a **counter's** keys or shards;
-- changing what an existing **counter value** counts (`count`/`sum`, `where`);
-- adding a `limit: arg` counter value to an entity that another entity's writes change through
-  `requires`: old items start counting when that write changes them, but only the entity's own
-  writes can be given the limit. Use a constant limit.
-
-Instead, add a new one under a new name, and remove the old one:
-
-```yaml
-values:
-  active: { count: true, where: { status: active } }                    # old: keep until you remove it
-  activeOverdue: { count: true, where: { status: active, overdue: true } } # new name, new definition
-```
-
-## Deploying a version bump
-
-1. Generate and review: the model document diff shows what changed, the lock diff the new shape.
-2. Deploy. During the rollout, old instances refuse to rewrite items that new instances have
-   written (`dynago.ErrNewerSchema`), so they can't undo the new shape. Callers see that error only
-   during the rollout.
-3. If the change needs a backfill (new counters, claims, copies, index keys), run it before relying
-   on the new structure. **dynago does not ship a backfill runner yet**; it is the next item on the
-   roadmap. It will rewrite every item below the current version through the generated write path,
-   which is exactly what a normal write does.
+- **A compatible change:** generate, review the model document and lock diffs, and deploy as
+  usual, with a rolling update.
+- **A new generation:** generate, review, then run the migration job before the new version serves.
+  See [Migrations](migrations.md).

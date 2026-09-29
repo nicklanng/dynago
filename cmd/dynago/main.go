@@ -40,9 +40,9 @@ Flags may come before or after the schema files.
 
   -prices        on-demand prices: $ per million WRU, $ per million RRU, $ per GB-month
                  (default 0.625,0.125,0.25, us-east-1)
-  -new-history   accept entities above version 1 that the lock file has no history for, starting
-                 their history at the current version. Only right if no stored item predates it:
-                 otherwise restore the lock file instead.
+  -new-history   accept a schema whose history the lock file doesn't have (entities above
+                 version 1, or a table above generation 1), starting the history there. Only right
+                 for a new table: otherwise restore the lock file instead.
 `
 
 func main() {
@@ -60,7 +60,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.Usage = func() { fmt.Fprint(stderr, usage) }
 	checkOnly := fs.Bool("check", false, "fail if generated files are out of date instead of writing them")
 	pricesFlag := fs.String("prices", "", "on-demand prices: wru,rru,gb")
-	newHistory := fs.Bool("new-history", false, "start the lock history of entities above version 1 that have none")
+	newHistory := fs.Bool("new-history", false, "start a lock history the lock file doesn't have")
 	switch cmd {
 	case "generate", "check":
 	case "help", "-h", "-help", "--help":
