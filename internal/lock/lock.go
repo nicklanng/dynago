@@ -206,6 +206,15 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 			next.Entities[e.Name] = h
 		}
 		n := len(h.Versions)
+		if prev.Format < 2 {
+			// Locks before format 2 didn't record which fields are required. Take it from the
+			// schema for every version: the history then records it, and the previous
+			// generation's shapes don't show fields as newly required.
+			for i := range h.Versions {
+				h.Versions[i].Shape = upgradeRequired(h.Versions[i].Shape, shape)
+				h.Versions[i].Fingerprint = fingerprint(h.Versions[i].Shape)
+			}
+		}
 		if n == 0 {
 			if e.Version > 1 && !opts.NewHistory {
 				errs = append(errs, fmt.Errorf("entity %s: it is at version %d, but the lock file has no history for it. Restore %s from version control, or run with -new-history to start its history here",
@@ -219,9 +228,6 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 		// Compare shapes, not the stored fingerprint, so a lock written by an older dynago
 		// (another fingerprint, or fields it didn't record yet) stays valid. A matching entry is
 		// refreshed in the current format.
-		if prev.Format < 2 {
-			last.Shape = upgradeRequired(last.Shape, shape)
-		}
 		same := fingerprint(upgrade(last.Shape, shape)) == fp
 		switch {
 		case e.Version < last.Version:
@@ -234,7 +240,8 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 		default:
 			changes := Changes(last.Shape, shape, e)
 			if !newGen {
-				// A new generation's table holds only what the migration copies in, in this shape.
+				// Not at a generation bump: the new table holds only what the migration copies
+				// in, so what the old table held is no concern (and would only add notes).
 				changes = append(changes, reusedAttrs(h, gen, shape)...)
 			}
 			var misfits []string

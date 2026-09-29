@@ -105,12 +105,16 @@ func conversionGaps(e *schema.Entity, prev []schema.PreviousField) []string {
 	for _, f := range e.Fields {
 		pf, had := old[f.Name]
 		delete(old, f.Name)
-		switch {
-		case !had && f.Required:
-			gaps = append(gaps, fmt.Sprintf("%s is new and required", f.Name))
-		case !had:
-		case f.Required && !pf.Required:
+		if !had {
+			if f.Required {
+				gaps = append(gaps, fmt.Sprintf("%s is new and required", f.Name))
+			}
+			continue
+		}
+		if f.Required && !pf.Required {
 			gaps = append(gaps, fmt.Sprintf("%s is now required", f.Name))
+		}
+		switch {
 		case previousType(pf) != previousType(schema.PreviousField{Type: f.Type}) || (pf.Type == schema.TypeEnum) != (f.Type == schema.TypeEnum):
 			gaps = append(gaps, fmt.Sprintf("%s changed from %s to %s", f.Name, pf.Type, f.Type))
 		case f.Type == schema.TypeEnum:
@@ -386,15 +390,18 @@ func (g *gen) migrateEntity(e *schema.Entity) {
 	g.p("return dynago.Retry(ctx, func() error {")
 	g.p("var current dynamo.Item")
 	g.p("found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)")
-	g.p("if err != nil || !found {")
+	g.p("if err != nil {")
 	g.p("return err")
+	g.p("}")
+	g.p("if !found {")
+	g.p("return dynago.ErrUnchanged")
 	g.p("}")
 	g.p("it, err := %sDecode(current)", lo)
 	g.p("if err != nil {")
 	g.p("return err")
 	g.p("}")
 	g.p("if it.Rev != dynago.ItemRev(raw) {")
-	g.p("return nil")
+	g.p("return dynago.ErrUnchanged")
 	g.p("}")
 	g.p("key := dynago.Key{PK: it.PK, SK: it.SK}")
 	g.p("ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete(\"PK\", key.PK).Range(\"SK\", key.SK).If(\"$ = ?\", \"_rev\", it.Rev), dynago.ErrStale), fence}")

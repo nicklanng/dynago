@@ -99,7 +99,7 @@ old table's traffic.
 Every read is strongly consistent.
 
 It writes only what changed. The job holds a lease, renewed as it runs, and every write it makes
-checks it, on a fence item of its worker's own, so workers never contend on the check. A job that
+checks it, on a fence item of each scan segment's own, so workers never contend on the check. A job that
 loses the lease (a paused or partitioned pod) stops without writing more. The check makes every
 copy a transaction, including entities with no copy index, claim or counter, which would otherwise
 be a single write. Such a copy costs 2 WRU per KB plus 2 WRU for the check, instead of 1 WRU per

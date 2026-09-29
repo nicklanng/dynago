@@ -3,6 +3,7 @@ package dynago
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -56,14 +57,15 @@ type Migration struct {
 	// it isn't copied (expired, or not an entity of this generation).
 	KeyOf func(raw dynamo.Item) (key Key, ok bool, err error)
 	// Remove deletes an entity of the new table, with its derived items and fence, because the
-	// item it was copied from is gone or now converts to another key.
+	// item it was copied from is gone or now converts to another key. It returns ErrUnchanged if
+	// the entity is gone already, or has been rewritten since raw was read (a fresher copy).
 	Remove func(ctx context.Context, raw dynamo.Item, fence Op) error
 	// Check reports why the migration can't run at all (a conversion function not provided), or nil.
 	Check func() error
 	// TTLAttr is the TTL attribute: expired items of the old table are not copied.
 	TTLAttr string
 
-	Workers   int     // parallel scan segments; default 8
+	Workers   int     // segments scanned at once (and segments per new pass); default 8
 	Rate      float64 // items per second across workers; 0 for no limit
 	MaxPasses int     // catch-up passes after the first, for copy; default 3
 	Out       io.Writer
@@ -353,20 +355,29 @@ func (j *job) pass(ctx context.Context, pass, segments int, finishing bool) (int
 		var wg sync.WaitGroup
 		errs := make([]error, segments)
 		workers := make(chan struct{}, j.Workers)
+		// The first failure stops the segments still waiting for a worker.
+		sctx, stop := context.WithCancel(ctx)
 		for seg := 0; seg < segments; seg++ {
 			wg.Add(1)
 			go func(seg int) {
 				defer wg.Done()
 				workers <- struct{}{}
 				defer func() { <-workers }()
+				if sctx.Err() != nil {
+					return
+				}
 				n, err := j.segment(ctx, pass, phase, seg, segments, limit)
 				mu.Lock()
 				changed += n
 				mu.Unlock()
 				errs[seg] = err
+				if err != nil {
+					stop()
+				}
 			}(seg)
 		}
 		wg.Wait()
+		stop()
 		if err := errors.Join(errs...); err != nil {
 			return changed, err
 		}
@@ -470,7 +481,7 @@ func (j *job) copyOne(ctx context.Context, raw dynamo.Item, fence Op, depth int)
 			return false, ferr
 		}
 		if stale {
-			if rerr := j.patient(ctx, func() error { return j.Remove(ctx, holder, fence) }); rerr != nil {
+			if rerr := j.patient(ctx, func() error { return j.Remove(ctx, holder, fence) }); rerr != nil && !errors.Is(rerr, ErrUnchanged) {
 				return false, rerr
 			}
 			displaced = holder
@@ -619,7 +630,11 @@ func (j *job) removeItems(ctx context.Context, items []dynamo.Item, cp *migSegme
 		if err := limit.wait(ctx); err != nil {
 			return err
 		}
-		if err := j.patient(ctx, func() error { return j.Remove(ctx, c.raw, fence) }); err != nil {
+		err := j.patient(ctx, func() error { return j.Remove(ctx, c.raw, fence) })
+		if errors.Is(err, ErrUnchanged) {
+			continue
+		}
+		if err != nil {
 			if errors.Is(err, ErrLeaseLost) {
 				return err
 			}
@@ -666,11 +681,11 @@ func (j *job) retryConflicts(ctx context.Context, limit *limiter) (int64, error)
 }
 
 // fence is the op every write of worker w includes: a check that this job still holds the lease,
-// made on the worker's own fence item. A single item checked by every worker's transactions would
-// make them conflict with one another; with one per worker, they never do. Taking the lease
+// made on the segment's own fence item. A single item checked by every worker's transactions would
+// make them conflict with one another; with one per segment, they never do. Taking the lease
 // rewrites every fence item, so a job that lost it fails its next write whichever worker makes it.
-func (j *job) fence(w int) Op {
-	k := Key{j.statePK(), fmt.Sprintf("FENCE#%03d", w)}
+func (j *job) fence(seg int) Op {
+	k := Key{j.statePK(), fmt.Sprintf("FENCE#%03d", seg)}
 	return CheckOp(k, j.DB.Table(j.To).Check(AttrPK, k.PK).Range(AttrSK, k.SK).If("$ = ?", "owner", j.owner), ErrLeaseLost)
 }
 
@@ -756,9 +771,15 @@ func (j *job) loadConflicts(ctx context.Context) error {
 func conflictSource(c migConflict) Key { return Key{c.SrcPK, c.SrcSK} }
 
 // conflictKey is the key of the conflict record for the item at src. The partition key's length
-// keeps it unambiguous whatever characters the source key holds.
+// keeps it unambiguous whatever characters the source key holds; a key too long for a sort key is
+// hashed.
 func (j *job) conflictKey(src Key) Key {
-	return Key{j.statePK(), fmt.Sprintf("CONFLICT#%d#%s%s", len(src.PK), src.PK, src.SK)}
+	sk := fmt.Sprintf("CONFLICT#%d#%s%s", len(src.PK), src.PK, src.SK)
+	if len(sk) > 1024 {
+		sum := sha256.Sum256([]byte(sk))
+		sk = "CONFLICT#H#" + hex.EncodeToString(sum[:])
+	}
+	return Key{j.statePK(), sk}
 }
 
 func (j *job) recordConflict(ctx context.Context, src Key, problem error, fence Op) error {
@@ -930,7 +951,7 @@ func (m *Migration) status(ctx context.Context) error {
 			phase = "copying"
 		}
 	}
-	m.logf("migration %s → %s: %s, pass %d (done: %t, final: %t)", m.From, m.To, phase, st.Pass, st.PassDone, st.Finishing)
+	m.logf("migration %s → %s: %s, pass %d of %d segments (done: %t, final: %t)", m.From, m.To, phase, st.Pass, st.segments(m.Workers), st.PassDone, st.Finishing)
 	var segs []migSegment
 	err = m.DB.Table(m.To).Get(AttrPK, m.statePK()).Range(AttrSK, dynamo.BeginsWith, fmt.Sprintf("PASS#%06d#", st.Pass)).Consistent(true).All(ctx, &segs)
 	if err != nil && !errors.Is(err, dynamo.ErrNotFound) {

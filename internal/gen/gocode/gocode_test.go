@@ -266,4 +266,41 @@ func TestConversionGaps(t *testing.T) {
 	if len(gaps) != 1 || gaps[0] != "email is now required" {
 		t.Fatalf("gaps = %q", gaps)
 	}
+	// Every reason is given, not only the first.
+	prev[0].Type = schema.TypeInt
+	if gaps := conversionGaps(e, prev); len(gaps) != 2 {
+		t.Fatalf("gaps = %q", gaps)
+	}
+}
+
+// A list made a set loses its repeats when copied: a string set can't hold duplicates.
+func TestAutoMigrateMakesListsSets(t *testing.T) {
+	m, err := schema.Parse([]byte(`
+dynago: 1
+package: things
+table: { name: things, generation: 2 }
+entities:
+  Thing:
+    version: 2
+    fields:
+      thingId: string
+      tags: string_set
+    key: { pk: "THING#{thingId}", sk: "THING" }
+    writes:
+      Create: create
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Previous = &schema.Previous{Generation: 1, Entities: map[string][]schema.PreviousField{"Thing": {
+		{Name: "thingId", Attr: "thingId", Type: schema.TypeString},
+		{Name: "tags", Attr: "tags", Type: schema.TypeList},
+	}}}
+	out, err := Generate(m, "things.dynago.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), "Tags: dynago.Distinct(old.Tags)") {
+		t.Fatalf("AutoMigrateThing doesn't dedupe tags:\n%s", out)
+	}
 }

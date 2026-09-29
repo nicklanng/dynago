@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -274,5 +275,19 @@ func TestCursorScopeIncludesBounds(t *testing.T) {
 func TestDistinct(t *testing.T) {
 	if got := Distinct([]string{"b", "a", "b", "c", "a"}); !slices.Equal(got, []string{"b", "a", "c"}) {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// Conflict records have sort keys DynamoDB accepts, one per source, whatever the source key.
+func TestConflictKeys(t *testing.T) {
+	j := &job{Migration: &Migration{From: "things-g1"}}
+	long := strings.Repeat("x", 1100)
+	keys := map[string]bool{}
+	for _, src := range []Key{{"a|b", "c"}, {"a", "b|c"}, {long, "1"}, {long, "2"}} {
+		k := j.conflictKey(src)
+		if len(k.SK) > 1024 || keys[k.SK] {
+			t.Fatalf("%v: sort key %q", src, k.SK)
+		}
+		keys[k.SK] = true
 	}
 }

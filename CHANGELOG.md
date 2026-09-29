@@ -52,7 +52,7 @@ First version.
 - A generated migration job (`RunMigration`, and a `main` package with `output.migrate_cmd`):
   `copy` makes a bulk pass and catch-up passes while the old generation serves, and `finish` a
   last pass with writes stopped. It is resumable, rate-limited and safe to run from several pods:
-  a lease, renewed as it runs, fences every write (on a fence item per worker, so workers don't
+  a lease, renewed as it runs, fences every write (on a fence item per scan segment, so workers don't
   contend), and a job that lost it writes nothing more. Copies follow key changes made while the
   old generation serves; conflicts are retried after each pass's removals, and a unique value held
   by a stale copy is freed, so swapped or rotated values copy cleanly. A resumed pass keeps its scan

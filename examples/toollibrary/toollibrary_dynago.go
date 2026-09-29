@@ -3355,15 +3355,18 @@ func (s *LibraryStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
 		found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)
-		if err != nil || !found {
+		if err != nil {
 			return err
+		}
+		if !found {
+			return dynago.ErrUnchanged
 		}
 		it, err := libraryDecode(current)
 		if err != nil {
 			return err
 		}
 		if it.Rev != dynago.ItemRev(raw) {
-			return nil
+			return dynago.ErrUnchanged
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
@@ -3433,15 +3436,18 @@ func (s *MemberStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence 
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
 		found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)
-		if err != nil || !found {
+		if err != nil {
 			return err
+		}
+		if !found {
+			return dynago.ErrUnchanged
 		}
 		it, err := memberDecode(current)
 		if err != nil {
 			return err
 		}
 		if it.Rev != dynago.ItemRev(raw) {
-			return nil
+			return dynago.ErrUnchanged
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
@@ -3511,15 +3517,18 @@ func (s *ToolStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dy
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
 		found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)
-		if err != nil || !found {
+		if err != nil {
 			return err
+		}
+		if !found {
+			return dynago.ErrUnchanged
 		}
 		it, err := toolDecode(current)
 		if err != nil {
 			return err
 		}
 		if it.Rev != dynago.ItemRev(raw) {
-			return nil
+			return dynago.ErrUnchanged
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
@@ -3601,15 +3610,18 @@ func (s *LoanStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dy
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
 		found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)
-		if err != nil || !found {
+		if err != nil {
 			return err
+		}
+		if !found {
+			return dynago.ErrUnchanged
 		}
 		it, err := loanDecode(current)
 		if err != nil {
 			return err
 		}
 		if it.Rev != dynago.ItemRev(raw) {
-			return nil
+			return dynago.ErrUnchanged
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}
@@ -3686,15 +3698,18 @@ func (s *HoldStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence dy
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
 		found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)
-		if err != nil || !found {
+		if err != nil {
 			return err
+		}
+		if !found {
+			return dynago.ErrUnchanged
 		}
 		it, err := holdDecode(current)
 		if err != nil {
 			return err
 		}
 		if it.Rev != dynago.ItemRev(raw) {
-			return nil
+			return dynago.ErrUnchanged
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}

@@ -409,15 +409,18 @@ func (s *PersonStore) migrateRemove(ctx context.Context, raw dynamo.Item, fence 
 	return dynago.Retry(ctx, func() error {
 		var current dynamo.Item
 		found, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: dynago.ItemKey(raw).PK, SK: dynago.ItemKey(raw).SK}, true, &current)
-		if err != nil || !found {
+		if err != nil {
 			return err
+		}
+		if !found {
+			return dynago.ErrUnchanged
 		}
 		it, err := personDecode(current)
 		if err != nil {
 			return err
 		}
 		if it.Rev != dynago.ItemRev(raw) {
-			return nil
+			return dynago.ErrUnchanged
 		}
 		key := dynago.Key{PK: it.PK, SK: it.SK}
 		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), fence}

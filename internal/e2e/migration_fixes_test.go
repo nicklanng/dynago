@@ -219,7 +219,9 @@ func TestRemovingAStaleCopySparesAFreshOne(t *testing.T) {
 	gate := dynago.Key{PK: "GATE", SK: "GATE"}
 	must(t, nt.Put(map[string]any{"PK": gate.PK, "SK": gate.SK}).Run(ctx))
 	fence := dynago.CheckOp(gate, nt.Check("PK", gate.PK).Range("SK", gate.SK).If("attribute_exists($)", "PK"), dynago.ErrLeaseLost)
-	must(t, m.Remove(ctx, stale, fence))
+	if err := m.Remove(ctx, stale, fence); !errors.Is(err, dynago.ErrUnchanged) {
+		t.Fatalf("removing the stale copy: got %v, want ErrUnchanged", err)
+	}
 	p, err := rekey.New(db, rekey.TableName(base)).Persons.Get(ctx, rekey.PersonKey{Email: "ann@example.org"})
 	if err != nil || p.Name != "Ann B" {
 		t.Fatalf("the fresh copy: %+v, %v", p, err)

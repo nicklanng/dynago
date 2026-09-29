@@ -292,3 +292,22 @@ entities:
 		t.Fatalf("previous = %+v", m.Previous)
 	}
 }
+
+// A lock from before format 2 didn't record required fields; a required field of the previous
+// generation must not look newly required to the migration.
+func TestRequiredFromAnOldLock(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "      name: { type: string, required: true }\n", ""), empty())
+	l1.Format = 1
+	for i := range l1.Entities["Thing"].Versions {
+		for j := range l1.Entities["Thing"].Versions[i].Shape.Fields {
+			l1.Entities["Thing"].Versions[i].Shape.Fields[j].Required = false
+		}
+	}
+	m := model(t, 2, 2, "      name: { type: string, required: true }\n      note: string\n", "")
+	apply(t, m, l1)
+	for _, f := range m.Previous.Entities["Thing"] {
+		if f.Name == "name" && !f.Required {
+			t.Fatalf("previous name = %+v", f)
+		}
+	}
+}
