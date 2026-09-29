@@ -482,7 +482,15 @@ func riskText(p Partition) string {
 	if p.Risk == "" {
 		return ""
 	}
-	return fmt.Sprintf("; risk %s (%.0f%% of a partition at peak)", p.Risk, p.Headroom*100)
+	return fmt.Sprintf("; risk %s (%s of a partition at peak)", p.Risk, percent(p.Headroom))
+}
+
+// percent formats a share: "<1%" for a sliver rather than a misleading "0%".
+func percent(f float64) string {
+	if f > 0 && f < 0.01 {
+		return "<1%"
+	}
+	return fmt.Sprintf("%.0f%%", f*100)
 }
 
 func bytesOrUnknown(b float64) string {

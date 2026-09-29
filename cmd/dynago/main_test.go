@@ -219,3 +219,15 @@ func TestPolicyDiscovery(t *testing.T) {
 		t.Errorf("the model document doesn't name the policy relative to the schema:\n%s", doc)
 	}
 }
+
+// check analyses a schema anywhere: it renders nothing, so it needs no Go module even when the
+// schema generates a migration command.
+func TestCheckOutsideAModule(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "notes.dynago.yaml")
+	writeFile(t, path, []byte(strings.Replace(notes, "table: { name: notes }", "table: { name: notes }\noutput: { migrate_cmd: cmd/migrate }", 1)), 0o644)
+	var out, errs bytes.Buffer
+	if code := run([]string{"check", path}, &out, &errs); code != 0 {
+		t.Fatalf("exit %d: %s", code, errs.String())
+	}
+}

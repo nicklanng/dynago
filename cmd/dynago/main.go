@@ -225,8 +225,10 @@ type output struct {
 	data []byte
 }
 
-// build loads a schema, analyses it and renders every output, without writing anything.
-func build(path string, o options) (*schema.Model, *analysis.Result, []lock.Note, []output, error) {
+// build loads a schema, checks it against its lock and analyses it. With render, it also renders
+// every output, without writing anything; check doesn't need them (nor, for the migration command,
+// a Go module).
+func build(path string, o options, render bool) (*schema.Model, *analysis.Result, []lock.Note, []output, error) {
 	m, err := schema.Load(path)
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -246,6 +248,9 @@ func build(path string, o options) (*schema.Model, *analysis.Result, []lock.Note
 		return nil, nil, nil, nil, err
 	}
 	result := analysis.Analyze(m, o.prices, pol)
+	if !render {
+		return m, result, notes, nil, nil
+	}
 
 	goSrc, err := gocode.Generate(m, source)
 	if err != nil {
@@ -291,7 +296,7 @@ func build(path string, o options) (*schema.Model, *analysis.Result, []lock.Note
 }
 
 func generate(path string, o options, stdout, stderr io.Writer) error {
-	_, result, notes, outs, err := build(path, o)
+	_, result, notes, outs, err := build(path, o, true)
 	if err != nil {
 		return err
 	}
@@ -348,7 +353,7 @@ func failText(r *analysis.Result) string {
 }
 
 func check(path string, o options, w io.Writer) error {
-	m, result, notes, _, err := build(path, o)
+	m, result, notes, _, err := build(path, o, false)
 	if err != nil {
 		return err
 	}
