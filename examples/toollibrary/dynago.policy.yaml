@@ -1,0 +1,13 @@
+# The rules the tool library's schema is checked against. dynago uses the nearest
+# dynago.policy.yaml in the schema's directory or above it, up to the repository root.
+
+# Open warnings fail `dynago check` and `dynago generate`: each one is fixed, or accepted in the
+# schema with a reason.
+fail_on: warning
+
+limits:
+  transaction_items: 25     # keep writes well inside DynamoDB's 100
+
+require:
+  volumes: true             # every entity says how many items to expect
+  freshness: true           # every read says how fresh its results must be

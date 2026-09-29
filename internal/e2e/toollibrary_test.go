@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -118,6 +119,35 @@ func (e env) reads(fn func()) int64 {
 	before := e.counter.Reads()
 	fn()
 	return e.counter.Reads() - before
+}
+
+// The tenant list pages through every library by name, ignoring case, whatever its id.
+func TestLibraryList(t *testing.T) {
+	e := setup(t)
+	for id, name := range map[string]string{"lib1": "Oakfield", "lib2": "ashby", "lib3": "Birchwood"} {
+		must(t, e.st.Libraries.Open(ctx, &toollibrary.Library{LibraryID: id, Name: name, Slug: strings.ToLower(name), OpenedAt: time.Now()}))
+	}
+	wantErr(t, e.st.Libraries.Open(ctx, &toollibrary.Library{LibraryID: "lib4", Slug: "nameless"}), dynago.ErrFieldRequired)
+	// The index is a GSI, read eventually consistently: in AWS it may lag the opens for a moment.
+	testdb.Eventually(t, "tenant list", func() error {
+		var names []string
+		pages := 0
+		for page := (dynago.Page{Size: 2}); ; pages++ {
+			libs, next, err := e.st.Libraries.List(ctx, toollibrary.LibraryListQuery{}, page)
+			if err != nil {
+				return err
+			}
+			for _, l := range libs {
+				names = append(names, l.Name+"/"+l.Slug)
+			}
+			if next == "" {
+				break
+			}
+			page.Cursor = next
+		}
+		want := []string{"ashby/ashby", "Birchwood/birchwood", "Oakfield/oakfield"}
+		return testdb.Check(slices.Equal(names, want) && pages >= 1, "listed %v, want %v", names, want)
+	})
 }
 
 func TestLibrarySlugAndVersionedEdits(t *testing.T) {
@@ -374,8 +404,11 @@ func TestBorrowingRules(t *testing.T) {
 	// Returning frees the tool and the member's slot, in one transaction.
 	key := loan.Key()
 	must(t, e.st.Loans.AddNote(ctx, key, toollibrary.LoanAddNote{Notes: dynago.Ptr("Chuck is stiff.")}))
-	must(t, e.st.Loans.Return(ctx, key, toollibrary.LoanReturn{ReturnedAt: time.Now()}))
+	must(t, e.st.Loans.Return(ctx, key, toollibrary.LoanReturn{ReturnedAt: time.Now(), CheckedInBy: "alice"}))
 	wantErr(t, e.st.Loans.Return(ctx, key, toollibrary.LoanReturn{ReturnedAt: time.Now()}), toollibrary.ErrLoanReturnPrecondition)
+	if got, err := e.st.Loans.Get(ctx, key); err != nil || got.CheckedInBy != "alice" || got.MemberID != "alice" {
+		t.Fatalf("returned loan: %+v %v", got, err)
+	}
 	if s := e.toolStatus(t, "t1"); s != toollibrary.ToolStatusAvailable {
 		t.Fatalf("tool status after return = %q", s)
 	}
@@ -390,6 +423,28 @@ func TestBorrowingRules(t *testing.T) {
 	if len(hist) != 2 || hist[0].LoanID != "l8" || hist[1].Status != toollibrary.LoanStatusReturned || hist[1].ReturnedAt.IsZero() {
 		t.Fatalf("history = %+v", hist)
 	}
+
+	// The export pages through every loan in the table, and nothing else. Its scan is eventually
+	// consistent, so in AWS it may lag the writes above for a moment.
+	testdb.Eventually(t, "export", func() error {
+		var exported []string
+		for page := (dynago.Page{Size: 2}); ; {
+			loans, next, err := e.st.Loans.Export(ctx, page)
+			if err != nil {
+				return err
+			}
+			for _, l := range loans {
+				exported = append(exported, l.LoanID)
+			}
+			if next == "" {
+				break
+			}
+			page.Cursor = next
+		}
+		slices.Sort(exported)
+		want := []string{"l1", "l7", "l8"}
+		return testdb.Check(slices.Equal(exported, want), "exported %v, want %v", exported, want)
+	})
 }
 
 // A borrow is one transaction: whichever rule refuses it, nothing is written. The design this

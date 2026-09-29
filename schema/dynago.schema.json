@@ -92,7 +92,7 @@
     },
     "accept": {
       "type": "object",
-      "description": "Findings of dynago check this schema records as deliberate: rule id → the reason. Errors can't be accepted. See docs/guides/risks.md.",
+      "description": "Findings of dynago check this schema records as deliberate: rule id → the reason. Errors can't be accepted. See docs/guides/analysis.md.",
       "propertyNames": {
         "type": "string",
         "pattern": "^[a-z][a-z-]*$"
@@ -311,6 +311,10 @@
               "$ref": "#/$defs/pascalName",
               "description": "The entity the numbers are per. Default: the entity whose partition this one's nests in."
             },
+            "via": {
+              "type": "string",
+              "description": "The field linking to the per entity, when this entity holds its key more than one way."
+            },
             "typical": {
               "type": "number",
               "minimum": 0,
@@ -350,6 +354,10 @@
         "max": {
           "type": "number",
           "minimum": 0
+        },
+        "via": {
+          "type": "string",
+          "description": "The field linking to this entity, when the item holds its key more than one way."
         }
       }
     },
@@ -741,7 +749,7 @@
             "rate": {
               "type": "number",
               "minimum": 0,
-              "description": "Average calls per second, for the cost estimate."
+              "description": "Average calls per second, for the cost estimate and the partition analysis."
             },
             "project": {
               "$ref": "#/$defs/projection",
@@ -820,7 +828,7 @@
             "rate": {
               "type": "number",
               "minimum": 0,
-              "description": "Average calls per second, for the cost estimate."
+              "description": "Average calls per second, for the cost estimate and the partition analysis."
             },
             "hot_key_rate": {
               "type": "number",
@@ -975,7 +983,7 @@
         },
         "set": {
           "$ref": "#/$defs/predicates",
-          "description": "Changes the required entity in the same transaction, maintaining its counters and indexes. Values are constants or \"{field}\" of this entity."
+          "description": "Changes the required entity in the same transaction, maintaining its counters, indexes, claims and copies. Values are constants or \"{field}\" of this entity."
         },
         "optional": {
           "type": "boolean",

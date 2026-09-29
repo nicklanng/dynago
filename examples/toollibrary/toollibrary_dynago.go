@@ -14,13 +14,13 @@ import (
 )
 
 // Generation is the table generation this code reads and writes: its table is
-// <base>-g2 (see TableName). A change existing items don't fit starts a new generation,
+// <base>-g3 (see TableName). A change existing items don't fit starts a new generation,
 // which the migration job fills from the previous one.
-const Generation = 2
+const Generation = 3
 
 // TableName returns the name of this generation's table for a base name, such as "toollibrary".
 func TableName(base string) string {
-	return base + "-g2"
+	return base + "-g3"
 }
 
 // TableSpec is the physical shape of the toollibrary table: base key PK/SK, its global secondary
@@ -28,6 +28,7 @@ func TableName(base string) string {
 var TableSpec = dynago.TableSpec{
 	TTLAttr: "ttl",
 	GSIs: []dynago.GSISpec{
+		{Name: "All", PKAttr: "AllPK", SKAttr: "AllSK", Projection: "INCLUDE", NonKeyAttrs: []string{"_t", "_v", "libraryId", "name", "slug", "openedAt"}},
 		{Name: "ByName", PKAttr: "ByNamePK", SKAttr: "ByNameSK", Projection: "INCLUDE", NonKeyAttrs: []string{"_t", "_v", "libraryId", "memberId", "name", "role", "status"}},
 		{Name: "ByCategory", PKAttr: "ByCategoryPK", SKAttr: "ByCategorySK", Projection: "INCLUDE", NonKeyAttrs: []string{"_t", "_v", "libraryId", "toolId", "name", "category", "status", "tags"}},
 		{Name: "Overdue", PKAttr: "OverduePK", SKAttr: "OverdueSK", Projection: "INCLUDE", NonKeyAttrs: []string{"_t", "_v", "libraryId", "toolId", "loanId", "memberId", "toolName", "dueAt"}},
@@ -65,7 +66,8 @@ func EnsureTable(ctx context.Context, db *dynamo.DB, tableName string) error {
 
 // ---- Library ----
 
-// Library is a tool library, run by volunteers in one neighbourhood.
+// Library is a tool library, run by volunteers in one neighbourhood. Each is a tenant of the
+// service.
 type Library struct {
 	LibraryID string `dynamo:"libraryId"`
 	Name      string `dynamo:"name,omitempty"`
@@ -137,7 +139,7 @@ var (
 	ErrLibrarySlugTaken = fmt.Errorf("%w: Library.Slug", dynago.ErrTaken)
 )
 
-const libraryVersion = 1
+const libraryVersion = 2
 
 type libraryItem struct {
 	Library
@@ -149,17 +151,31 @@ type libraryItem struct {
 	DynagoCreated string `dynamo:"_created,omitempty"`
 	DynagoUpdated string `dynamo:"_updated,omitempty"`
 
-	raw dynamo.Item // as read, for writes to keep attributes this code doesn't know
+	raw   dynamo.Item // as read, for writes to keep attributes this code doesn't know
+	AllPK string      `dynamo:"AllPK,omitempty"`
+	AllSK string      `dynamo:"AllSK,omitempty"`
 }
 
 // libraryKnown is every attribute this code writes on Library items.
-var libraryKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "libraryId": true, "name": true, "slug": true, "openedAt": true}
+var libraryKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "libraryId": true, "name": true, "slug": true, "openedAt": true, "AllPK": true, "AllSK": true}
 
 // libraryToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
 // unknown).
 func libraryToItem(e *Library, key dynago.Key, rev int64, created, updated string) *libraryItem {
 	it := &libraryItem{Library: *e, PK: key.PK, SK: key.SK, T: "Library", V: libraryVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
+	if e.Name != "" && e.LibraryID != "" {
+		it.AllPK = "LIBRARIES"
+		it.AllSK = dynago.Lower(e.Name) + "#" + e.LibraryID
+	}
 	return it
+}
+
+// LibraryAll is a Library as seen through the All index: key fields plus the projected fields.
+type LibraryAll struct {
+	LibraryID string    `dynamo:"libraryId"`
+	Name      string    `dynamo:"name,omitempty"`
+	Slug      string    `dynamo:"slug,omitempty"`
+	OpenedAt  time.Time `dynamo:"openedAt,omitempty"`
 }
 
 // libraryDerived returns the counter contributions, claims and copies that exist because of e.
@@ -354,12 +370,36 @@ func (s *LibraryStore) ToolStats(ctx context.Context, k ToolCountsKey) (ToolCoun
 	return out, err
 }
 
-// Open creates a Library, failing with ErrLibraryExists if one already exists. In the same
-// transaction it maintains unique claim Slug. Afterwards e.Version() returns the new item's
-// version.
+// LibraryListQuery selects the partition for Library.List.
+type LibraryListQuery struct {
+}
+
+// List returns one page of Library items from the All index, ascending by
+// "{name|lower}#{libraryId}", with exactly one eventually consistent Query (default 50, max 100
+// items). It returns the cursor for the next page, or "" at the end.
+//
+// Every library, a page at a time, for the operators.
+func (s *LibraryStore) List(ctx context.Context, q LibraryListQuery, page dynago.Page) ([]LibraryAll, string, error) {
+	pk := "LIBRARIES"
+	spec := dynago.QuerySpec{Scope: "Library.List#1b0dbc85\x00" + pk, PK: pk, PageSize: 50, MaxPage: 100, Index: "All", PKAttr: "AllPK", SKAttr: "AllSK"}
+	var out []LibraryAll
+	next, err := dynago.Query(ctx, s.t, spec, page, &out)
+	if err != nil {
+		return nil, "", err
+	}
+	return out, next, nil
+}
+
+// Open creates a Library, failing with ErrLibraryExists if one already exists. Name must be set
+// (else dynago.ErrFieldRequired). In the same transaction it maintains unique claim Slug.
+// Afterwards e.Version() returns the new item's version.
 func (s *LibraryStore) Open(ctx context.Context, e *Library) error {
 	key, err := e.Key().dynamoKey()
 	if err != nil {
+		return err
+	}
+	if e.Name == "" {
+		err := fmt.Errorf("%w: Library.name", dynago.ErrFieldRequired)
 		return err
 	}
 	if err := e.checkKeyParts(); err != nil {
@@ -395,7 +435,11 @@ type LibraryRename struct {
 	Name *string
 }
 
-// Rename updates name of a Library with a single conditional UpdateItem.
+// Rename updates name of a Library. It reads the item consistently first (not with dynago.From)
+// because the change affects the All index entry, then writes everything in one transaction guarded
+// by the item's revision. In the same transaction it maintains unique claim Slug. A call that
+// leaves name nil changes nothing derived, and runs as a single conditional UpdateItem instead.
+// Name may not be set to the zero value (dynago.ErrFieldRequired).
 //
 // A steward editing the library's settings.
 func (s *LibraryStore) Rename(ctx context.Context, k LibraryKey, v LibraryRename, opts ...dynago.WriteOption) error {
@@ -403,24 +447,55 @@ func (s *LibraryStore) Rename(ctx context.Context, k LibraryKey, v LibraryRename
 	if err != nil {
 		return err
 	}
+	if v.Name != nil && *v.Name == "" {
+		return fmt.Errorf("%w: Library.name", dynago.ErrFieldRequired)
+	}
 	o := dynago.ApplyOptions(opts)
 	if v.Name == nil {
 		return nil // nothing to change
 	}
-	sets := []dynago.Set{}
-	if v.Name != nil {
-		sets = append(sets, dynago.Set{Attr: "name", Value: *v.Name, Remove: *v.Name == ""})
-	}
-	guard, err := s.guard(key, o, true)
-	if err != nil {
-		return err
+	if v.Name == nil {
+		// Nothing derived changes: one conditional UpdateItem, no read.
+		sets := []dynago.Set{}
+		guard, err := s.guard(key, o, true)
+		if err != nil {
+			return err
+		}
+		return dynago.Retry(ctx, func() error {
+			rev, err := dynago.UpdateFields(ctx, s.t, key, sets, nil, guard, nil)
+			if err == nil {
+				o.Written(rev)
+			}
+			return dynago.StaleAs(guard.ExpectRev != 0, err)
+		})
 	}
 	return dynago.Retry(ctx, func() error {
-		rev, err := dynago.UpdateFields(ctx, s.t, key, sets, nil, guard, nil)
-		if err == nil {
-			o.Written(rev)
+		it, versioned, err := s.start(ctx, key, o, true)
+		if err != nil {
+			return err
 		}
-		return dynago.StaleAs(guard.ExpectRev != 0, err)
+		before := &it.Library
+		after := before.clone()
+		if v.Name != nil {
+			after.Name = *v.Name
+		}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, libraryKnown, libraryToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: libraryDerived(before, key), After: libraryDerived(&after, key)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return dynago.StaleAs(versioned, err)
+		}
+		o.Written(it.Rev + 1)
+		return nil
 	})
 }
 
@@ -769,13 +844,15 @@ func (s *MemberStore) start(ctx context.Context, key dynago.Key, o dynago.WriteO
 	return it, expect != 0, nil
 }
 
-// Get reads a Member by primary key with one eventually consistent GetItem.
+// Get reads a Member by primary key with one strongly consistent GetItem.
+//
+// A member's profile, which they see straight after editing it.
 func (s *MemberStore) Get(ctx context.Context, k MemberKey) (*Member, error) {
 	key, err := k.dynamoKey()
 	if err != nil {
 		return nil, err
 	}
-	it, err := s.load(ctx, key, false)
+	it, err := s.load(ctx, key, true)
 	if err != nil {
 		return nil, err
 	}
@@ -784,6 +861,8 @@ func (s *MemberStore) Get(ctx context.Context, k MemberKey) (*Member, error) {
 
 // GetByEmail finds the Member holding the unique libraryId and email: a consistent read of the
 // claim, then of the item.
+//
+// Sign-in, which may come the moment after joining.
 func (s *MemberStore) GetByEmail(ctx context.Context, libraryID string, email string) (*Member, error) {
 	if libraryID == "" {
 		return nil, fmt.Errorf("%w: GetByEmail needs libraryId", dynago.ErrInvalidKey)
@@ -830,7 +909,7 @@ func (s *MemberStore) Directory(ctx context.Context, q MemberDirectoryQuery, pag
 		return nil, "", err
 	}
 	pk := "LIB#" + q.LibraryID + "#MEMBERS"
-	spec := dynago.QuerySpec{Scope: "Member.Directory@v1\x00" + pk, PK: pk, PageSize: 50, MaxPage: 100, Index: "ByName", PKAttr: "ByNamePK", SKAttr: "ByNameSK"}
+	spec := dynago.QuerySpec{Scope: "Member.Directory#a38e1325\x00" + pk, PK: pk, PageSize: 50, MaxPage: 100, Index: "ByName", PKAttr: "ByNamePK", SKAttr: "ByNameSK"}
 	var out []MemberByName
 	next, err := dynago.Query(ctx, s.t, spec, page, &out)
 	if err != nil {
@@ -1534,7 +1613,7 @@ func (s *ToolStore) Catalogue(ctx context.Context, q ToolCatalogueQuery, page dy
 		return nil, "", err
 	}
 	pk := "LIB#" + q.LibraryID + "#CAT#" + string(q.Category)
-	spec := dynago.QuerySpec{Scope: "Tool.Catalogue@v2\x00" + pk, PK: pk, PageSize: 25, MaxPage: 100, Index: "ByCategory", PKAttr: "ByCategoryPK", SKAttr: "ByCategorySK"}
+	spec := dynago.QuerySpec{Scope: "Tool.Catalogue#2b262810\x00" + pk, PK: pk, PageSize: 25, MaxPage: 100, Index: "ByCategory", PKAttr: "ByCategoryPK", SKAttr: "ByCategorySK"}
 	var out []ToolByCategory
 	next, err := dynago.Query(ctx, s.t, spec, page, &out)
 	if err != nil {
@@ -1545,6 +1624,8 @@ func (s *ToolStore) Catalogue(ctx context.Context, q ToolCatalogueQuery, page dy
 
 // GetByBarcode finds the Tool holding the given element of barcodes (with libraryId): a consistent
 // read of the claim, then of the item.
+//
+// The desk scanning a label, perhaps one just attached.
 func (s *ToolStore) GetByBarcode(ctx context.Context, libraryID string, barcodesElem string) (*Tool, error) {
 	if libraryID == "" {
 		return nil, fmt.Errorf("%w: GetByBarcode needs libraryId", dynago.ErrInvalidKey)
@@ -1888,6 +1969,9 @@ type Loan struct {
 	BorrowedAt time.Time  `dynamo:"borrowedAt,omitempty"`
 	DueAt      time.Time  `dynamo:"dueAt,omitempty"`
 	ReturnedAt time.Time  `dynamo:"returnedAt,omitempty"`
+	// The steward who took the tool back. A Member's memberId, under another name: the loan's memberId
+	// is its borrower.
+	CheckedInBy string `dynamo:"checkedInBy,omitempty"`
 	// Condition notes from the steward. Not listed.
 	Notes string `dynamo:"notes,omitempty"`
 
@@ -1975,7 +2059,7 @@ var (
 	ErrMemberLoansActiveLimit   = fmt.Errorf("%w: MemberLoans.active", dynago.ErrLimit)
 )
 
-const loanVersion = 1
+const loanVersion = 2
 
 type loanItem struct {
 	Loan
@@ -1993,7 +2077,7 @@ type loanItem struct {
 }
 
 // loanKnown is every attribute this code writes on Loan items.
-var loanKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "libraryId": true, "toolId": true, "loanId": true, "memberId": true, "toolName": true, "status": true, "borrowedAt": true, "dueAt": true, "returnedAt": true, "notes": true, "OverduePK": true, "OverdueSK": true}
+var loanKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "libraryId": true, "toolId": true, "loanId": true, "memberId": true, "toolName": true, "status": true, "borrowedAt": true, "dueAt": true, "returnedAt": true, "checkedInBy": true, "notes": true, "OverduePK": true, "OverdueSK": true}
 
 // loanToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
 // unknown).
@@ -2046,9 +2130,9 @@ type MemberLoansKey struct {
 	MemberID  string
 }
 
-// LoanTotals counts every loan the library has made. Sharded to show how: a counter that every
-// write of a busy entity touches can take ~1,000 writes/s per shard. This library's rate needs one
-// item.
+// LoanTotals counts every loan the library has made. Sharded to show how: a counter item that every
+// write of a busy entity touches starts to see transaction conflicts at about 20 writes/s, so each
+// shard should take no more than about 10. This library's rate needs one item.
 type LoanTotals struct {
 	// Started counts items.
 	Started int64 `dynamo:"started"`
@@ -2204,13 +2288,15 @@ func (s *LoanStore) start(ctx context.Context, key dynago.Key, o dynago.WriteOpt
 	return it, expect != 0, nil
 }
 
-// Get reads a Loan by primary key with one eventually consistent GetItem.
+// Get reads a Loan by primary key with one strongly consistent GetItem.
+//
+// A loan as the steward checks it in, straight after any change.
 func (s *LoanStore) Get(ctx context.Context, k LoanKey) (*Loan, error) {
 	key, err := k.dynamoKey()
 	if err != nil {
 		return nil, err
 	}
-	it, err := s.load(ctx, key, false)
+	it, err := s.load(ctx, key, true)
 	if err != nil {
 		return nil, err
 	}
@@ -2251,7 +2337,7 @@ func (s *LoanStore) History(ctx context.Context, q LoanHistoryQuery, page dynago
 		return nil, "", err
 	}
 	pk := "LIB#" + q.LibraryID + "#TOOL#" + q.ToolID
-	spec := dynago.QuerySpec{Scope: "Loan.History@v1\x00" + pk, PK: pk, PageSize: 20, MaxPage: 100, PKAttr: "PK", SKAttr: "SK", Prefix: "LOAN#", Desc: true, Project: []string{"libraryId", "toolId", "loanId", "memberId", "status", "borrowedAt", "dueAt", "returnedAt"}}
+	spec := dynago.QuerySpec{Scope: "Loan.History#fd57a8d3\x00" + pk, PK: pk, PageSize: 20, MaxPage: 100, PKAttr: "PK", SKAttr: "SK", Prefix: "LOAN#", Desc: true, Project: []string{"libraryId", "toolId", "loanId", "memberId", "status", "borrowedAt", "dueAt", "returnedAt"}}
 	var out []LoanHistoryItem
 	next, err := dynago.Query(ctx, s.t, spec, page, &out)
 	if err != nil {
@@ -2279,7 +2365,7 @@ func (s *LoanStore) MyLoans(ctx context.Context, q LoanMyLoansQuery, page dynago
 		return nil, "", err
 	}
 	pk := "LIB#" + q.LibraryID + "#MEMBER#" + q.MemberID
-	spec := dynago.QuerySpec{Scope: "Loan.MyLoans@v1\x00" + pk, PK: pk, PageSize: 50, MaxPage: 100, PKAttr: "PK", SKAttr: "SK", Prefix: "MYLOAN#", Consistent: true}
+	spec := dynago.QuerySpec{Scope: "Loan.MyLoans#31fa9aa5\x00" + pk, PK: pk, PageSize: 50, MaxPage: 100, PKAttr: "PK", SKAttr: "SK", Prefix: "MYLOAN#", Consistent: true}
 	var out []LoanByMember
 	next, err := dynago.Query(ctx, s.t, spec, page, &out)
 	if err != nil {
@@ -2306,7 +2392,7 @@ func (s *LoanStore) Overdue(ctx context.Context, q LoanOverdueQuery, page dynago
 		return nil, "", err
 	}
 	pk := "LIB#" + q.LibraryID + "#DUE"
-	spec := dynago.QuerySpec{Scope: "Loan.Overdue@v1\x00" + pk, PK: pk, PageSize: 50, MaxPage: 100, Index: "Overdue", PKAttr: "OverduePK", SKAttr: "OverdueSK"}
+	spec := dynago.QuerySpec{Scope: "Loan.Overdue#25a0e947\x00" + pk, PK: pk, PageSize: 50, MaxPage: 100, Index: "Overdue", PKAttr: "OverduePK", SKAttr: "OverdueSK"}
 	if q.From != nil {
 		from := dynago.FmtTime(*q.From)
 		spec.From = &from
@@ -2325,6 +2411,8 @@ func (s *LoanStore) Overdue(ctx context.Context, q LoanOverdueQuery, page dynago
 
 // ActiveLoans reads the MemberLoans counter (one eventually consistent GetItem). A counter nothing
 // has touched reads as zero.
+//
+// Shown beside the member's loans. Borrow enforces the cap itself.
 func (s *LoanStore) ActiveLoans(ctx context.Context, k MemberLoansKey) (MemberLoans, error) {
 	if k.LibraryID == "" || k.MemberID == "" {
 		return MemberLoans{}, fmt.Errorf("%w: MemberLoans needs libraryId and memberId", dynago.ErrInvalidKey)
@@ -2360,6 +2448,21 @@ func (s *LoanStore) Totals(ctx context.Context, k LoanTotalsKey) (LoanTotals, er
 		out.Started += p.Started
 	}
 	return out, nil
+}
+
+// Export returns the Loan items of one page of the whole table, with exactly one eventually
+// consistent Scan (default 50, max 100 items evaluated). A page evaluates items of every kind and
+// keeps the Loan ones, so it can hold few or none and still have a next cursor. It returns the
+// cursor for the next page, or "" once the whole table has been read. Declared as a scan because:
+// The yearly lending report reads every loan once, overnight. No request path reads it.
+func (s *LoanStore) Export(ctx context.Context, page dynago.Page) ([]Loan, string, error) {
+	var raws []dynamo.Item
+	next, err := dynago.Scan(ctx, s.t, dynago.ScanSpec{Scope: "Loan.Export", Type: "Loan", PageSize: 50, MaxPage: 100}, page, &raws)
+	if err != nil {
+		return nil, "", err
+	}
+	out, err := loanDecodeAll(raws)
+	return out, next, err
 }
 
 // Borrow creates a Loan, failing with ErrLoanExists if one already exists. It sets status to
@@ -2448,10 +2551,11 @@ func (s *LoanStore) Borrow(ctx context.Context, e *Loan, limits LoanBorrowLimits
 
 // LoanReturn holds the new values for Loan.Return.
 type LoanReturn struct {
-	ReturnedAt time.Time
+	ReturnedAt  time.Time
+	CheckedInBy string
 }
 
-// Return updates returnedAt and status of a Loan when status = "active" (else
+// Return updates returnedAt, checkedInBy and status of a Loan when status = "active" (else
 // ErrLoanReturnPrecondition). It reads the item consistently first (not with dynago.From) because
 // the change affects the ByMember index entry, the Overdue index entry, counter MemberLoans, then
 // writes everything in one transaction guarded by the item's revision. In the same transaction it
@@ -2475,6 +2579,7 @@ func (s *LoanStore) Return(ctx context.Context, k LoanKey, v LoanReturn, opts ..
 		}
 		after := before.clone()
 		after.ReturnedAt = v.ReturnedAt
+		after.CheckedInBy = v.CheckedInBy
 		after.Status = LoanStatusReturned
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
 		item, err := dynago.KeepUnknown(it.raw, loanKnown, loanToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
@@ -2932,13 +3037,15 @@ func (s *HoldStore) guard(key dynago.Key, o dynago.WriteOptions, required bool) 
 	return dynago.Guard{ExpectRev: expect, TTLAttr: "ttl", NotFound: ErrHoldNotFound}, nil
 }
 
-// Get reads a Hold by primary key with one eventually consistent GetItem.
+// Get reads a Hold by primary key with one strongly consistent GetItem.
+//
+// The member's hold, straight after placing it.
 func (s *HoldStore) Get(ctx context.Context, k HoldKey) (*Hold, error) {
 	key, err := k.dynamoKey()
 	if err != nil {
 		return nil, err
 	}
-	it, err := s.load(ctx, key, false)
+	it, err := s.load(ctx, key, true)
 	if err != nil {
 		return nil, err
 	}
@@ -2958,7 +3065,7 @@ func (s *HoldStore) FindByCode(ctx context.Context, q HoldFindByCodeQuery, page 
 		return nil, "", fmt.Errorf("%w: FindByCode needs codeHash", dynago.ErrInvalidKey)
 	}
 	pk := "HOLDCODE#" + q.CodeHash
-	spec := dynago.QuerySpec{Scope: "Hold.FindByCode@v1\x00" + pk, PK: pk, PageSize: 1, MaxPage: 1, Index: "ByCode", PKAttr: "ByCodePK", TTLAttr: "ttl"}
+	spec := dynago.QuerySpec{Scope: "Hold.FindByCode#7d67c7bb\x00" + pk, PK: pk, PageSize: 1, MaxPage: 1, Index: "ByCode", PKAttr: "ByCodePK", TTLAttr: "ttl"}
 	var out []HoldByCode
 	next, err := dynago.Query(ctx, s.t, spec, page, &out)
 	if err != nil {
@@ -3052,37 +3159,37 @@ func RunMigration(ctx context.Context, db *dynamo.DB, args []string, out io.Writ
 	return mig.Run(ctx, command)
 }
 
-// NewMigration returns the job copying generation 1 of the table into generation 2: base-g1
-// into base-g2. Entities are converted by the Migrate<Entity> functions, where set, and copied
+// NewMigration returns the job copying generation 2 of the table into generation 3: base-g2
+// into base-g3. Entities are converted by the Migrate<Entity> functions, where set, and copied
 // field by field otherwise.
 func NewMigration(db *dynamo.DB, base string) *dynago.Migration {
 	st := New(db, TableName(base))
-	return &dynago.Migration{DB: db, From: base + "-g1", To: TableName(base),
+	return &dynago.Migration{DB: db, From: base + "-g2", To: TableName(base),
 		Types: map[string]bool{"Library": true, "Member": true, "Tool": true, "Loan": true, "Hold": true},
 		Copy:  st.migrateCopy, KeyOf: st.migrateKeyOf, Remove: st.migrateRemove, Check: migrationCheck, TTLAttr: "ttl"}
 }
 
-// LibraryG1 is a Library as generation 1 stored it: what the migration job reads.
-type LibraryG1 struct {
+// LibraryG2 is a Library as generation 2 stored it: what the migration job reads.
+type LibraryG2 struct {
 	LibraryID string    `dynamo:"libraryId"`
 	Name      string    `dynamo:"name"`
 	Slug      string    `dynamo:"slug"`
 	OpenedAt  time.Time `dynamo:"openedAt"`
 }
 
-// MigrateLibrary, if set, converts a generation-1 Library into this generation's. Without it, the
-// migration job uses AutoMigrateLibrary: every field carries over. Set it in a file of your own in
-// this package to fill new fields.
-var MigrateLibrary func(old LibraryG1) (Library, error)
+// MigrateLibrary converts a generation-2 Library into this generation's. The migration job can't
+// run without it, because name is now required. Set it in a file of your own in this package, for
+// example from an init function; AutoMigrateLibrary copies the fields that carry over.
+var MigrateLibrary func(old LibraryG2) (Library, error)
 
-// AutoMigrateLibrary copies the fields of a generation-1 Library that exist in this generation with the
+// AutoMigrateLibrary copies the fields of a generation-2 Library that exist in this generation with the
 // same type (enums by value, lists made sets without repeats); the others are left zero.
-func AutoMigrateLibrary(old LibraryG1) Library {
+func AutoMigrateLibrary(old LibraryG2) Library {
 	return Library{LibraryID: old.LibraryID, Name: old.Name, Slug: old.Slug, OpenedAt: old.OpenedAt}
 }
 
-// MemberG1 is a Member as generation 1 stored it: what the migration job reads.
-type MemberG1 struct {
+// MemberG2 is a Member as generation 2 stored it: what the migration job reads.
+type MemberG2 struct {
 	LibraryID string    `dynamo:"libraryId"`
 	MemberID  string    `dynamo:"memberId"`
 	Email     string    `dynamo:"email"`
@@ -3094,19 +3201,19 @@ type MemberG1 struct {
 	JoinedAt  time.Time `dynamo:"joinedAt"`
 }
 
-// MigrateMember, if set, converts a generation-1 Member into this generation's. Without it, the
+// MigrateMember, if set, converts a generation-2 Member into this generation's. Without it, the
 // migration job uses AutoMigrateMember: every field carries over. Set it in a file of your own in
 // this package to fill new fields.
-var MigrateMember func(old MemberG1) (Member, error)
+var MigrateMember func(old MemberG2) (Member, error)
 
-// AutoMigrateMember copies the fields of a generation-1 Member that exist in this generation with the
+// AutoMigrateMember copies the fields of a generation-2 Member that exist in this generation with the
 // same type (enums by value, lists made sets without repeats); the others are left zero.
-func AutoMigrateMember(old MemberG1) Member {
+func AutoMigrateMember(old MemberG2) Member {
 	return Member{LibraryID: old.LibraryID, MemberID: old.MemberID, Email: old.Email, Name: old.Name, Phone: old.Phone, Role: MemberRole(old.Role), Status: MemberStatus(old.Status), MaxLoans: old.MaxLoans, JoinedAt: old.JoinedAt}
 }
 
-// ToolG1 is a Tool as generation 1 stored it: what the migration job reads.
-type ToolG1 struct {
+// ToolG2 is a Tool as generation 2 stored it: what the migration job reads.
+type ToolG2 struct {
 	LibraryID    string    `dynamo:"libraryId"`
 	ToolID       string    `dynamo:"toolId"`
 	Name         string    `dynamo:"name"`
@@ -3115,47 +3222,49 @@ type ToolG1 struct {
 	Manual       string    `dynamo:"manual"`
 	Tags         []string  `dynamo:"tags"`
 	SerialNumber string    `dynamo:"serialNumber"`
+	Barcodes     []string  `dynamo:"barcodes"`
 	AddedAt      time.Time `dynamo:"addedAt"`
 }
 
-// MigrateTool, if set, converts a generation-1 Tool into this generation's. Without it, the
+// MigrateTool, if set, converts a generation-2 Tool into this generation's. Without it, the
 // migration job uses AutoMigrateTool: every field carries over. Set it in a file of your own in
 // this package to fill new fields.
-var MigrateTool func(old ToolG1) (Tool, error)
+var MigrateTool func(old ToolG2) (Tool, error)
 
-// AutoMigrateTool copies the fields of a generation-1 Tool that exist in this generation with the
+// AutoMigrateTool copies the fields of a generation-2 Tool that exist in this generation with the
 // same type (enums by value, lists made sets without repeats); the others are left zero.
-func AutoMigrateTool(old ToolG1) Tool {
-	return Tool{LibraryID: old.LibraryID, ToolID: old.ToolID, Name: old.Name, Category: ToolCategory(old.Category), Status: ToolStatus(old.Status), Manual: old.Manual, Tags: old.Tags, SerialNumber: old.SerialNumber, AddedAt: old.AddedAt}
+func AutoMigrateTool(old ToolG2) Tool {
+	return Tool{LibraryID: old.LibraryID, ToolID: old.ToolID, Name: old.Name, Category: ToolCategory(old.Category), Status: ToolStatus(old.Status), Manual: old.Manual, Tags: old.Tags, SerialNumber: old.SerialNumber, Barcodes: old.Barcodes, AddedAt: old.AddedAt}
 }
 
-// LoanG1 is a Loan as generation 1 stored it: what the migration job reads.
-type LoanG1 struct {
-	LibraryID  string    `dynamo:"libraryId"`
-	ToolID     string    `dynamo:"toolId"`
-	LoanID     string    `dynamo:"loanId"`
-	MemberID   string    `dynamo:"memberId"`
-	ToolName   string    `dynamo:"toolName"`
-	Status     string    `dynamo:"status"`
-	BorrowedAt time.Time `dynamo:"borrowedAt"`
-	DueAt      time.Time `dynamo:"dueAt"`
-	ReturnedAt time.Time `dynamo:"returnedAt"`
-	Notes      string    `dynamo:"notes"`
+// LoanG2 is a Loan as generation 2 stored it: what the migration job reads.
+type LoanG2 struct {
+	LibraryID   string    `dynamo:"libraryId"`
+	ToolID      string    `dynamo:"toolId"`
+	LoanID      string    `dynamo:"loanId"`
+	MemberID    string    `dynamo:"memberId"`
+	ToolName    string    `dynamo:"toolName"`
+	Status      string    `dynamo:"status"`
+	BorrowedAt  time.Time `dynamo:"borrowedAt"`
+	DueAt       time.Time `dynamo:"dueAt"`
+	ReturnedAt  time.Time `dynamo:"returnedAt"`
+	CheckedInBy string    `dynamo:"checkedInBy"`
+	Notes       string    `dynamo:"notes"`
 }
 
-// MigrateLoan, if set, converts a generation-1 Loan into this generation's. Without it, the
+// MigrateLoan, if set, converts a generation-2 Loan into this generation's. Without it, the
 // migration job uses AutoMigrateLoan: every field carries over. Set it in a file of your own in
 // this package to fill new fields.
-var MigrateLoan func(old LoanG1) (Loan, error)
+var MigrateLoan func(old LoanG2) (Loan, error)
 
-// AutoMigrateLoan copies the fields of a generation-1 Loan that exist in this generation with the
+// AutoMigrateLoan copies the fields of a generation-2 Loan that exist in this generation with the
 // same type (enums by value, lists made sets without repeats); the others are left zero.
-func AutoMigrateLoan(old LoanG1) Loan {
-	return Loan{LibraryID: old.LibraryID, ToolID: old.ToolID, LoanID: old.LoanID, MemberID: old.MemberID, ToolName: old.ToolName, Status: LoanStatus(old.Status), BorrowedAt: old.BorrowedAt, DueAt: old.DueAt, ReturnedAt: old.ReturnedAt, Notes: old.Notes}
+func AutoMigrateLoan(old LoanG2) Loan {
+	return Loan{LibraryID: old.LibraryID, ToolID: old.ToolID, LoanID: old.LoanID, MemberID: old.MemberID, ToolName: old.ToolName, Status: LoanStatus(old.Status), BorrowedAt: old.BorrowedAt, DueAt: old.DueAt, ReturnedAt: old.ReturnedAt, CheckedInBy: old.CheckedInBy, Notes: old.Notes}
 }
 
-// HoldG1 is a Hold as generation 1 stored it: what the migration job reads.
-type HoldG1 struct {
+// HoldG2 is a Hold as generation 2 stored it: what the migration job reads.
+type HoldG2 struct {
 	LibraryID string    `dynamo:"libraryId"`
 	ToolID    string    `dynamo:"toolId"`
 	MemberID  string    `dynamo:"memberId"`
@@ -3164,25 +3273,32 @@ type HoldG1 struct {
 	ExpiresAt time.Time `dynamo:"expiresAt"`
 }
 
-// MigrateHold, if set, converts a generation-1 Hold into this generation's. Without it, the
+// MigrateHold, if set, converts a generation-2 Hold into this generation's. Without it, the
 // migration job uses AutoMigrateHold: every field carries over. Set it in a file of your own in
 // this package to fill new fields.
-var MigrateHold func(old HoldG1) (Hold, error)
+var MigrateHold func(old HoldG2) (Hold, error)
 
-// AutoMigrateHold copies the fields of a generation-1 Hold that exist in this generation with the
+// AutoMigrateHold copies the fields of a generation-2 Hold that exist in this generation with the
 // same type (enums by value, lists made sets without repeats); the others are left zero.
-func AutoMigrateHold(old HoldG1) Hold {
+func AutoMigrateHold(old HoldG2) Hold {
 	return Hold{LibraryID: old.LibraryID, ToolID: old.ToolID, MemberID: old.MemberID, CodeHash: old.CodeHash, CreatedAt: old.CreatedAt, ExpiresAt: old.ExpiresAt}
 }
 
 // migrationCheck reports the conversions the migration job needs but hasn't been given.
 func migrationCheck() error {
-	return nil // every entity carries over field by field
+	var missing string
+	if MigrateLibrary == nil {
+		missing += "\n  MigrateLibrary: name is now required"
+	}
+	if missing != "" {
+		return fmt.Errorf("dynago migrate: set these conversions in package toollibrary before migrating:%s", missing)
+	}
+	return nil
 }
 
-// convertLibrary converts a Library stored by generation 1 into this generation's.
+// convertLibrary converts a Library stored by generation 2 into this generation's.
 func convertLibrary(raw dynamo.Item) (Library, error) {
-	var old LibraryG1
+	var old LibraryG2
 	if err := dynamo.UnmarshalItem(raw, &old); err != nil {
 		return Library{}, err
 	}
@@ -3196,9 +3312,9 @@ func convertLibrary(raw dynamo.Item) (Library, error) {
 	return e, nil
 }
 
-// convertMember converts a Member stored by generation 1 into this generation's.
+// convertMember converts a Member stored by generation 2 into this generation's.
 func convertMember(raw dynamo.Item) (Member, error) {
-	var old MemberG1
+	var old MemberG2
 	if err := dynamo.UnmarshalItem(raw, &old); err != nil {
 		return Member{}, err
 	}
@@ -3212,9 +3328,9 @@ func convertMember(raw dynamo.Item) (Member, error) {
 	return e, nil
 }
 
-// convertTool converts a Tool stored by generation 1 into this generation's.
+// convertTool converts a Tool stored by generation 2 into this generation's.
 func convertTool(raw dynamo.Item) (Tool, error) {
-	var old ToolG1
+	var old ToolG2
 	if err := dynamo.UnmarshalItem(raw, &old); err != nil {
 		return Tool{}, err
 	}
@@ -3228,9 +3344,9 @@ func convertTool(raw dynamo.Item) (Tool, error) {
 	return e, nil
 }
 
-// convertLoan converts a Loan stored by generation 1 into this generation's.
+// convertLoan converts a Loan stored by generation 2 into this generation's.
 func convertLoan(raw dynamo.Item) (Loan, error) {
-	var old LoanG1
+	var old LoanG2
 	if err := dynamo.UnmarshalItem(raw, &old); err != nil {
 		return Loan{}, err
 	}
@@ -3244,9 +3360,9 @@ func convertLoan(raw dynamo.Item) (Loan, error) {
 	return e, nil
 }
 
-// convertHold converts a Hold stored by generation 1 into this generation's.
+// convertHold converts a Hold stored by generation 2 into this generation's.
 func convertHold(raw dynamo.Item) (Hold, error) {
-	var old HoldG1
+	var old HoldG2
 	if err := dynamo.UnmarshalItem(raw, &old); err != nil {
 		return Hold{}, err
 	}
@@ -3394,6 +3510,10 @@ func (s *Store) migrateRemove(ctx context.Context, raw dynamo.Item, fence dynago
 func (s *LibraryStore) migrate(ctx context.Context, e *Library, src dynago.Key, srcRev int64, fence dynago.Op) error {
 	key, err := e.Key().dynamoKey()
 	if err != nil {
+		return err
+	}
+	if e.Name == "" {
+		err := fmt.Errorf("%w: Library.name", dynago.ErrFieldRequired)
 		return err
 	}
 	if err := e.checkKeyParts(); err != nil {

@@ -160,7 +160,22 @@ func (a *analyzer) indexRules(e *schema.Entity) {
 		if n > 1 {
 			where = fmt.Sprintf("at most %d partitions", n)
 		}
-		a.add("low-cardinality-key", Warning, s, "%s partition key %q has no field that varies per item beyond enums: every %s lands in %s, however many there are. Add an id (a tenant, a parent) to the key.", what, pk.Raw, e.Name, where)
+		// With volumes and rates declared, the partition estimate says whether it matters: a list
+		// of every tenant is one small, quiet partition, and the right design.
+		if p := a.partitionOf(s); p != nil && p.Risk == RiskLow && p.Size.MaxKnown {
+			grows := ""
+			if p.Grows {
+				grows = " (and grows as long as the table lives)"
+			}
+			a.add("low-cardinality-key", Note, s, "%s partition key %q has no field that varies per item beyond enums: every %s lands in %s. At the declared volumes and rates that's fine: the largest holds %s%s, and its busiest key takes %s of a partition's capacity at peak. Revisit it if the volumes or rates grow by orders of magnitude.",
+				what, pk.Raw, e.Name, where, cost.HumanBytes(p.Size.Max), grows, headroomText(p.Headroom))
+			return
+		}
+		unknown := ""
+		if p := a.partitionOf(s); p == nil || p.Risk == RiskUnknown || !p.Size.MaxKnown {
+			unknown = " Declare the volume and rates to see whether that matters here."
+		}
+		a.add("low-cardinality-key", Warning, s, "%s partition key %q has no field that varies per item beyond enums: every %s lands in %s, however many there are. Add an id (a tenant, a parent) to the key.%s", what, pk.Raw, e.Name, where, unknown)
 	}
 	check(entitySubject(e), e.Name+"'s", e.PK, len(minus(e.KeyFields(), e.PK.Fields)) > 0)
 	for _, ix := range e.Indexes {
@@ -490,4 +505,25 @@ func pronoun(n int) string {
 		return "one"
 	}
 	return "them"
+}
+
+// partitionOf returns the partition family holding the items the subject declares (an entity's
+// items, an index's entries), or nil.
+func (a *analyzer) partitionOf(s schema.Subject) *Partition {
+	for _, p := range a.r.Partitions {
+		for _, mb := range p.Members {
+			if mb.Owner == s {
+				return p
+			}
+		}
+	}
+	return nil
+}
+
+// headroomText formats a share of a partition's capacity: "<1%", "4%".
+func headroomText(h float64) string {
+	if h < 0.01 {
+		return "<1%"
+	}
+	return fmt.Sprintf("%.0f%%", h*100)
 }

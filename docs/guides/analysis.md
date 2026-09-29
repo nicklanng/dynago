@@ -125,9 +125,10 @@ access:
 
 An index without a `strategy` becomes a copy if any read through it needs `immediate`, and a GSI
 otherwise. Either way, the model document shows what the other kind would cost ("As a GSI:
-Loan.Borrow 23 → 22 WRU; Loan.Extend 8 → 5 WRU, no longer a transaction; MyLoans would lose
-immediate freshness"). A declared GSI with an immediate read is an error; a copy that no read
-needs is a `copy-not-needed` note.
+Loan.Borrow 23 → 22 WRU (8 → 7 items); Loan.Return 19 → 17 WRU (6 → 4 items); Loan.Extend 8 → 5
+WRU, no longer a transaction; MyLoans would lose immediate freshness"). A declared GSI with an
+immediate read is an error. A copy whose every read declares `freshness: eventual` is a
+`copy-not-needed` note, and one that nothing reads is an `unused-index` warning.
 
 ## Guarantees and lifecycles
 
@@ -149,9 +150,9 @@ Every finding has a severity, a rule id, and the schema object it's about.
 | `hot-partition` | warning; error on a single item over capacity | A partition key's busiest value takes over half its throughput at peak. |
 | `hot-counter` | error | A counter item takes more write units per second than a partition can serve. Suggests a shard count. |
 | `counter-contention` | warning, or note | Transactions update one counter item often enough (over ~20 a second) to conflict and retry. |
-| `low-cardinality-key` | warning | A partition key holds nothing but constants and enums (`STATUS#{status}`), so all of an entity's items share a few partitions. |
+| `low-cardinality-key` | warning, or note | A partition key holds nothing but constants, enums and bools (`STATUS#{status}`), so all of an entity's items share a few partitions. A note, with the figures, when the declared volumes and rates put those partitions at low risk: a list of every tenant under one key is often the right design. |
 | `sparse-index` | warning | An index is keyed by an optional field, so items without it silently drop out of the index and every read through it. |
-| `unenforced-unique` | warning | A read takes one entry of an index (`page: 1`, no sort key) as if its key were unique, but no unique constraint makes it so. |
+| `unenforced-unique` | warning | A read takes one entry of an index (`max_page: 1`, no sort key) as if its key were unique, but no unique constraint makes it so. |
 | `unused-index` | warning | No declared read uses an index, yet every write pays for it. |
 | `copy-drift` | warning | A `copy_of` field must be rewritten by your code when its source changes; says how many items one change fans out to, and whether one transaction could hold them. |
 | `item-large` | warning | An item's p99 size is over 100 KB: every read and write of it is expensive. |
@@ -197,7 +198,8 @@ so reasons don't outlive what they explained.
 ## Policy
 
 A `dynago.policy.yaml` holds rules for every schema in a repository: `dynago` uses the nearest one
-in the schema's directory or above it (or `-policy <file>`).
+in the schema's directory or above it, up to the repository root (the directory holding `.git`;
+outside a repository, the module root holding `go.mod`). `-policy <file>` names one instead.
 
 ```yaml
 # Fail the build on warnings, not just errors.

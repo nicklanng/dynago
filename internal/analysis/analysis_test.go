@@ -15,7 +15,21 @@ func example(t *testing.T) *Result {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return Analyze(m, cost.DefaultPrices, nil)
+	return Analyze(m, cost.DefaultPrices, examplePolicy(t))
+}
+
+// examplePolicy reads the policy beside the example schema.
+func examplePolicy(t *testing.T) *Policy {
+	t.Helper()
+	data, err := os.ReadFile("../../examples/toollibrary/dynago.policy.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := ParsePolicy(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }
 
 func parse(t *testing.T, src string) *schema.Model {
@@ -52,10 +66,13 @@ func dump(r *Result) string {
 func TestExampleFindings(t *testing.T) {
 	r := example(t)
 	if len(r.Failing()) != 0 {
-		t.Fatalf("the example fails its default policy:\n%s", dump(r))
+		t.Fatalf("the example fails its policy:\n%s", dump(r))
 	}
 	if !has(r, "large-field", Warning, "Tool", "manual (p99 19.5 KB)") {
 		t.Errorf("no large-field finding:\n%s", dump(r))
+	}
+	if !has(r, "scan", Note, "Loan.Export", "The yearly lending report") {
+		t.Errorf("no note for the declared scan:\n%s", dump(r))
 	}
 	accepted := 0
 	for _, f := range r.Findings {
@@ -63,8 +80,8 @@ func TestExampleFindings(t *testing.T) {
 			accepted++
 		}
 	}
-	if accepted != 3 {
-		t.Errorf("want 3 accepted findings (two sparse indexes, one lookup by code):\n%s", dump(r))
+	if accepted != 4 {
+		t.Errorf("want 4 accepted findings (two sparse indexes, the manual, one lookup by code):\n%s", dump(r))
 	}
 }
 
@@ -226,7 +243,9 @@ func TestRules(t *testing.T) {
 		{"low-cardinality GSI", "    indexes:\n      ByKind: { pk: \"KIND#{kind}\", sk: \"T#{thingId}\", project: keys }\n    access:\n      K: { query: ByKind }\n",
 			"low-cardinality-key", Warning, "Thing.ByKind", "at most 2 partitions"},
 		{"constant partition key", "    indexes:\n      All: { pk: \"ALL\", sk: \"T#{thingId}\", project: keys }\n    access:\n      L: { query: All }\n",
-			"low-cardinality-key", Warning, "Thing.All", "one partition"},
+			"low-cardinality-key", Warning, "Thing.All", "one partition, however many there are. Add an id (a tenant, a parent) to the key. Declare the volume and rates"},
+		{"small, quiet constant partition key", "    indexes:\n      All: { pk: \"ALL\", sk: \"T#{thingId}\", project: keys }\n    access:\n      L: { query: All, rate: 1 }\n",
+			"low-cardinality-key", Note, "Thing.All", "At the declared volumes and rates that's fine: the largest holds"},
 		{"sparse index", "    indexes:\n      ByName: { pk: \"ORG#{orgId}#N\", sk: \"{name}#{thingId}\", project: keys }\n    access:\n      L: { query: ByName }\n",
 			"sparse-index", Warning, "Thing.ByName", "a Thing without one is missing from ByName and from L"},
 		{"unused index", "    indexes:\n      ByName: { pk: \"ORG#{orgId}#N\", sk: \"N#{thingId}\", project: keys }\n",

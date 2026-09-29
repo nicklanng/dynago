@@ -17,9 +17,10 @@ Write down every read the application needs, with how it is bounded and how ofte
 | How many tools a member has out | one | 5/s |
 
 Each row becomes an entry under `access:`. If a question cannot be answered by one keyed request,
-the model needs another key, index, copy or counter, never a scan or a filter. dynago does not
-generate scans or filters (except one dropping expired items), so a missing pattern shows up as a missing method, not as a slow page
-in production.
+the model needs another key, index, copy or counter, never a scan or a filter. dynago generates no
+filters (except one dropping expired items), and a scan only where the schema declares one with a
+reason, for work off the request path such as an export. A missing pattern shows up as a missing
+method, not as a slow page in production.
 
 ## 2. Choose the primary key
 

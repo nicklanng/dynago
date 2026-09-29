@@ -11,36 +11,33 @@ First version.
 ### Analysis and review
 
 - `volume` on entities (a total, or `typical` and `max` per parent, with `by` for the spread over
-  other entities) and `workload` (`peak`, `horizon`) replace `estimate`. Parents are inferred from
-  partition key nesting; `ref` links a field to another entity's key.
+  other entities) and `workload` (`peak`, `horizon`). Parents are inferred from partition key
+  nesting; `ref` links a field to another entity's key, and `via` says which link a volume counts
+  by when an entity holds another's key more than one way.
 - Partition analysis: every partition family in the base table and each GSI, with items per key,
   size (typical and largest), growth, the busiest key's capacity at peak, and a risk level.
-- Findings have rule ids and subjects. `accept: { rule: reason }` on the table, an entity, field,
-  index, constraint, counter, read or write records one as deliberate; errors can't be accepted,
-  and stale acceptances are errors. New rules: `hot-partition`, `low-cardinality-key`,
-  `sparse-index`, `unenforced-unique`, `unused-index`, `copy-not-needed`, `transaction-too-large`
-  (4 MB), `scan`, and policy rules; `copy-drift` now reports fan-out.
+- Findings with rule ids, severities and subjects: DynamoDB's limits (item size, partitions,
+  transactions, indexes), hot partitions and counters, contention, low-cardinality keys, sparse
+  indexes, unenforced uniqueness, unused and unneeded indexes, copies that drift (with their
+  fan-out), scans, and what a policy requires. `accept: { rule: reason }` on the table, an entity,
+  field, index, constraint, counter, read or write records one as deliberate; errors can't be
+  accepted, and stale acceptances are errors.
 - `dynago.policy.yaml`: `fail_on`, rule severities, limits (item and partition size, transaction
   items, GSIs, indexes per entity) and required declarations (volumes, rates, freshness).
 - `freshness: immediate | eventual` on reads. An index without `strategy` becomes a copy if a read
   through it needs immediate freshness, a GSI otherwise; the model document shows what the other
   strategy would cost.
 - `snapshot_of`: a copied value deliberately kept as it was when written.
-- `scan: true` with a `reason`: a declared, paginated scan of the entity's items.
+- `scan: true` with a `reason`: a declared, paginated scan of the entity's items, for work off the
+  request path.
 - The model document leads with a summary, the domain (relationships, guarantees, lifecycles),
-  catalogues of every read and write, the indexes and a partition map, then risks and costs; the
-  per-entity detail moved to a reference section.
+  catalogues of every read and write, the indexes and a partition map, then risks and costs, and
+  ends with per-entity reference detail.
+- `dynago check`: the analysis (costs, partitions, findings), without writing anything; `-json`
+  prints the analysed design as JSON.
 - `dynago diff`: the architectural changes since a git ref or another file, as Markdown, including
   whether existing items need a new table generation and what migrating them costs.
-- `dynago check -json`: the analysed design as JSON.
 - `dynago vet`: DynamoDB calls outside generated code, with `//dynago:raw <reason>` for exceptions.
-
-- Every row dynago writes carries `_created` and `_updated` (entity items, copies, claims,
-  counters), set on every write path and kept by the migration job; entities expose them as
-  `Timestamps()`.
-- The migration job checks which items of a page are already copied with one BatchGetItem, not a
-  read per item: catch-up passes and `finish` make far fewer round trips.
-- Tests can run against real DynamoDB tables in a test AWS account (`make test-aws`, maintainers).
 
 ### Schema and generator
 
@@ -93,7 +90,8 @@ First version.
   segments whatever `-workers` is, and expiry of old items follows the old table's TTL attribute.
   It rebuilds derived items from the entities, and reports items it can't copy as conflicts. It
   converts entities field by field, or with a `Migrate<Entity>` function where fields don't carry
-  over.
+  over. Which items of a page are already copied, and which sources still exist, it checks with
+  one BatchGetItem per page.
 - Model document with Mermaid diagrams, Terraform JSON (with point-in-time recovery, deletion
   protection and TTL) and CreateTable JSON.
 - Read-free writes only when the key of every counter they change is known; `versioned: required`
@@ -105,12 +103,14 @@ First version.
 - Lock file: refuses a missing history (`-new-history` to start one), records the TTL attribute and
   each generation's table, ignores declaration order, and upgrades older lock files in place.
 - CLI flags may follow the schema files.
-- Cost and risk report: sizes, capacity per call (including condition checks), monthly cost from
-  declared rates, storage, and findings (item size, large fields, transaction size, hot and
-  conflict-prone counters, cross-entity copies, projections, TTL interactions).
+- Cost estimates: sizes, capacity per call (including condition checks), monthly cost from
+  declared rates, and storage.
 
 ### Runtime
 
+- Every row dynago writes carries `_created` and `_updated` (entity items, copies, claims,
+  counters), set on every write path and kept by the migration job; entities expose them as
+  `Timestamps()`.
 - Caller-supplied limits are required: `dynago.Max(n)` or `dynago.Unlimited()`; a missing one is
   `dynago.ErrLimitRequired`.
 - Retry-safe writes: idempotent transactions, and single-item creates that recognise their own item
@@ -125,17 +125,21 @@ First version.
 - `{field|lower}` normalises Unicode to NFC before lower-casing.
 - `DYNAGO_REQUIRE_DB` makes `dynagotest` fail instead of skip without DynamoDB Local; `make test`
   sets it.
-- Cursors tied to query, partition, range bounds and schema version, optionally signed
+- Cursors tied to query, partition, range bounds and the query's key shape (not the schema
+  version, so they survive a rolling deploy of a compatible version), optionally signed
   (`dynago.SignCursors`, with previous keys accepted for rotation).
 - Transactions refuse to touch an item twice (`dynago.ErrSameItemTwice`) before sending, and
   changes to one counter item from several entities in a write are merged.
 - Single-item writes blocked by a transaction on the item are retried as contention.
 - `dynagotest`: DynamoDB Local connection, a table per test, and counts of every request kind.
+- dynago's own tests can also run against real tables in a test AWS account (`make test-aws`, for
+  maintainers).
 
 ### Example
 
-- `toollibrary`, a fictional neighbourhood tool library using every feature: borrowing and
+- `toollibrary`, a fictional neighbourhood tool library using most features: borrowing and
   returning change the tool atomically, and holds reserve a tool until they lapse. It is at table
-  generation 2 (barcodes), with its migration command. End-to-end tests
+  generation 3 (barcodes, then a list of every library, the service's tenants), with its migration
+  command and the conversion the last move needs. End-to-end tests
   (`internal/e2e`) show a refused borrow leaves the table unchanged and ten racing borrowers get
   one tool.

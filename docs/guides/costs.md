@@ -6,20 +6,25 @@ ships, and so the numbers are argued about as assumptions, not opinions. The sam
 the [partition analysis and findings](analysis.md).
 
 ```
-Loan (v1)  item 464 B / 1.9 KB  2,400,000 items  storage 3.22 GB ($0.80/month)
-  read   Overdue      Query                    2.5/5 RRU  $0.01/month
+Loan (v2)  item 571 B / 2.0 KB  2,400,000 items  storage 3.63 GB ($0.91/month)
+  read   Overdue      Query                    2.5/5 RRU    $0.01/month
   read   Totals       BatchGetItem (4 shards)  2 RRU
-  write  Borrow       tx 8 items               23/61 WRU  $74.52/month
-  write  Return       tx 6 items + read        19/57 WRU  $62.21/month
+  read   Export       Scan (one page)          3.5/13 RRU
+  write  Borrow       tx 8 items               23/63 WRU    $74.52/month
+  write  Return       tx 6 items + read        19/59 WRU    $62.21/month
 
-warning [large-field] entity Tool: manual (p99 19.5 KB) makes every write cost up to 21 WRU (42
+accepted [large-field] entity Tool: manual (p99 19.5 KB) makes every write cost up to 21 WRU (42
 in a transaction), including writes that never change it: Relabel, Retire, Loan.Borrow,
 Loan.Return. Consider moving it to an entity of its own, written only when it changes.
+  reason: Most manuals are short (2 KB typically); only a few tools carry long ones, and those
+  tools' writes cost more. Splitting the manual out would add a read to every tool page, for cents
+  a month.
 ```
 
-The warning is worth reading closely: marking the tool on loan rewrites the whole tool item, so a
-borrow pays for the tool's 20 KB manual as well as the loan. It names the loan's writes because
-they change the tool through `requires`.
+The finding is worth reading closely: marking the tool on loan rewrites the whole tool item, so a
+borrow pays for the tool's manual as well as the loan. It names the loan's writes because they
+change the tool through `requires`. The example accepts it, with the numbers that justify doing
+so; a design whose manuals were mostly long would move them out instead.
 
 ## Inputs you provide
 

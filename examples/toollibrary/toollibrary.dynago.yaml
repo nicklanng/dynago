@@ -1,8 +1,9 @@
 # yaml-language-server: $schema=../../schema/dynago.schema.json
 #
 # A neighbourhood tool library. Members borrow drills and tents instead of buying them, reserve a
-# tool for pickup with a code, and stewards run the place. A fictional domain, chosen to use every
-# feature of dynago in one realistic table.
+# tool for pickup with a code, and stewards run the place. A fictional domain, chosen to show most
+# of dynago in one realistic table: dynago.policy.yaml beside it holds the rules it is checked
+# against.
 #
 # The rules that matter hold in single transactions, so no crash or race can leave them half done:
 #   - Borrow creates the loan, marks the tool on loan, counts it against the member's cap, and
@@ -19,9 +20,10 @@ table:
   name: toollibrary
   doc: Libraries, their members and tools, loans and pickup holds.
   # Generation 2 added tool barcodes, with a unique claim per label: existing tools had no claims,
-  # so the table moved to a new generation. Generation 1 stays for rollback.
-  generation: 2
-  retain: [1]
+  # so the table moved to a new generation. Generation 3 added the list of every library (index
+  # Library.All), whose entries existing libraries lacked. Generation 2 stays for rollback.
+  generation: 3
+  retain: [2]
 
 output:
   migrate_cmd: cmd/migrate-toollibrary
@@ -32,24 +34,34 @@ workload: { horizon: 3 years, peak: 5 }
 
 entities:
   Library:
-    doc: A tool library, run by volunteers in one neighbourhood.
+    doc: A tool library, run by volunteers in one neighbourhood. Each is a tenant of the service.
+    version: 2 # v2 (generation 3) added the All index
     fields:
       libraryId: { type: string, example: lib_1 }
-      name: { type: string, size: 20/80 }
+      name: { type: string, size: 20/80, required: true }
       slug: { type: string, size: 12/40, example: greenwood, doc: The library's URL name. }
       openedAt: time
     key:
       pk: "LIB#{libraryId}"
       sk: "LIBRARY"
+    indexes:
+      All:
+        # One partition holds every library. That's deliberate: 2,000 entries are a few hundred
+        # KB, read a few times a minute, and dynago's analysis reports the numbers as a note.
+        doc: "Every library, alphabetically, for the operators' admin pages: the tenant list."
+        pk: "LIBRARIES"
+        sk: "{name|lower}#{libraryId}"
+        project: [slug, openedAt]
     unique:
       Slug:
         doc: Routes /l/{slug} to its library. Global, because the URL carries nothing else.
         fields: [slug]
     access:
-      Get: { get: key, rate: 5 }
-      GetBySlug: { get: { unique: Slug }, rate: 20 }
-      MemberStats: { counter: MemberCounts, rate: 2, doc: "The member counts, read from the library's page." }
-      ToolStats: { counter: ToolCounts, rate: 2 }
+      Get: { get: key, freshness: eventual, rate: 5 }
+      GetBySlug: { get: { unique: Slug }, freshness: eventual, rate: 20 }
+      MemberStats: { counter: MemberCounts, freshness: eventual, rate: 2, doc: "The member counts, read from the library's page." }
+      ToolStats: { counter: ToolCounts, freshness: eventual, rate: 2 }
+      List: { query: All, page: 50, freshness: eventual, rate: 0.1, doc: "Every library, a page at a time, for the operators." }
     writes:
       Open: create
       Rename: { patch: [name], versioned: required, doc: "A steward editing the library's settings." }
@@ -94,8 +106,8 @@ entities:
           suspended: { count: true, where: { status: suspended } }
           stewards: { count: true, where: { role: steward, status: active }, min: 1, doc: A library always keeps at least one active steward. }
     access:
-      Get: { get: key, rate: 10 }
-      GetByEmail: { get: { unique: Email }, rate: 1 }
+      Get: { get: key, freshness: immediate, rate: 10, doc: "A member's profile, which they see straight after editing it." }
+      GetByEmail: { get: { unique: Email }, freshness: immediate, rate: 1, doc: "Sign-in, which may come the moment after joining." }
       Directory: { query: ByName, freshness: eventual, rate: 2 }
     writes:
       Join: create
@@ -155,9 +167,9 @@ entities:
           onLoan: { count: true, where: { status: onLoan } }
           retired: { count: true, where: { status: retired } }
     access:
-      Get: { get: key, rate: 20 }
+      Get: { get: key, freshness: eventual, rate: 20 }
       Catalogue: { query: ByCategory, page: 25, freshness: eventual, rate: 10 }
-      GetByBarcode: { get: { unique: Barcode }, rate: 2 }
+      GetByBarcode: { get: { unique: Barcode }, freshness: immediate, rate: 2, doc: "The desk scanning a label, perhaps one just attached." }
     writes:
       Add: { create: true, set: { status: available } }
       EditDetails: { patch: [name, manual, tags], versioned: required }
@@ -171,9 +183,12 @@ entities:
     # Tools go on and off loan through Loan.Borrow and Loan.Return, which change them in the same
     # transaction as the loan.
     volume: { typical: 60, max: 5000 }
+    accept:
+      large-field: "Most manuals are short (2 KB typically); only a few tools carry long ones, and those tools' writes cost more. Splitting the manual out would add a read to every tool page, for cents a month."
 
   Loan:
     doc: A member borrowing a tool.
+    version: 2 # v2 added checkedInBy
     fields:
       libraryId: { type: string, example: lib_1 }
       toolId: { type: string, example: t_42 }
@@ -184,6 +199,7 @@ entities:
       borrowedAt: { type: time, required: true }
       dueAt: { type: time, required: true, example: "2026-10-12T17:00:00Z" }
       returnedAt: time
+      checkedInBy: { type: string, ref: Member, doc: "The steward who took the tool back. A Member's memberId, under another name: the loan's memberId is its borrower." }
       notes: { type: string, size: 0/1000, doc: Condition notes from the steward. Not listed. }
     key:
       pk: "LIB#{libraryId}#TOOL#{toolId}"
@@ -210,19 +226,20 @@ entities:
         values:
           active: { count: true, where: { status: active }, limit: arg, doc: Capped by the member's maxLoans. }
       LoanTotals:
-        doc: "Counts every loan the library has made. Sharded to show how: a counter that every write of a busy entity touches can take ~1,000 writes/s per shard. This library's rate needs one item."
+        doc: "Counts every loan the library has made. Sharded to show how: a counter item that every write of a busy entity touches starts to see transaction conflicts at about 20 writes/s, so each shard should take no more than about 10. This library's rate needs one item."
         pk: "LIB#{libraryId}#LOANTOTALS"
         sk: "TOTALS"
         shards: 4
         values:
           started: count
     access:
-      Get: get
-      History: { query: key, order: desc, page: 20, project: [memberId, status, borrowedAt, dueAt, returnedAt], rate: 1, doc: "A tool's loans, newest first, without the notes." }
+      Get: { get: key, freshness: immediate, doc: "A loan as the steward checks it in, straight after any change." }
+      History: { query: key, order: desc, page: 20, project: [memberId, status, borrowedAt, dueAt, returnedAt], freshness: eventual, rate: 1, doc: "A tool's loans, newest first, without the notes." }
       MyLoans: { query: ByMember, freshness: immediate, rate: 5, doc: "A member's current loans, soonest due first." }
       Overdue: { query: Overdue, range: dueAt, freshness: eventual, rate: 0.01 }
-      ActiveLoans: { counter: MemberLoans }
-      Totals: { counter: LoanTotals }
+      ActiveLoans: { counter: MemberLoans, freshness: eventual, doc: "Shown beside the member's loans. Borrow enforces the cap itself." }
+      Totals: { counter: LoanTotals, freshness: eventual }
+      Export: { scan: true, freshness: eventual, reason: "The yearly lending report reads every loan once, overnight. No request path reads it." }
     writes:
       Borrow:
         create: true
@@ -240,7 +257,7 @@ entities:
             consume: true
         rate: 2
       Return:
-        update: [returnedAt]
+        update: [returnedAt, checkedInBy]
         set: { status: returned }
         when: { status: active }
         requires:
@@ -252,7 +269,9 @@ entities:
       Extend: { update: [dueAt], when: { status: active } }
       AddNote: { patch: [notes] }
     # A tool's loans accumulate: its whole lending history stays in its partition.
-    volume: { typical: 20, max: 500, by: { Member: { typical: 60, max: 400 } } }
+    # A loan holds two members' keys (borrower and steward), so `via` says loans are counted per
+    # borrower.
+    volume: { typical: 20, max: 500, by: { Member: { typical: 60, max: 400, via: memberId } } }
 
   Hold:
     doc: "A tool reserved for a member to collect, with a pickup code. While it is live, only that member can borrow the tool; borrowing collects it. Lapses after two days."
@@ -279,7 +298,7 @@ entities:
         accept:
           unenforced-unique: "Codes are HMACs under a server-side secret: two holds sharing one is negligibly unlikely, and a claim would outlive the hold's TTL."
     access:
-      Get: get
+      Get: { get: key, freshness: immediate, doc: "The member's hold, straight after placing it." }
       FindByCode: { query: ByCode, page: 1, max_page: 1, freshness: eventual, rate: 1 }
     writes:
       Place:

@@ -16,8 +16,8 @@ import (
 )
 
 // generations sets up a migration: the previous generation's table (written with the current
-// store, which stores the same shapes apart from barcodes, which old tools lack) and the current
-// generation's empty table.
+// store, which stores the same shapes apart from the tenant list's index keys, which generation 2
+// items lack) and the current generation's empty table.
 type generations struct {
 	db       *dynamo.DB
 	base     string
@@ -30,11 +30,11 @@ func setupGenerations(t *testing.T) *generations {
 	t.Helper()
 	db := testdb.DB(t)
 	g := &generations{db: db, base: testdb.UniqueName(t, "migrate")}
-	testdb.TableNamed(t, db, g.base+"-g1", toollibrary.TableSpec)
+	testdb.TableNamed(t, db, g.base+"-g2", toollibrary.TableSpec)
 	testdb.TableNamed(t, db, toollibrary.TableName(g.base), toollibrary.TableSpec)
-	g.old = toollibrary.New(db, g.base+"-g1")
+	g.old = toollibrary.New(db, g.base+"-g2")
 	g.new = toollibrary.New(db, toollibrary.TableName(g.base))
-	g.oldTable = db.Table(g.base + "-g1")
+	g.oldTable = db.Table(g.base + "-g2")
 	return g
 }
 
@@ -66,6 +66,9 @@ func TestMigrationCopiesAndCatchesUp(t *testing.T) {
 	g := setupGenerations(t)
 	old := g.old
 	must(t, old.Libraries.Open(ctx, &toollibrary.Library{LibraryID: "lib1", Name: "Greenwood", Slug: "greenwood", OpenedAt: time.Now()}))
+	// Generation 2 allowed a library without a name; MigrateLibrary names it after its slug.
+	must(t, g.oldTable.Put(map[string]any{"PK": "LIB#lib2", "SK": "LIBRARY", "_t": "Library", "_v": 1, "_rev": 1,
+		"libraryId": "lib2", "slug": "oak"}).Run(ctx))
 	for id, role := range map[string]toollibrary.MemberRole{"alice": toollibrary.MemberRoleSteward, "bob": toollibrary.MemberRoleSteward} {
 		must(t, old.Members.Join(ctx, &toollibrary.Member{LibraryID: "lib1", MemberID: id, Email: id + "@example.org", Name: id,
 			Role: role, Status: toollibrary.MemberStatusActive, MaxLoans: 3, JoinedAt: time.Now()}))
@@ -79,8 +82,8 @@ func TestMigrationCopiesAndCatchesUp(t *testing.T) {
 	must(t, old.Holds.Place(ctx, &toollibrary.Hold{LibraryID: "lib1", ToolID: "t2", MemberID: "bob", CodeHash: pickupCode("K3J"),
 		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(48 * time.Hour)}))
 
-	// This generation adds barcodes; the conversion labels each tool with its serial number.
-	toollibrary.MigrateTool = func(o toollibrary.ToolG1) (toollibrary.Tool, error) {
+	// A conversion of our own: it labels each tool with its serial number.
+	toollibrary.MigrateTool = func(o toollibrary.ToolG2) (toollibrary.Tool, error) {
 		tool := toollibrary.AutoMigrateTool(o)
 		if o.SerialNumber != "" {
 			tool.Barcodes = []string{"LBL-" + o.SerialNumber}
@@ -101,6 +104,14 @@ func TestMigrationCopiesAndCatchesUp(t *testing.T) {
 	if tool, err := nu.Tools.GetByBarcode(ctx, "lib1", "LBL-SN-t2"); err != nil || tool.ToolID != "t2" {
 		t.Fatalf("barcode from the conversion: %+v %v", tool, err)
 	}
+	// Every library is in the new generation's tenant list, the unnamed one under its slug.
+	testdb.Eventually(t, "tenant list", func() error {
+		libs, _, err := nu.Libraries.List(ctx, toollibrary.LibraryListQuery{}, dynago.Page{})
+		if err != nil {
+			return err
+		}
+		return testdb.Check(len(libs) == 2 && libs[0].Name == "Greenwood" && libs[1].Name == "oak", "libraries %+v", libs)
+	})
 	mine, _, err := nu.Loans.MyLoans(ctx, toollibrary.LoanMyLoansQuery{LibraryID: "lib1", MemberID: "alice"}, dynago.Page{})
 	if err != nil || len(mine) != 1 {
 		t.Fatalf("copy index in the new table: %+v %v", mine, err)

@@ -114,11 +114,12 @@ func (d *doc) summary() {
 	}
 	var rk []string
 	for _, k := range []struct {
-		kind schema.AccessKind
-		name string
-	}{{schema.AccessGet, "by key"}, {schema.AccessGetUnique, "by unique value"}, {schema.AccessQuery, "queries"}, {schema.AccessCounter, "counters"}, {schema.AccessScan, "scans"}} {
+		kind      schema.AccessKind
+		one, many string
+	}{{schema.AccessGet, "by key", "by key"}, {schema.AccessGetUnique, "by unique value", "by unique value"}, {schema.AccessQuery, "query", "queries"},
+		{schema.AccessCounter, "counter", "counters"}, {schema.AccessScan, "scan", "scans"}} {
 		if n := kinds[k.kind]; n > 0 {
-			rk = append(rk, fmt.Sprintf("%d %s", n, k.name))
+			rk = append(rk, plural(n, k.one, k.many))
 		}
 	}
 	d.p("| | |")
@@ -315,9 +316,9 @@ func relText(rel *schema.Relation) string {
 	default:
 		parts = append(parts, holds)
 	}
-	for _, f := range rel.From.Fields {
-		if f.Ref == rel.To {
-			parts = append(parts, fmt.Sprintf("`%s` is declared `ref: %s`", f.Name, rel.To.Name))
+	for _, k := range rel.Key {
+		if k.Source.Ref == rel.To {
+			parts = append(parts, fmt.Sprintf("`%s` is declared `ref: %s`", k.Source.Name, rel.To.Name))
 		}
 	}
 	if len(rel.Writes) > 0 {

@@ -304,3 +304,43 @@ entities:
 		t.Fatalf("AutoMigrateThing doesn't dedupe tags:\n%s", out)
 	}
 }
+
+// A cursor is tied to its query's shape, not the entity's version: a version that leaves the
+// query alone keeps cursors working through a rolling deploy, and a change to its keys doesn't.
+func TestCursorScopeFollowsTheQueryShape(t *testing.T) {
+	scope := func(version, sk, extra string) string {
+		t.Helper()
+		m, err := schema.Parse([]byte(`
+dynago: 1
+package: things
+table: { name: things }
+entities:
+  Thing:
+    version: ` + version + `
+    fields: { tenantId: string, thingId: string, name: string` + extra + ` }
+    key: { pk: "T#{tenantId}", sk: "` + sk + `" }
+    access:
+      List: { query: key }
+`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := Generate(m, "things.dynago.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		code := string(out)
+		start := strings.Index(code, `Scope: "Thing.List#`)
+		if start < 0 {
+			t.Fatalf("no List scope in:\n%s", code)
+		}
+		return code[start : start+strings.Index(code[start:], `"`+" + pk")]
+	}
+	v1 := scope("1", "THING#{thingId}", "")
+	if v2 := scope("2", "THING#{thingId}", ", colour: string"); v2 != v1 {
+		t.Errorf("adding a field changed the cursor scope: %s → %s", v1, v2)
+	}
+	if rekeyed := scope("2", "THING#{name}#{thingId}", ""); rekeyed == v1 {
+		t.Errorf("changing the sort key kept the cursor scope %s", v1)
+	}
+}

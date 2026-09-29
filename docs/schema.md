@@ -3,7 +3,8 @@
 A dynago schema is one YAML file per DynamoDB table. It declares the entities stored in the table,
 how each is keyed, the items derived from it (index entries, copies, uniqueness claims, counters),
 and **every** way it is read and written. `dynago generate` turns it into Go, documentation,
-Terraform and a lock file; `dynago check` validates it and prints a cost and risk report.
+Terraform and a lock file; `dynago check` validates it and prints its analysis: costs, partitions
+and findings.
 
 Name the file `<something>.dynago.yaml`. For editor autocomplete and inline errors, put this on its
 first line (VS Code with the YAML extension, JetBrains IDEs and others understand it):
@@ -135,7 +136,7 @@ Field names are camelCase. Each becomes an exported Go field (`libraryId` → `L
 | `required` | no | `true` makes writes refuse the field's zero value with `dynago.ErrFieldRequired`: creates must set it, updates (`update`, `patch`) may not clear it, and `set` may not set it to zero. Key fields are always required. Use it for fields the model depends on, such as a hold's expiry. |
 | `copy_of` | no | `Entity.field` this field copies from another entity and must **stay equal to**. dynago keeps copies within an entity in sync but not this one: declaring it documents that your code must rewrite the copies when the source changes, and `dynago check` warns (`copy-drift`), saying how many items one change fans out to and whether one transaction could hold them. Types must match. |
 | `snapshot_of` | no | `Entity.field` whose value this field takes when the item is written, and **deliberately keeps**: a tool's name at the time of a loan, a price at the time of an order. Documented, not warned about. Exclusive with `copy_of`. |
-| `ref` | no | The entity whose key this field holds, when its name doesn't match that entity's key field (`borrowerId` holding a `Member`'s `memberId`, `userId` holding a `User`'s `id`). Fields with matching names link without it. The field supplies the key field no same-named field can, or else the entity's last key field (a `stewardId` beside `memberId` refers to another `Member`); the other key fields come from fields of the same name. A `ref` is the link `volume` (`per`, `by`), parents and the analysis follow to that entity, ahead of any match by name. |
+| `ref` | no | The entity whose key this field holds, when its name doesn't match that entity's key field (`borrowerId` holding a `Member`'s `memberId`, `userId` holding a `User`'s `id`). Fields with matching names link without it. The field supplies the key field no same-named field can, or else the entity's last key field (a `stewardId` beside `memberId` refers to another `Member`); the other key fields come from fields of the same name. When an entity holds another's key more than one way (a `memberId` and a `stewardId` both reaching `Member`), `volume.per` and `volume.by` must say which with `via`. A match by name that is just this entity's own key (`Post.id` against `User.id`) doesn't count when a `ref` to that entity exists. |
 | `accept` | no | Findings about the field recorded as deliberate. See [Accepting findings](#accept). |
 
 | Type | Go type | Stored as | In keys | Empty means absent | Default size p50/p99 |
@@ -521,6 +522,7 @@ Hold:
 | `typical` | Items per parent item, typically. Fractions are fine (0.02 holds per tool). |
 | `max` | Items per parent item, at most: the biggest parent. Skew lives here, and so do hot partitions: a partition's largest size and traffic follow from it. Left out, unknown (or 1, when this entity's key is its parent's key). |
 | `by` | How the items spread over other entities whose keys they hold: `{ Member: { typical, max } }` is how many loans one member has. Partitions keyed by that entity's key (a copy or GSI keyed by `memberId`, a counter per member) are counted with it. Without it, the items are assumed to spread evenly, with no known maximum. |
+| `via` | In `volume` (with `per`) or in an entry of `by`: the field linking to that entity, when this entity holds its key more than one way. A loan with a `memberId` (its borrower) and a `stewardId: { ref: Member }` says `by: { Member: { typical: 60, via: memberId } }`. Without it, dynago refuses to guess. |
 
 Totals multiply down: 2,000 libraries × 60 tools × 20 loans is 2.4 million loans. From the volumes
 and the key templates, `dynago check` and the model document estimate every partition's item
@@ -586,8 +588,9 @@ Checked by `dynago` beyond the JSON Schema:
   could match on the other. So a query never returns another family's items.
 - **References.** Key templates, `project`, `where`, `when`, `set`, `patch`, `sum`, `range`, `ttl`
   and `unique` fields must name fields of the entity; `query` must name an index of the entity,
-  `get: { unique }` a constraint, `counter` a counter of the table, `copy_of` and `requires` other
-  entities of the table.
+  `get: { unique }` a constraint, `counter` a counter of the table; `copy_of`, `snapshot_of`,
+  `ref`, `requires`, `volume.per` and `volume.by` other entities of the table (and `via` a field of
+  the entity).
 - **Key values.** At runtime, string and enum values used in keys may not contain the literal
   character that follows them in a key identifying an item (e.g. `#`): `"a#b" + "c"` and
   `"a" + "b#c"` would render the same key. Such writes and lookups fail with
@@ -595,8 +598,9 @@ Checked by `dynago` beyond the JSON Schema:
   `requires` key share their checks, and values are checked as `|lower` renders them too.
 - **Go names.** Everything becomes Go identifiers, which must not collide: two fields (or enum
   values, or entities) with the same Go name (`userId` and `userID`, `in-progress` and
-  `in_progress`), a field named `key` or `version` (methods of the entity) or `pk`, `sk`, `t`, `v`,
-  `rev` or `ttl` (the stored item's own attributes), an entity named like another's generated type
+  `in_progress`), a field named `key`, `version` or `timestamps` (methods of the entity) or `pk`,
+  `sk`, `t`, `v`, `rev`, `ttl`, `dynagoCreated` or `dynagoUpdated` (the stored item's own
+  attributes), an entity named like another's generated type
   (`OrderStore`), or a partition key field named `from` or `to` on a range query.
 - **Writes.** `when` can't name a primary key field (the key already selects the item). A
   `requires` can't target the write's own item, or check a counter that the write (or a change it
@@ -607,8 +611,9 @@ Checked by `dynago` beyond the JSON Schema:
 - **Consistency.** `consistent: true` and `freshness: immediate` are not allowed on a GSI query;
   `freshness` and `consistent` may not contradict each other.
 - **Relations and volumes.** `ref`, `volume.per` and `volume.by` must name entities whose key this
-  entity holds (fields linked by name, or through a `ref` field). A `per`-parent volume needs a
-  parent; volumes must not count per each other in a circle.
+  entity holds (fields linked by name, or through a `ref` field), with `via` naming the link when
+  there is more than one. A `per`-parent volume needs a parent; volumes must not count per each
+  other in a circle.
 - **Analysis.** Beyond validity, `dynago check` reports findings (limits, hot partitions, risky
   shapes); errors stop `dynago generate`. See [Analysis](guides/analysis.md).
 - **Versions and generations.** Changing an entity's storage shape (fields and their attributes

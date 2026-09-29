@@ -20,6 +20,7 @@ down, from what a reviewer needs to what an implementer needs:
 | Storage and partitions | The table, each index (why it's a GSI or a copy, and what the other kind would cost), a map of which items share partitions and which reads reach them, and each partition's size, growth and busiest key. |
 | Risks and costs | Open findings, accepted findings with their reasons, costs, and every assumption behind the numbers. |
 | Reference | Each entity in full: fields, every stored item with example keys, key conditions, errors. |
+| How to read this | A short primer on the DynamoDB terms the document uses. |
 
 Diagrams are Mermaid, which GitHub, GitLab and most editors render in Markdown: the relationships
 between entities, each lifecycle, and the partition map.
@@ -86,8 +87,9 @@ can make, as long as nothing reaches DynamoDB another way. `dynago vet` checks t
 dynago vet ./...
 ```
 
-It type-checks the packages and reports every call outside generated code that makes a DynamoDB
-request:
+It type-checks the packages and reports every call outside generated code that reaches DynamoDB,
+including calls that only build a request or hand out the client (such as guregu/dynamo's
+`DB.Table` and `DB.Client`):
 
 - methods of guregu/dynamo's `DB`, `Table`, queries, scans, puts, updates, deletes and batches;
 - methods of the AWS SDK's DynamoDB client (v1 and v2), and its paginators and waiters;

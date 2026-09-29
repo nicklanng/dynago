@@ -46,8 +46,8 @@ func TestMigrationAtVolume(t *testing.T) {
 	})
 	t.Logf("seeded %d tools in %s", libraries*toolsPer, time.Since(start).Round(time.Second))
 
-	// The new generation labels each tool with its serial number: a claim per tool.
-	toollibrary.MigrateTool = func(o toollibrary.ToolG1) (toollibrary.Tool, error) {
+	// A conversion of our own labels each tool with its serial number: a claim per tool.
+	toollibrary.MigrateTool = func(o toollibrary.ToolG2) (toollibrary.Tool, error) {
 		tool := toollibrary.AutoMigrateTool(o)
 		tool.Barcodes = []string{"LBL-" + o.SerialNumber}
 		return tool, nil

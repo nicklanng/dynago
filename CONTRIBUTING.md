@@ -7,10 +7,10 @@ send; pull requests are welcome too.
 
 | Path | What |
 |---|---|
-| `*.go` (root) | The runtime package `dynago`, imported by generated code: writes and transactions (`write.go`), derived items and counters (`derived.go`), reads and cursors (`read.go`), versions (`version.go`), tables (`table.go`). |
+| `*.go` (root) | The runtime package `dynago`, imported by generated code: errors and constants (`dynago.go`), writes and transactions (`write.go`), derived items and counters (`derived.go`), reads, scans and cursors (`read.go`), versions (`version.go`), row timestamps (`stamps.go`), tables (`table.go`), the migration job (`migrate.go`). |
 | `dynagotest/` | Test helpers: DynamoDB Local connection, a table per test, request counting. |
 | `cmd/dynago/` | The CLI. |
-| `internal/schema/` | YAML parsing (`raw.go`), resolution and validation into a model (`resolve.go`, `model.go`). |
+| `internal/schema/` | YAML parsing (`raw.go`), resolution and validation into a model (`resolve.go`, `model.go`), and the links between entities: parents, `ref`, volumes (`relations.go`). |
 | `internal/keytmpl/` | Key template parsing. |
 | `internal/lock/` | Storage shapes, the lock file, version rules. |
 | `internal/cost/` | Size, capacity and cost estimates, per call and per item touched. |
@@ -23,7 +23,7 @@ send; pull requests are welcome too.
 | `internal/gen/infra/` | Terraform and CreateTable JSON. |
 | `schema/dynago.schema.json` | JSON Schema for editors. |
 | `docs/` | Documentation. |
-| `internal/e2e/` | End-to-end tests: the examples' generated stores run against DynamoDB Local. |
+| `internal/e2e/` | End-to-end tests: the examples' generated stores, and test-only schemas (`fixture/`, `rekey/`), run against DynamoDB Local, or AWS with `make test-aws`. |
 | `examples/` | Example schemas and their committed generated output. No tests: the stores are generated. |
 
 ## Running the tests
@@ -50,7 +50,8 @@ DYNAGO_TEST_AWS=123456789012 make aws-sweep   # delete tables a run left behind 
 
 The tests refuse to run if the credentials belong to another account. Each test creates an
 on-demand table named `dynagotest-…`, tagged with its creation time, and deletes it when it ends;
-the sweeper deletes only tables with that prefix and tag. A run costs cents. Tests use the
+the sweeper deletes only tables with that prefix and tag, older than an hour (`ARGS=-age 0` for
+any age, once no run is going). A run costs cents. Tests use the
 internal `internal/testdb` package for this; `dynagotest`, for users' own tests, stays DynamoDB
 Local only. Tests that need DynamoDB read `DYNAGO_TEST_ENDPOINT` and skip without it, unless
 `DYNAGO_REQUIRE_DB` is set (as `make test` does), in which case they fail. CI
@@ -77,6 +78,9 @@ Keep three things in step (tests enforce it):
 2. the JSON Schema (`schema/dynago.schema.json`): `TestSchemaKeysAreDocumented` compares their keys
    and `TestExamplesMatchJSONSchema` validates the examples against it;
 3. the reference (`docs/schema.md`): every key must be mentioned.
+
+A new analysis rule goes in the registry in `internal/analysis/analysis.go` and in the rules table
+in `docs/guides/analysis.md`; `TestRulesAreDocumented` checks every rule id is there.
 
 If the change affects stored items, it also belongs in the storage shape (`internal/lock`), so
 changing it requires a version bump.

@@ -9,6 +9,14 @@
       "AttributeType": "S"
     },
     {
+      "AttributeName": "AllPK",
+      "AttributeType": "S"
+    },
+    {
+      "AttributeName": "AllSK",
+      "AttributeType": "S"
+    },
+    {
       "AttributeName": "ByNamePK",
       "AttributeType": "S"
     },
@@ -39,6 +47,30 @@
   ],
   "BillingMode": "PAY_PER_REQUEST",
   "GlobalSecondaryIndexes": [
+    {
+      "IndexName": "All",
+      "KeySchema": [
+        {
+          "AttributeName": "AllPK",
+          "KeyType": "HASH"
+        },
+        {
+          "AttributeName": "AllSK",
+          "KeyType": "RANGE"
+        }
+      ],
+      "Projection": {
+        "NonKeyAttributes": [
+          "_t",
+          "_v",
+          "libraryId",
+          "name",
+          "slug",
+          "openedAt"
+        ],
+        "ProjectionType": "INCLUDE"
+      }
+    },
     {
       "IndexName": "ByName",
       "KeySchema": [
@@ -149,5 +181,5 @@
       "KeyType": "RANGE"
     }
   ],
-  "TableName": "toollibrary-g2"
+  "TableName": "toollibrary-g3"
 }

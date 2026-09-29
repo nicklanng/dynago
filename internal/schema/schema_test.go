@@ -358,6 +358,50 @@ entities:
 	}
 }
 
+// A loan holds two members' keys (its borrower's by name, its steward's through a ref), so a
+// volume by Member must say which it counts by.
+func TestVolumeViaPicksALink(t *testing.T) {
+	src := `
+dynago: 1
+package: lib
+table: { name: lib }
+entities:
+  Member:
+    fields: { libraryId: string, memberId: string }
+    key: { pk: "LIB#{libraryId}", sk: "MEMBER#{memberId}" }
+    volume: 100
+  Loan:
+    fields: { libraryId: string, loanId: string, memberId: string, stewardId: { type: string, ref: Member } }
+    key: { pk: "LIB#{libraryId}", sk: "LOAN#{loanId}" }
+    volume: { per: Member, typical: 3%s, by: { Member: { typical: 10%s } } }
+`
+	for _, c := range []struct{ per, by, want, err string }{
+		{"", "", "", "more than one way (via: memberId, or via: stewardId); say which with via"},
+		{", via: memberId", ", via: stewardId", "stewardId", ""},
+		{", via: stewardId", ", via: memberId", "memberId", ""},
+		{", via: libraryId", "", "", "via: libraryId doesn't pick one way"},
+		{", via: nope", "", "", "Loan has no field nope"},
+	} {
+		m, err := Parse([]byte(strings.Replace(strings.Replace(src, "%s", c.per, 1), "%s", c.by, 1)))
+		if c.err != "" {
+			if err == nil || !strings.Contains(err.Error(), c.err) {
+				t.Errorf("per%q by%q: %v, want %q", c.per, c.by, err, c.err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		v := m.Entity("Loan").Volume
+		if got := v.By[0].Relation.Key[1].Source.Name; got != c.want {
+			t.Errorf("per%q by%q: by Member through %s, want %s", c.per, c.by, got, c.want)
+		}
+		if got := v.Per.Key[1].Source.Name; got == c.want {
+			t.Errorf("per%q by%q: per Member through %s too", c.per, c.by, got)
+		}
+	}
+}
+
 // Parents come from partition nesting, counts multiply down from totals, and ref links a field
 // to another entity's key.
 func TestRelationsAndVolumes(t *testing.T) {

@@ -105,7 +105,9 @@ type RawVolume struct {
 	// Total is the short form: the number of items in the table.
 	Total *float64 `yaml:"-"`
 	// Per names the parent the numbers are per; inferred from the partition key when absent.
-	Per     string   `yaml:"per"`
+	Per string `yaml:"per"`
+	// Via names the field linking to Per, when the item holds Per's key more than one way.
+	Via     string   `yaml:"via"`
 	Typical *float64 `yaml:"typical"`
 	Max     *float64 `yaml:"max"`
 	// By says how the items spread over other entities they refer to.
@@ -136,6 +138,8 @@ func (v *RawVolume) UnmarshalYAML(n *yaml.Node) error {
 type RawVolumeBy struct {
 	Typical *float64 `yaml:"typical"`
 	Max     *float64 `yaml:"max"`
+	// Via names the field linking to the entity, when the item holds its key more than one way.
+	Via string `yaml:"via"`
 }
 
 // UnmarshalYAML decodes a RawVolumeBy, rejecting unknown keys.

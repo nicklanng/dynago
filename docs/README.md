@@ -3,7 +3,7 @@
 **Start here**
 
 - [Getting started](getting-started.md): from an empty module to a tested store in ten minutes.
-- [The example](../examples/toollibrary): a fictional tool library using every feature, with its
+- [The example](../examples/toollibrary): a fictional tool library using most features, with its
   generated code and model document.
 
 **Reference**

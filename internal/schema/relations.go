@@ -14,7 +14,7 @@ import (
 func (r *resolver) relations(m *Model) {
 	for _, e := range m.Entities {
 		if p := parentOf(m, e); p != nil {
-			rel := r.relate(m, e, p, nil)
+			rel := r.relate(m, e, p)
 			rel.Kinds = appendKind(rel.Kinds, RelNests)
 			e.Parent = rel
 		}
@@ -47,10 +47,10 @@ func (r *resolver) relations(m *Model) {
 	}
 }
 
-// relate returns the relation from e to target, linking fields by name (and through e's ref
-// fields to target), creating it if needed; nil if e doesn't hold target's key.
-func (r *resolver) relate(m *Model, e, target *Entity, via *Field) *Relation {
-	key, missing := mapKey(e, target, via)
+// relate returns the relation from e to target through fields of the same names, creating it if
+// needed; nil if e doesn't hold target's key that way.
+func (r *resolver) relate(m *Model, e, target *Entity) *Relation {
+	key, missing := mapKey(e, target, nil)
 	if missing != "" {
 		return nil
 	}
@@ -88,19 +88,11 @@ func appendKind(ks []RelationKind, k RelationKind) []RelationKind {
 	return append(ks, k)
 }
 
-// mapKey maps each key field of target to the field of e holding its value. A ref field to target
-// (via, or else e's first) supplies one key field: the one no field of e matches by name, or else
-// target's last (a stewardId next to memberId refers to another Member). The rest match fields of
-// the same name and type. It returns the first key field it can't map, if any.
+// mapKey maps each key field of target to the field of e holding its value. Without via, fields
+// match by name and type. A ref field via supplies one key field: the one no field of e matches by
+// name, or else target's last (a stewardId next to memberId refers to another Member); the rest
+// match by name. It returns the first key field it can't map, if any.
 func mapKey(e, target *Entity, via *Field) ([]RequireKey, string) {
-	if via == nil {
-		for _, f := range e.Fields {
-			if f.Ref == target {
-				via = f
-				break
-			}
-		}
-	}
 	tks := target.KeyFields()
 	var byRef *Field // the key field via supplies
 	if via != nil {
@@ -144,11 +136,100 @@ func mapKey(e, target *Entity, via *Field) ([]RequireKey, string) {
 	return key, ""
 }
 
+// keyChoices returns each way e holds target's key: through fields of the same names, and through
+// each ref field to target. A by-name match that is e's own key (Post.id against User.id) is a
+// coincidence when e has a ref to target, and isn't offered.
+func keyChoices(e, target *Entity) [][]RequireKey {
+	var out [][]RequireKey
+	add := func(key []RequireKey) {
+		for _, k := range out {
+			if sameKey(k, key) {
+				return
+			}
+		}
+		out = append(out, key)
+	}
+	var refs []*Field
+	for _, f := range e.Fields {
+		if f.Ref == target {
+			refs = append(refs, f)
+		}
+	}
+	if key, missing := mapKey(e, target, nil); missing == "" {
+		if rel := (&Relation{From: e, To: target, Key: key}); len(refs) == 0 || !rel.OneToOne() || e == target {
+			add(key)
+		}
+	}
+	for _, f := range refs {
+		if key, missing := mapKey(e, target, f); missing == "" {
+			add(key)
+		}
+	}
+	return out
+}
+
+// keyVia picks how e holds target's key: the only way, or the one through the field via. It
+// returns a message saying why it can't pick, if it can't.
+func keyVia(e, target *Entity, via string) ([]RequireKey, string) {
+	choices := keyChoices(e, target)
+	if via != "" {
+		if e.Field(via) == nil {
+			return nil, fmt.Sprintf("via: %s has no field %s", e.Name, via)
+		}
+		var picked [][]RequireKey
+		for _, key := range choices {
+			if slices.Contains(distinct(key, choices), via) {
+				picked = append(picked, key)
+			}
+		}
+		if len(picked) != 1 {
+			return nil, fmt.Sprintf("via: %s doesn't pick one way %s holds %s's key (%s)", via, e.Name, target.Name, ways(choices))
+		}
+		return picked[0], ""
+	}
+	switch len(choices) {
+	case 0:
+		_, missing := mapKey(e, target, nil)
+		return nil, fmt.Sprintf("%s doesn't hold %s's key field %s (fields link by name, or through a ref field)", e.Name, target.Name, missing)
+	case 1:
+		return choices[0], ""
+	}
+	return nil, fmt.Sprintf("%s holds %s's key more than one way (%s); say which with via", e.Name, target.Name, ways(choices))
+}
+
+// distinct returns the names of key's source fields that not every choice uses.
+func distinct(key []RequireKey, choices [][]RequireKey) []string {
+	var out []string
+	for _, k := range key {
+		for _, other := range choices {
+			if !slices.ContainsFunc(other, func(o RequireKey) bool { return o.Source == k.Source }) {
+				out = append(out, k.Source.Name)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// ways describes the choices by the fields that tell them apart: "via: memberId, or via: stewardId".
+func ways(choices [][]RequireKey) string {
+	var out []string
+	for _, key := range choices {
+		if d := distinct(key, choices); len(d) > 0 {
+			out = append(out, "via: "+strings.Join(d, "+"))
+		}
+	}
+	if len(out) == 0 {
+		return "no field tells them apart"
+	}
+	return strings.Join(out, ", or ")
+}
+
 // HoldsKey returns e's fields holding target's key, linked as relations are (by name, or through a
-// ref field), or false if e doesn't hold it.
+// ref field), or false if e doesn't hold it, or holds it more than one way.
 func HoldsKey(e, target *Entity) ([]*Field, bool) {
-	key, missing := mapKey(e, target, nil)
-	if missing != "" {
+	key, why := keyVia(e, target, "")
+	if why != "" {
 		return nil, false
 	}
 	out := make([]*Field, len(key))
@@ -289,14 +370,17 @@ func (r *resolver) volumes(m *Model) {
 				r.errorf("%s: per: %s is not an entity of this table", where, raw.Per)
 				continue
 			}
-			key, missing := mapKey(e, p, nil)
-			if missing != "" {
-				r.errorf("%s: per %s: %s doesn't hold %s's key field %s (fields link by name, or through a ref field)", where, p.Name, e.Name, p.Name, missing)
+			key, why := keyVia(e, p, raw.Via)
+			if why != "" {
+				r.errorf("%s: per %s: %s", where, p.Name, why)
 				continue
 			}
 			v.Per = r.link(m, e, p, key)
 			v.Per.Kinds = appendKind(v.Per.Kinds, RelVolume)
 			e.Parent = v.Per
+		case raw.Via != "":
+			r.errorf("%s: via picks how %s holds the key of the entity named by per; name it", where, e.Name)
+			continue
 		case e.Parent == nil:
 			r.errorf("%s: %s's partition doesn't nest in another entity's, so typical and max have nothing to count per. Name the parent (per: <Entity>), or give a total (volume: N)", where, e.Name)
 			continue
@@ -318,9 +402,9 @@ func (r *resolver) volumes(m *Model) {
 				r.errorf("%s: %s is not an entity of this table", bw, b.Key)
 				continue
 			}
-			key, missing := mapKey(e, to, nil)
-			if missing != "" {
-				r.errorf("%s: %s doesn't hold %s's key field %s", bw, e.Name, to.Name, missing)
+			key, why := keyVia(e, to, b.Value.Via)
+			if why != "" {
+				r.errorf("%s: %s", bw, why)
 				continue
 			}
 			if b.Value.Typical == nil {

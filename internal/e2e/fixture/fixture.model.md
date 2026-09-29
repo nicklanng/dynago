@@ -11,7 +11,7 @@ Table generation **1**: `fixture-g1`.
 | | |
 |---|---|
 | Entities | 1: Account |
-| Reads | 4: 1 by key, 2 counters, 1 scans |
+| Reads | 4: 1 by key, 2 counters, 1 scan |
 | Writes | 3: 3 in a transaction, 2 reading the item first |
 | Indexes | 0 GSIs, 0 copy indexes |
 | Uniqueness claims, counters | 0, 2 |

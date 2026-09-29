@@ -42,7 +42,9 @@ model document and code always match the schema.
 Validates each schema and prints its analysis: item sizes and counts, capacity units per call,
 monthly cost at the declared rates, storage, every partition family (items per key, size, growth,
 busiest key at peak, risk), open findings and accepted ones with their reasons. See
-[Analysis](guides/analysis.md) and [Costs](guides/costs.md). Nothing is written.
+[Analysis](guides/analysis.md) and [Costs](guides/costs.md). Like `generate`, it also checks the
+schema against its lock file (a missing `version` bump or `generation` fails it) and prints a
+`change:` line for each compatible change the lock file hasn't recorded yet. Nothing is written.
 
 With `-json`, it prints the analysed design as JSON instead: entities, reads, writes, guarantees,
 partitions, findings and costs, for tools of your own.
@@ -75,7 +77,7 @@ found. See [Reviewing designs and changes](guides/review.md#only-declared-access
 | Flag | Default | Meaning |
 |---|---|---|
 | `-check` | off | `generate` only: fail instead of writing when outputs are stale. |
-| `-policy` | the nearest `dynago.policy.yaml` in the schema's directory or above | The policy file: which findings fail, rule severities, limits, required declarations. See [Analysis](guides/analysis.md#policy). |
+| `-policy` | the nearest `dynago.policy.yaml` in the schema's directory or above, up to the repository root | The policy file: which findings fail, rule severities, limits, required declarations. See [Analysis](guides/analysis.md#policy). |
 | `-json` | off | `check` only: print the analysed design as JSON. |
 | `-base` | `HEAD` | `diff` only: the git ref to compare with. |
 | `-from` | | `diff` only: a schema file to compare with, instead of a git ref. |

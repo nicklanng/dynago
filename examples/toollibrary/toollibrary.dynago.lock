@@ -1,7 +1,7 @@
 {
   "dynago": 1,
   "format": 2,
-  "generation": 2,
+  "generation": 3,
   "tables": [
     {
       "generation": 1,
@@ -78,6 +78,90 @@
       "spec": {
         "ttl_attribute": "ttl",
         "gsis": [
+          {
+            "name": "ByName",
+            "pk": "ByNamePK",
+            "sk": "ByNameSK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "memberId",
+              "name",
+              "role",
+              "status"
+            ]
+          },
+          {
+            "name": "ByCategory",
+            "pk": "ByCategoryPK",
+            "sk": "ByCategorySK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "toolId",
+              "name",
+              "category",
+              "status",
+              "tags"
+            ]
+          },
+          {
+            "name": "Overdue",
+            "pk": "OverduePK",
+            "sk": "OverdueSK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "toolId",
+              "loanId",
+              "memberId",
+              "toolName",
+              "dueAt"
+            ]
+          },
+          {
+            "name": "ByCode",
+            "pk": "ByCodePK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "toolId",
+              "memberId",
+              "codeHash",
+              "expiresAt",
+              "ttl"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "generation": 3,
+      "spec": {
+        "ttl_attribute": "ttl",
+        "gsis": [
+          {
+            "name": "All",
+            "pk": "AllPK",
+            "sk": "AllSK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "libraryId",
+              "name",
+              "slug",
+              "openedAt"
+            ]
+          },
           {
             "name": "ByName",
             "pk": "ByNamePK",
@@ -249,6 +333,62 @@
               }
             ]
           }
+        },
+        {
+          "version": 2,
+          "generation": 3,
+          "fingerprint": "4165b71437742a73",
+          "shape": {
+            "fields": [
+              {
+                "name": "libraryId",
+                "attr": "libraryId",
+                "type": "string"
+              },
+              {
+                "name": "name",
+                "attr": "name",
+                "type": "string",
+                "required": true
+              },
+              {
+                "name": "slug",
+                "attr": "slug",
+                "type": "string"
+              },
+              {
+                "name": "openedAt",
+                "attr": "openedAt",
+                "type": "time"
+              }
+            ],
+            "pk": "LIB#{libraryId}",
+            "sk": "LIBRARY",
+            "indexes": [
+              {
+                "name": "All",
+                "strategy": "gsi",
+                "pk": "LIBRARIES",
+                "sk": "{name|lower}#{libraryId}",
+                "projection": "include",
+                "project": [
+                  "slug",
+                  "openedAt"
+                ]
+              }
+            ],
+            "uniques": [
+              {
+                "name": "Slug",
+                "fields": [
+                  "slug"
+                ],
+                "pk": "UNIQUE#Library.Slug#{slug}",
+                "sk": "UNIQUE"
+              }
+            ]
+          },
+          "startsGeneration": true
         }
       ]
     },
@@ -311,6 +451,136 @@
                 "name": "returnedAt",
                 "attr": "returnedAt",
                 "type": "time"
+              },
+              {
+                "name": "notes",
+                "attr": "notes",
+                "type": "string"
+              }
+            ],
+            "pk": "LIB#{libraryId}#TOOL#{toolId}",
+            "sk": "LOAN#{loanId}",
+            "indexes": [
+              {
+                "name": "ByMember",
+                "strategy": "copy",
+                "pk": "LIB#{libraryId}#MEMBER#{memberId}",
+                "sk": "MYLOAN#{dueAt}#{toolId}#{loanId}",
+                "projection": "include",
+                "project": [
+                  "toolName",
+                  "dueAt"
+                ],
+                "where": [
+                  "status=active"
+                ]
+              },
+              {
+                "name": "Overdue",
+                "strategy": "gsi",
+                "pk": "LIB#{libraryId}#DUE",
+                "sk": "{dueAt}#{loanId}",
+                "projection": "include",
+                "project": [
+                  "memberId",
+                  "toolName"
+                ],
+                "where": [
+                  "status=active"
+                ]
+              }
+            ],
+            "counters": [
+              {
+                "name": "MemberLoans",
+                "pk": "LIB#{libraryId}#MEMBER#{memberId}",
+                "sk": "LOANS",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "active",
+                    "where": [
+                      "status=active"
+                    ]
+                  }
+                ]
+              },
+              {
+                "name": "LoanTotals",
+                "pk": "LIB#{libraryId}#LOANTOTALS",
+                "sk": "TOTALS",
+                "shards": 4,
+                "values": [
+                  {
+                    "name": "started"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "version": 2,
+          "generation": 2,
+          "fingerprint": "42c7e6013a522b2e",
+          "shape": {
+            "fields": [
+              {
+                "name": "libraryId",
+                "attr": "libraryId",
+                "type": "string"
+              },
+              {
+                "name": "toolId",
+                "attr": "toolId",
+                "type": "string"
+              },
+              {
+                "name": "loanId",
+                "attr": "loanId",
+                "type": "string"
+              },
+              {
+                "name": "memberId",
+                "attr": "memberId",
+                "type": "string",
+                "required": true
+              },
+              {
+                "name": "toolName",
+                "attr": "toolName",
+                "type": "string"
+              },
+              {
+                "name": "status",
+                "attr": "status",
+                "type": "enum",
+                "values": [
+                  "active",
+                  "returned"
+                ]
+              },
+              {
+                "name": "borrowedAt",
+                "attr": "borrowedAt",
+                "type": "time",
+                "required": true
+              },
+              {
+                "name": "dueAt",
+                "attr": "dueAt",
+                "type": "time",
+                "required": true
+              },
+              {
+                "name": "returnedAt",
+                "attr": "returnedAt",
+                "type": "time"
+              },
+              {
+                "name": "checkedInBy",
+                "attr": "checkedInBy",
+                "type": "string"
               },
               {
                 "name": "notes",

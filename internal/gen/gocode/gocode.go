@@ -3,6 +3,8 @@ package gocode
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"go/format"
 	"go/token"
@@ -655,7 +657,8 @@ func (g *gen) scan(a *schema.Access) {
 		e.Name, consistency(a.Consistent), a.Page, a.MaxPage, e.Name, a.Reason))
 	g.p("func (s *%sStore) %s(ctx context.Context, page dynago.Page) ([]%s, string, error) {", e.GoName, a.GoName, e.GoName)
 	spec := []string{
-		fmt.Sprintf("Scope: %q", fmt.Sprintf("%s.%s@v%d", e.Name, a.Name, e.Version)),
+		// A scan's cursor is a table key, valid whatever the schema version.
+		fmt.Sprintf("Scope: %q", e.Name+"."+a.Name),
 		fmt.Sprintf("Type: %q", e.Name),
 		fmt.Sprintf("PageSize: %d", a.Page),
 		fmt.Sprintf("MaxPage: %d", a.MaxPage),
@@ -750,6 +753,21 @@ func (g *gen) getUnique(a *schema.Access) {
 	g.p("")
 }
 
+// queryShape identifies what a query's cursors hold and where they may resume: the item family it
+// reads (the entity's key, or the index's keys and strategy), its key templates, prefix and order.
+// A change to any of them changes the shape, so older cursors are refused rather than misread.
+func queryShape(a *schema.Access) string {
+	e := a.Entity
+	pk := a.QueryPK()
+	sk, _ := a.QuerySK()
+	parts := []string{e.PK.Raw, e.SK.Raw, pk.Raw, sk.Raw, strconv.FormatBool(a.Desc)}
+	if a.Index != nil {
+		parts = append(parts, string(a.Index.Strategy), a.Index.Name, a.Index.PKAttr, a.Index.SKAttr)
+	}
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return hex.EncodeToString(sum[:4])
+}
+
 func (g *gen) query(a *schema.Access) {
 	e := a.Entity
 	qt := e.GoName + a.GoName + "Query"
@@ -798,8 +816,9 @@ func (g *gen) query(a *schema.Access) {
 	g.keyPartChecks(pk.Fields, func(f *schema.Field) string { return "q." + f.GoName }, "return nil, \"\", err")
 	g.p("pk := %s", tmplExpr(e, pk, "q"))
 	spec := []string{
-		// The scope ties a cursor to this query, its partition and the schema version.
-		fmt.Sprintf("Scope: %q + pk", fmt.Sprintf("%s.%s@v%d\x00", e.Name, a.Name, e.Version)),
+		// The scope ties a cursor to this query's shape and its partition, not to the schema
+		// version: a version that doesn't change the query keeps cursors working through a deploy.
+		fmt.Sprintf("Scope: %q + pk", fmt.Sprintf("%s.%s#%s\x00", e.Name, a.Name, queryShape(a))),
 		"PK: pk",
 		fmt.Sprintf("PageSize: %d", a.Page),
 		fmt.Sprintf("MaxPage: %d", a.MaxPage),

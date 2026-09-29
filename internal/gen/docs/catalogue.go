@@ -105,7 +105,7 @@ func freshnessText(a *schema.Access) string {
 		return "immediate"
 	case schema.FreshnessEventual:
 		if strong {
-			return "eventual required; reads are strong"
+			return "eventual; read strongly anyway"
 		}
 		return "eventual"
 	}

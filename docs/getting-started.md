@@ -197,5 +197,5 @@ data.
 - [Counters](guides/counters.md): limits, lower bounds, sharding.
 - [Concurrency](guides/concurrency.md): preventing lost updates with `dynago.From` and `dynago.IfVersion`.
 - [Generated code](generated-code.md): every generated name, method and error.
-- [The example](../examples/toollibrary): a fictional tool library that uses every feature, with its
+- [The example](../examples/toollibrary): a fictional tool library that uses most features, with its
   generated output and tests.

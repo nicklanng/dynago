@@ -69,7 +69,7 @@ func TestLostLeaseStopsTheJob(t *testing.T) {
 	go func() { done <- m.Run(ctx, "copy") }()
 	time.Sleep(time.Second)
 	newTable := g.db.Table(toollibrary.TableName(g.base))
-	statePK := "_DYNAGO#MIGRATION#" + g.base + "-g1"
+	statePK := "_DYNAGO#MIGRATION#" + g.base + "-g2"
 	must(t, newTable.Update("PK", statePK).Range("SK", "STATE").Set("leaseOwner", "another job").Run(ctx))
 	must(t, newTable.Update("PK", statePK).Range("SK", "FENCE#000").Set("owner", "another job").Run(ctx))
 	stolenAt := count(t, newTable)
@@ -80,7 +80,7 @@ func TestLostLeaseStopsTheJob(t *testing.T) {
 	if n := count(t, newTable); n != stolenAt {
 		t.Fatalf("%d items written after the lease was lost", n-stolenAt)
 	}
-	if st := testdb.RawItem(t, newTable, "_DYNAGO#MIGRATION#"+g.base+"-g1", "STATE"); st["leaseOwner"] != "another job" {
+	if st := testdb.RawItem(t, newTable, "_DYNAGO#MIGRATION#"+g.base+"-g2", "STATE"); st["leaseOwner"] != "another job" {
 		t.Fatalf("the stale job changed the lease: %v", st)
 	}
 }
@@ -236,7 +236,7 @@ func TestCatchUpReadsCopiesInBatches(t *testing.T) {
 		id := fmt.Sprintf("t%02d", i)
 		must(t, g.old.Tools.Add(ctx, &toollibrary.Tool{LibraryID: "lib1", ToolID: id, Name: "Tool " + id, Category: toollibrary.ToolCategoryHand}))
 	}
-	toollibrary.MigrateTool = func(o toollibrary.ToolG1) (toollibrary.Tool, error) { return toollibrary.AutoMigrateTool(o), nil }
+	toollibrary.MigrateTool = func(o toollibrary.ToolG2) (toollibrary.Tool, error) { return toollibrary.AutoMigrateTool(o), nil }
 	defer func() { toollibrary.MigrateTool = nil }()
 	must(t, g.run("copy"))
 

@@ -4,7 +4,7 @@
 
 Libraries, their members and tools, loans and pickup holds.
 
-Table generation **2**: `toollibrary-g2`. It is filled from generation 1 (`toollibrary-g1`) by the migration job (`RunMigration`); `toollibrary-g1` stays for rollback. See the [migrations guide](https://github.com/nicklanng/dynago/blob/main/docs/guides/migrations.md).
+Table generation **3**: `toollibrary-g3`. It is filled from generation 2 (`toollibrary-g2`) by the migration job (`RunMigration`); `toollibrary-g2` stays for rollback. See the [migrations guide](https://github.com/nicklanng/dynago/blob/main/docs/guides/migrations.md).
 
 **Contents:** [Summary](#summary) · [Domain](#domain) · [Reads](#reads) · [Writes](#writes) · [Storage and partitions](#storage-and-partitions) · [Risks and costs](#risks-and-costs) · [Reference](#reference) · [How to read this](#how-to-read-this)
 
@@ -13,20 +13,16 @@ Table generation **2**: `toollibrary-g2`. It is filled from generation 1 (`tooll
 | | |
 |---|---|
 | Entities | 5: Library, Member, Tool, Loan, Hold |
-| Reads | 18: 5 by key, 3 by unique value, 6 queries, 4 counters |
-| Writes | 21: 15 in a transaction, 11 reading the item first |
-| Indexes | 4 GSIs, 1 copy index (ByName, ByCategory, Overdue, ByCode, Loan.ByMember) |
+| Reads | 20: 5 by key, 3 by unique value, 7 queries, 4 counters, 1 scan |
+| Writes | 21: 15 in a transaction, 12 reading the item first |
+| Indexes | 5 GSIs, 1 copy index (All, ByName, ByCategory, Overdue, ByCode, Loan.ByMember) |
 | Uniqueness claims, counters | 4, 4 |
 | Workload | Volumes expected at 3 years; peak traffic 5× the average; volumes declared for 5 of 5 entities |
 | Largest partition | `LIB#{libraryId}#DUE` (GSI Overdue): 420 KB typical, 34 MB at most |
 | Busiest partition at peak | `LIB#{libraryId}` (base table): 0.27% of a partition's capacity, risk **low** |
-| Storage | 4.0 GB at the declared volumes |
-| Cost | $172.25/month at the declared volumes and rates |
-| Findings | 0 errors, 1 warning, 0 notes open; 3 accepted |
-
-Open findings (details under [Risks and costs](#risks-and-costs)):
-
-- ⚠️ warning **large-field**, entity Tool: manual (p99 19.5 KB) makes every write cost up to 21 WRU (42 in a transaction), including writes that never change it.
+| Storage | 4.1 GB at the declared volumes |
+| Cost | $173.93/month at the declared volumes and rates |
+| Findings | 0 errors, 0 warnings, 2 notes open; 4 accepted |
 
 ## Domain
 
@@ -48,6 +44,7 @@ erDiagram
   Library ||--o{ Tool : "contains"
   Tool ||--o{ Loan : "contains"
   Tool ||--o| Hold : "contains"
+  Member ||--o{ Loan : "referenced by"
   Member ||--o{ Loan : "Borrow requires"
   Hold ||--o{ Loan : "Borrow requires"
   Member ||--o{ Hold : "Place requires"
@@ -59,6 +56,7 @@ erDiagram
 | Tool | Library | Lives in (or under) its Library's partition, and holds its Library's key in `libraryId`; 60 per Library typically, at most 5,000. |
 | Loan | Tool | Lives in (or under) its Tool's partition, and holds its Tool's key in `libraryId`, `toolId`; Borrow, Return require it; 20 per Tool typically, at most 500. |
 | Hold | Tool | Lives in (or under) its Tool's partition, and holds its Tool's key in `libraryId`, `toolId`; Place requires it; 0.02 per Tool typically, at most 1. |
+| Loan | Member | Holds its Member's key in `libraryId`, `checkedInBy` (Member's `memberId`); `checkedInBy` is declared `ref: Member`. |
 | Loan | Member | Holds its Member's key in `libraryId`, `memberId`; Borrow requires it; 60 per Member typically, at most 400. |
 | Loan | Hold | Holds its Hold's key in `libraryId`, `toolId`; Borrow requires it. |
 | Hold | Member | Holds its Member's key in `libraryId`, `memberId`; Place requires it. |
@@ -69,6 +67,7 @@ What the generated code enforces on every write, so no bug or race elsewhere can
 
 - **Library**
   - No two Libraries have the same slug. *(claim Slug)*
+  - Every Library has name. *(required fields)*
 - **Member**
   - No two Members have the same libraryId and email (ignoring case). *(claim Email)*
   - The number of Members with role = "steward" and status = "active" per libraryId never goes below 1. *(counter MemberCounts)*
@@ -151,24 +150,28 @@ Every read the code can make. A read that isn't listed has no method, so a new w
 
 | Read | Answers | Served by | Freshness | Returns | RRU per call p50/p99 | Rate |
 |---|---|---|---|---|---|---|
-| `Library.Get` | One Library, by libraryId. | GetItem | eventual (not stated) | one | 0.5 | 5/s |
-| `Library.GetBySlug` | The Library holding a slug. | claim Slug, then the item (2 GetItems) | strong (not stated) | one | 2 | 20/s |
-| `Library.MemberStats` | The member counts, read from the library's page. | counter MemberCounts (GetItem) | eventual (not stated) | the counts | 0.5 | 2/s |
-| `Library.ToolStats` | The ToolCounts counts for a libraryId. | counter ToolCounts (GetItem) | eventual (not stated) | the counts | 0.5 | 2/s |
-| `Member.Get` | One Member, by libraryId and memberId. | GetItem | eventual (not stated) | one | 0.5 | 10/s |
-| `Member.GetByEmail` | The Member holding a libraryId and email. | claim Email, then the item (2 GetItems) | strong (not stated) | one | 2 | 1/s |
+| `Library.Get` | One Library, by libraryId. | GetItem | eventual | one | 0.5 | 5/s |
+| `Library.GetBySlug` | The Library holding a slug. | claim Slug, then the item (2 GetItems) | eventual; read strongly anyway | one | 2 | 20/s |
+| `Library.MemberStats` | The member counts, read from the library's page. | counter MemberCounts (GetItem) | eventual | the counts | 0.5 | 2/s |
+| `Library.ToolStats` | The ToolCounts counts for a libraryId. | counter ToolCounts (GetItem) | eventual | the counts | 0.5 | 2/s |
+| `Library.List` | Every library, a page at a time, for the operators. | Query of GSI All | eventual | 2,000 items typically: 40 pages of 50 | 1.5 / 3.5 | 0.1/s |
+| `Member.Get` | A member's profile, which they see straight after editing it. | GetItem | immediate | one | 1 | 10/s |
+| `Member.GetByEmail` | Sign-in, which may come the moment after joining. | claim Email, then the item (2 GetItems) | immediate | one | 2 | 1/s |
 | `Member.Directory` | Members with a given libraryId, by name (ascending). | Query of GSI ByName | eventual | 20 items typically, 2,000 at most: 1–40 pages of 50 | 2 / 4 | 2/s |
-| `Tool.Get` | One Tool, by libraryId and toolId. | GetItem | eventual (not stated) | one | 0.5 / 3 | 20/s |
+| `Tool.Get` | One Tool, by libraryId and toolId. | GetItem | eventual | one | 0.5 / 3 | 20/s |
 | `Tool.Catalogue` | Tools with a given libraryId and category, by name (ascending). | Query of GSI ByCategory | eventual | 12 items typically, 5,000 at most: 1–200 pages of 25 | 1 / 2.5 | 10/s |
-| `Tool.GetByBarcode` | The Tool holding an element of barcodes. | claim Barcode, then the item (2 GetItems) | strong (not stated) | one | 2 / 7 | 2/s |
-| `Loan.Get` | One Loan, by libraryId, toolId and loanId. | GetItem | eventual (not stated) | one | 0.5 | — |
-| `Loan.History` | A tool's loans, newest first, without the notes. | Query of the Loan's partition | eventual (not stated) | 20 items typically, 500 at most: 1–25 pages of 20 | 1.5 / 5 | 1/s |
+| `Tool.GetByBarcode` | The desk scanning a label, perhaps one just attached. | claim Barcode, then the item (2 GetItems) | immediate | one | 2 / 7 | 2/s |
+| `Loan.Get` | A loan as the steward checks it in, straight after any change. | GetItem | immediate | one | 1 | — |
+| `Loan.History` | A tool's loans, newest first, without the notes. | Query of the Loan's partition | eventual | 20 items typically, 500 at most: 1–25 pages of 20 | 1.5 / 5.5 | 1/s |
 | `Loan.MyLoans` | A member's current loans, soonest due first. | Query of copy ByMember | immediate | 60 items typically, 400 at most (fewer: only those matching the index's where): 2–8 pages of 50 | 5 / 10 | 5/s |
 | `Loan.Overdue` | Loans with a given libraryId, by dueAt (ascending). | Query of GSI Overdue | eventual | 1,200 items typically, 100,000 at most (fewer: only those matching the index's where): 24–2,000 pages of 50 | 2.5 / 5 | 0.01/s |
-| `Loan.ActiveLoans` | The MemberLoans counts for a libraryId and memberId. | counter MemberLoans (GetItem) | eventual (not stated) | the counts | 0.5 | — |
-| `Loan.Totals` | The LoanTotals counts for a libraryId. | counter LoanTotals (4 shards, one BatchGetItem) | eventual (not stated) | the counts | 2 | — |
-| `Hold.Get` | One Hold, by libraryId and toolId. | GetItem | eventual (not stated) | one | 0.5 | — |
+| `Loan.ActiveLoans` | Shown beside the member's loans. | counter MemberLoans (GetItem) | eventual | the counts | 0.5 | — |
+| `Loan.Totals` | The LoanTotals counts for a libraryId. | counter LoanTotals (4 shards, one BatchGetItem) | eventual | the counts | 2 | — |
+| `Loan.Export` | Every Loan in the table. | Scan of the whole table, one page per call | eventual | 2,400,000 items typically, over 104,928 pages of 50 of the whole table | 3.5 / 13 | — |
+| `Hold.Get` | The member's hold, straight after placing it. | GetItem | immediate | one | 1 | — |
 | `Hold.FindByCode` | Holds with a given codeHash. | Query of GSI ByCode | eventual | pages of 1, a page at a time (volume not declared) | 0.5 | 1/s |
+
+- **`Loan.Export` scans the whole table.** Reason: The yearly lending report reads every loan once, overnight. No request path reads it.
 
 ## Writes
 
@@ -176,9 +179,9 @@ Every write the code can make, and everything each changes. Each is atomic: all 
 
 | Write | Does | Checks | Changes | Reads first | Atomic | WRU per call p50/p99 | Rate |
 |---|---|---|---|---|---|---|---|
-| `Library.Open` | Creates a Library | no Library at the key; slug unique (claim Slug) | Library<br>claim Slug | no | transaction, 2 items | 4 | — |
-| `Library.Rename` | Sets `name` if given | the Library exists; the caller's version is current | Library | no | single item | 1 | — |
-| `Library.ChangeSlug` | Sets `slug` | the Library exists; slug unique (claim Slug); the caller's version is current | Library<br>claim Slug (moved: put + delete) | yes | transaction, 3 items | 6 | — |
+| `Library.Open` | Creates a Library | no Library at the key; slug unique (claim Slug); required fields are set | Library<br>GSI All entry<br>claim Slug | no | transaction, 2 items | 5 | — |
+| `Library.Rename` | Sets `name` if given | the Library exists; required fields are set; the caller's version is current | Library<br>GSI All entry (moved: delete + put) | yes | single item | 3 | — |
+| `Library.ChangeSlug` | Sets `slug` | the Library exists; slug unique (claim Slug); the caller's version is current | Library<br>GSI All entry<br>claim Slug (moved: put + delete) | yes | transaction, 3 items | 7 | — |
 | `Member.Join` | Creates a Member | no Member at the key; libraryId and email unique (claim Email) | Member<br>GSI ByName entry<br>counter MemberCounts<br>claim Email | no | transaction, 3 items | 7 | — |
 | `Member.UpdateProfile` | Sets `name` if given, sets `phone` if given | the Member exists | Member<br>GSI ByName entry (moved: delete + put) | yes | single item | 3 | — |
 | `Member.SetLoanCap` | Sets `maxLoans` | the Member exists | Member | no | single item | 1 | — |
@@ -191,10 +194,10 @@ Every write the code can make, and everything each changes. Each is atomic: all 
 | `Tool.EditDetails` | Sets `name` if given, sets `manual` if given, sets `tags` if given | the Tool exists; the caller's version is current | Tool<br>GSI ByCategory entry (moved: delete + put) | yes | single item | 5 / 23 | — |
 | `Tool.Relabel` | Sets `barcodes` | the Tool exists; libraryId and barcodes unique (claim Barcode) | Tool<br>claims Barcode (added and dropped barcodes elements) | yes | transaction, 7 items | 10 / 54 | — |
 | `Tool.Retire` | Sets `status` = "retired", deletes the Hold if there is one | the Tool exists; status = "available" | Tool<br>GSI ByCategory entry<br>counter ToolCounts<br>Hold (deletes the Hold if there is one)<br>Hold's GSI ByCode entry | no (read-free) | transaction, 3 items | 12 / 48 | — |
-| `Loan.Borrow` | Creates a Loan, sets `status` = "active", sets the Tool's status to "onLoan", deletes the Hold if there is one | no Loan at the key; the Member exists with status = "active"; the Tool exists with status = "available"; any Hold has memberId = Loan.memberId (none is fine); MemberLoans.active stays within the caller's limit; required fields are set | Loan<br>copy ByMember<br>GSI Overdue entry<br>counter MemberLoans<br>counter LoanTotals<br>check Member<br>Tool (sets its status to "onLoan")<br>Tool's GSI ByCategory entry<br>Tool's counter ToolCounts<br>Hold (deletes the Hold if there is one)<br>Hold's GSI ByCode entry | no | transaction, 8 items | 23 / 61 | 2/s |
-| `Loan.Return` | Sets `returnedAt`, sets `status` = "returned", sets the Tool's status to "available" | the Loan exists; status = "active"; the Tool exists with status = "onLoan" | Loan<br>copy ByMember (moved: put + delete)<br>GSI Overdue entry (moved: delete + put)<br>counter MemberLoans<br>Tool (sets its status to "available")<br>Tool's GSI ByCategory entry<br>Tool's counter ToolCounts | yes | transaction, 6 items | 19 / 57 | 2/s |
-| `Loan.Extend` | Sets `dueAt` | the Loan exists; status = "active"; required fields are set | Loan<br>copy ByMember (moved: put + delete)<br>GSI Overdue entry (moved: delete + put) | yes | transaction, 3 items | 8 / 10 | — |
-| `Loan.AddNote` | Sets `notes` if given | the Loan exists | Loan | no | single item | 1 / 2 | — |
+| `Loan.Borrow` | Creates a Loan, sets `status` = "active", sets the Tool's status to "onLoan", deletes the Hold if there is one | no Loan at the key; the Member exists with status = "active"; the Tool exists with status = "available"; any Hold has memberId = Loan.memberId (none is fine); MemberLoans.active stays within the caller's limit; required fields are set | Loan<br>copy ByMember<br>GSI Overdue entry<br>counter MemberLoans<br>counter LoanTotals<br>check Member<br>Tool (sets its status to "onLoan")<br>Tool's GSI ByCategory entry<br>Tool's counter ToolCounts<br>Hold (deletes the Hold if there is one)<br>Hold's GSI ByCode entry | no | transaction, 8 items | 23 / 63 | 2/s |
+| `Loan.Return` | Sets `returnedAt`, sets `checkedInBy`, sets `status` = "returned", sets the Tool's status to "available" | the Loan exists; status = "active"; the Tool exists with status = "onLoan" | Loan<br>copy ByMember (moved: put + delete)<br>GSI Overdue entry (moved: delete + put)<br>counter MemberLoans<br>Tool (sets its status to "available")<br>Tool's GSI ByCategory entry<br>Tool's counter ToolCounts | yes | transaction, 6 items | 19 / 59 | 2/s |
+| `Loan.Extend` | Sets `dueAt` | the Loan exists; status = "active"; required fields are set | Loan<br>copy ByMember (moved: put + delete)<br>GSI Overdue entry (moved: delete + put) | yes | transaction, 3 items | 8 / 12 | — |
+| `Loan.AddNote` | Sets `notes` if given | the Loan exists | Loan | no | single item | 1 / 3 | — |
 | `Hold.Place` | Creates a Hold | no Hold at the key; the Tool exists with status = "available"; the Member exists with status = "active"; required fields are set | Hold<br>GSI ByCode entry<br>check Tool<br>check Member | no | transaction, 3 items | 11 / 47 | — |
 | `Hold.Release` | Deletes a Hold | the Hold exists | Hold<br>GSI ByCode entry | no | single item | 2 | — |
 
@@ -204,7 +207,7 @@ Every write the code can make, and everything each changes. Each is atomic: all 
 
 | Setting | Value |
 |---|---|
-| Table | `toollibrary-g2` (generation 2) |
+| Table | `toollibrary-g3` (generation 3) |
 | Base key | `PK` (partition, string) + `SK` (sort, string) |
 | Billing | On-demand |
 | TTL attribute | `ttl` (epoch seconds) |
@@ -215,6 +218,7 @@ A GSI is maintained by DynamoDB a moment after each write: writes stay cheap, an
 
 | Index | Kind | Keys | Projection | Read by | Why this kind | The other kind |
 |---|---|---|---|---|---|---|
+| `Library.All` | GSI `All` | `LIBRARIES` / `{name\|lower}#{libraryId}` | `slug`, `openedAt` plus key fields | List | chosen: no read through it needs immediate freshness | Can't be a copy: a copy's sort key must start with literal text, and All's starts with a field. |
 | `Member.ByName` | GSI `ByName` | `LIB#{libraryId}#MEMBERS` / `{name\|lower}#{memberId}` | `role`, `status` plus key fields | Directory | chosen: no read through it needs immediate freshness | Can't be a copy: a copy's sort key must start with literal text, and ByName's starts with a field. |
 | `Tool.ByCategory` | GSI `ByCategory` | `LIB#{libraryId}#CAT#{category}` / `{name\|lower}#{toolId}` | `status`, `tags` plus key fields | Catalogue | chosen: no read through it needs immediate freshness | Can't be a copy: a copy's sort key must start with literal text, and ByCategory's starts with a field. |
 | `Loan.ByMember` | copy | `LIB#{libraryId}#MEMBER#{memberId}` / `MYLOAN#{dueAt}#{toolId}#{loanId}`; only when `status = "active"` | `toolName`, `dueAt` plus key fields | MyLoans | chosen: MyLoans needs immediate freshness | As a GSI: Loan.Borrow 23 → 22 WRU (8 → 7 items); Loan.Return 19 → 17 WRU (6 → 4 items); Loan.Extend 8 → 5 WRU, no longer a transaction; MyLoans would lose immediate freshness. |
@@ -233,61 +237,67 @@ flowchart LR
     p0m2["counter MemberCounts"]
     p0m3["counter ToolCounts"]
   end
-  subgraph p1["UNIQUE#35;Library.Slug#35;{slug}"]
-    p1m0["Library Slug claim"]
+  subgraph p1["GSI All: LIBRARIES"]
+    p1m0["Library All entry ×2,000"]
   end
-  subgraph p2["GSI ByName: LIB#35;{libraryId}#35;MEMBERS"]
-    p2m0["Member ByName entry ×20 (≤2,000)"]
+  subgraph p2["UNIQUE#35;Library.Slug#35;{slug}"]
+    p2m0["Library Slug claim"]
   end
-  subgraph p3["UNIQUE#35;Member.Email#35;{libraryId}#35;{email|lower}"]
-    p3m0["Member Email claim"]
+  subgraph p3["GSI ByName: LIB#35;{libraryId}#35;MEMBERS"]
+    p3m0["Member ByName entry ×20 (≤2,000)"]
   end
-  subgraph p4["LIB#35;{libraryId}#35;TOOL#35;{toolId}"]
-    p4m0["Tool"]
-    p4m1["Loan ×20 (≤500)"]
-    p4m2["Hold ×0–1"]
+  subgraph p4["UNIQUE#35;Member.Email#35;{libraryId}#35;{email|lower}"]
+    p4m0["Member Email claim"]
   end
-  subgraph p5["GSI ByCategory: LIB#35;{libraryId}#35;CAT#35;{category}"]
-    p5m0["Tool ByCategory entry ×12 (≤5,000)"]
+  subgraph p5["LIB#35;{libraryId}#35;TOOL#35;{toolId}"]
+    p5m0["Tool"]
+    p5m1["Loan ×20 (≤500)"]
+    p5m2["Hold ×0–1"]
   end
-  subgraph p6["UNIQUE#35;Tool.Serial#35;{libraryId}#35;{serialNumber}"]
-    p6m0["Tool Serial claim"]
+  subgraph p6["GSI ByCategory: LIB#35;{libraryId}#35;CAT#35;{category}"]
+    p6m0["Tool ByCategory entry ×12 (≤5,000)"]
   end
-  subgraph p7["UNIQUE#35;Tool.Barcode#35;{libraryId}#35;{barcodes}"]
-    p7m0["Tool Barcode claim"]
+  subgraph p7["UNIQUE#35;Tool.Serial#35;{libraryId}#35;{serialNumber}"]
+    p7m0["Tool Serial claim"]
   end
-  subgraph p8["LIB#35;{libraryId}#35;MEMBER#35;{memberId}"]
-    p8m0["Loan ByMember copy ×60 (≤400)"]
-    p8m1["counter MemberLoans"]
+  subgraph p8["UNIQUE#35;Tool.Barcode#35;{libraryId}#35;{barcodes}"]
+    p8m0["Tool Barcode claim"]
   end
-  subgraph p9["GSI Overdue: LIB#35;{libraryId}#35;DUE"]
-    p9m0["Loan Overdue entry ×1,200 (≤100,000)"]
+  subgraph p9["LIB#35;{libraryId}#35;MEMBER#35;{memberId}"]
+    p9m0["Loan ByMember copy ×60 (≤400)"]
+    p9m1["counter MemberLoans"]
   end
-  subgraph p10["LIB#35;{libraryId}#35;LOANTOTALS#35;S{0..3}"]
-    p10m0["counter LoanTotals"]
+  subgraph p10["GSI Overdue: LIB#35;{libraryId}#35;DUE"]
+    p10m0["Loan Overdue entry ×1,200 (≤100,000)"]
   end
-  subgraph p11["GSI ByCode: HOLDCODE#35;{codeHash}"]
-    p11m0["Hold ByCode entry"]
+  subgraph p11["LIB#35;{libraryId}#35;LOANTOTALS#35;S{0..3}"]
+    p11m0["counter LoanTotals"]
+  end
+  subgraph p12["GSI ByCode: HOLDCODE#35;{codeHash}"]
+    p12m0["Hold ByCode entry"]
   end
   r_Library_Get{{"Library.Get"}} --> p0
-  r_Library_GetBySlug{{"Library.GetBySlug"}} --> p1 & p0
+  r_Library_GetBySlug{{"Library.GetBySlug"}} --> p2 & p0
   r_Library_MemberStats{{"Library.MemberStats"}} --> p0
   r_Library_ToolStats{{"Library.ToolStats"}} --> p0
+  r_Library_List{{"Library.List"}} --> p1
   r_Member_Get{{"Member.Get"}} --> p0
-  r_Member_GetByEmail{{"Member.GetByEmail"}} --> p3 & p0
-  r_Member_Directory{{"Member.Directory"}} --> p2
-  r_Tool_Get{{"Tool.Get"}} --> p4
-  r_Tool_Catalogue{{"Tool.Catalogue"}} --> p5
-  r_Tool_GetByBarcode{{"Tool.GetByBarcode"}} --> p7 & p4
-  r_Loan_Get{{"Loan.Get"}} --> p4
-  r_Loan_History{{"Loan.History"}} --> p4
-  r_Loan_MyLoans{{"Loan.MyLoans"}} --> p8
-  r_Loan_Overdue{{"Loan.Overdue"}} --> p9
-  r_Loan_ActiveLoans{{"Loan.ActiveLoans"}} --> p8
-  r_Loan_Totals{{"Loan.Totals"}} --> p10
-  r_Hold_Get{{"Hold.Get"}} --> p4
-  r_Hold_FindByCode{{"Hold.FindByCode"}} --> p11
+  r_Member_GetByEmail{{"Member.GetByEmail"}} --> p4 & p0
+  r_Member_Directory{{"Member.Directory"}} --> p3
+  r_Tool_Get{{"Tool.Get"}} --> p5
+  r_Tool_Catalogue{{"Tool.Catalogue"}} --> p6
+  r_Tool_GetByBarcode{{"Tool.GetByBarcode"}} --> p8 & p5
+  r_Loan_Get{{"Loan.Get"}} --> p5
+  r_Loan_History{{"Loan.History"}} --> p5
+  r_Loan_MyLoans{{"Loan.MyLoans"}} --> p9
+  r_Loan_Overdue{{"Loan.Overdue"}} --> p10
+  r_Loan_ActiveLoans{{"Loan.ActiveLoans"}} --> p9
+  r_Loan_Totals{{"Loan.Totals"}} --> p11
+  r_Hold_Get{{"Hold.Get"}} --> p5
+  r_Hold_FindByCode{{"Hold.FindByCode"}} --> p12
 ```
+
+`Loan.Export` scans every partition of the base table.
 
 ### Partitions
 
@@ -295,11 +305,12 @@ Each row is every partition key value one key pattern renders: *Keys* is how man
 
 | Partition key | In | Keys | Holds | Size, typical / largest | Grows | Busiest key at peak | Risk |
 |---|---|---|---|---|---|---|---|
-| `LIB#{libraryId}` | base table | 2,000 | Library: 1<br>Member: 20 / 2,000<br>counter MemberCounts: 1<br>counter ToolCounts: 1 | 9 KB / 870 KB | no | 2.67 WRU/s, 2.01 RRU/s | low (0.27%) |
+| `LIB#{libraryId}` | base table | 2,000 | Library: 1<br>Member: 20 / 2,000<br>counter MemberCounts: 1<br>counter ToolCounts: 1 | 9 KB / 870 KB | no | 2.67 WRU/s, 3.26 RRU/s | low (0.27%) |
+| `LIBRARIES` | GSI All | 1 | Library All entry: 2,000 | 420 KB / 420 KB | yes: Library never removed | 0 WRU/s, 0.75 RRU/s | low (0.03%) |
 | `UNIQUE#Library.Slug#{slug}` | base table | 2,000 | Library Slug claim: 1 | 230 B / 230 B | no | 0 WRU/s, 0.05 RRU/s | low (<0.01%) |
 | `LIB#{libraryId}#MEMBERS` | GSI ByName | 2,000 | Member ByName entry: 20 / 2,000 | 5 KB / 494 KB | no | 0 WRU/s, 1 RRU/s | low (0.03%) |
 | `UNIQUE#Member.Email#{libraryId}#{email\|lower}` | base table | 40,000 | Member Email claim: 1 | 230 B / 230 B | no | 0 WRU/s, <0.01 RRU/s | low (<0.01%) |
-| `LIB#{libraryId}#TOOL#{toolId}` | base table | 120,000 | Tool: 1<br>Loan: 20 / 500<br>Hold: 0 or 1 | 13 KB / 267 KB | yes: Loan never removed | 0.02 WRU/s, <0.01 RRU/s | low (<0.01%) |
+| `LIB#{libraryId}#TOOL#{toolId}` | base table | 120,000 | Tool: 1<br>Loan: 20 / 500<br>Hold: 0 or 1 | 14 KB / 282 KB | yes: Loan never removed | 0.02 WRU/s, <0.01 RRU/s | low (<0.01%) |
 | `LIB#{libraryId}#CAT#{category}` | GSI ByCategory | 10,000 | Tool ByCategory entry: 12 / 5,000 | 4 KB / 1 MB | yes: Tool never removed | 0.83 WRU/s, 2.08 RRU/s | low (0.08%) |
 | `UNIQUE#Tool.Serial#{libraryId}#{serialNumber}` | base table | 120,000 | Tool Serial claim: 1 | 230 B / 230 B | no | no rates declared | — |
 | `UNIQUE#Tool.Barcode#{libraryId}#{barcodes}` | base table | 120,000 | Tool Barcode claim: 1 | 230 B / 230 B | no | 0 WRU/s, <0.01 RRU/s | low (<0.01%) |
@@ -314,7 +325,8 @@ Unknown counts: nothing declares how many items share a value of `codeHash` in `
 
 | | Rule | About | Finding |
 |---|---|---|---|
-| ⚠️ warning | `large-field` | entity Tool | manual (p99 19.5 KB) makes every write cost up to 21 WRU (42 in a transaction), including writes that never change it: Relabel, Retire, Loan.Borrow, Loan.Return. Consider moving it to an entity of its own, written only when it changes. |
+| ℹ️ note | `low-cardinality-key` | index Library.All | All's partition key "LIBRARIES" has no field that varies per item beyond enums: every Library lands in one partition. At the declared volumes and rates that's fine: the largest holds 420 KB (and grows as long as the table lives), and its busiest key takes <1% of a partition's capacity at peak. Revisit it if the volumes or rates grow by orders of magnitude. |
+| ℹ️ note | `scan` | access Loan.Export | scans the whole table, every entity's items, for its Loans, one page per call: The yearly lending report reads every loan once, overnight. No request path reads it. At the declared volumes one full pass reads about 2.5 GB, costing about 329,228 RRU. |
 
 ### Accepted
 
@@ -324,19 +336,22 @@ Findings the schema records as deliberate, with its reasons.
 |---|---|---|---|
 | `sparse-index` | index Member.ByName | is keyed by name, which is optional: a Member without one is missing from ByName and from Directory, with nothing to say so. Make the field required, or accept this if it's deliberate. | Members invited by email join without a name, and stay out of the directory until they give one. |
 | `sparse-index` | index Tool.ByCategory | is keyed by category and name, which are optional: a Tool without them is missing from ByCategory and from Catalogue, with nothing to say so. Make the field required, or accept this if it's deliberate. | Donated tools are added before a steward sorts them; they join the catalogue once they have a category. |
+| `large-field` | entity Tool | manual (p99 19.5 KB) makes every write cost up to 21 WRU (42 in a transaction), including writes that never change it: Relabel, Retire, Loan.Borrow, Loan.Return. Consider moving it to an entity of its own, written only when it changes. | Most manuals are short (2 KB typically); only a few tools carry long ones, and those tools' writes cost more. Splitting the manual out would add a read to every tool page, for cents a month. |
 | `unenforced-unique` | index Hold.ByCode | FindByCode reads one entry of ByCode, keyed by codeHash, as if the key were unique, but no unique constraint makes it so: two Holds with the same codeHash would both be there, and the read returns either. Declare unique: on the fields, or accept this if duplicates can't happen. | Codes are HMACs under a server-side secret: two holds sharing one is negligibly unlikely, and a claim would outlive the hold's TTL. |
+
+Checked against the policy in `dynago.policy.yaml`: open findings of severity warning or worse fail `dynago check` and `dynago generate`.
 
 ### Costs
 
 | Entity | Expected items | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
 |---|---|---|---|---|---|
-| Library | 2,000 | 238 B / 421 B | 0.00 GB | $0.00 | $14.42 |
-| Member | 40,000 | 445 B / 908 B | 0.05 GB | $0.01 | $3.56 |
+| Library | 2,000 | 298 B / 585 B | 0.00 GB | $0.00 | $14.47 |
+| Member | 40,000 | 445 B / 908 B | 0.05 GB | $0.01 | $5.18 |
 | Tool | 120,000 | 2.4 KB / 20.5 KB | 0.41 GB | $0.10 | $7.78 |
-| Loan | 2,400,000 | 540 B / 1.9 KB | 3.56 GB | $0.89 | $145.32 |
+| Loan | 2,400,000 | 571 B / 2.0 KB | 3.63 GB | $0.91 | $145.32 |
 | Hold | 2,400 | 474 B / 706 B | 0.00 GB | $0.00 | $0.16 |
 
-Estimated total: **$172.25/month** for the declared volumes and rates.
+Estimated total: **$173.93/month** for the declared volumes and rates.
 
 Assumptions:
 
@@ -362,13 +377,15 @@ Each entity in full: its fields, every item stored for it, the key condition of 
 
 ### Library
 
-A tool library, run by volunteers in one neighbourhood.
+A tool library, run by volunteers in one neighbourhood. Each is a tenant of the service.
 
-Schema version **1**. Go type `Library`, store `Store.Libraries`.
+Schema version **2**. Go type `Library`, store `Store.Libraries`.
 
 ```mermaid
 flowchart LR
   item_Library["Library item<br/>LIB#35;{libraryId}<br/>LIBRARY"]
+  ix_All[("GSI All<br/>LIBRARIES")]
+  item_Library -. DynamoDB maintains .-> ix_All
   claim_Slug["claim Slug<br/>UNIQUE#35;Library.Slug#35;{slug}"]
   w_Open(["Open"])
   w_Open --> item_Library & claim_Slug
@@ -384,6 +401,8 @@ flowchart LR
   counter_MemberCounts --> r_MemberStats
   r_ToolStats{{"ToolStats"}}
   counter_ToolCounts --> r_ToolStats
+  r_List{{"List"}}
+  ix_All --> r_List
 ```
 
 Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB; solid arrows are written by the generated code.
@@ -393,7 +412,7 @@ Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB
 | Field | Type | Attribute | Size p50/p99 | Notes |
 |---|---|---|---|---|
 | `libraryId` | string | `libraryId` | 20 / 64 B | key |
-| `name` | string | `name` | 20 / 80 B |  |
+| `name` | string | `name` | 20 / 80 B | required |
 | `slug` | string | `slug` | 12 / 40 B | The library's URL name. |
 | `openedAt` | time | `openedAt` | 30 / 35 B |  |
 
@@ -403,8 +422,13 @@ Every item that exists because of a Library, and what keeps it up to date.
 
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
-| **Library** | `LIB#{libraryId}` | `LIBRARY` | `LIB#lib_1`<br>`LIBRARY` | 238 B / 421 B | the writes below |
+| **Library** | `LIB#{libraryId}` | `LIBRARY` | `LIB#lib_1`<br>`LIBRARY` | 298 B / 585 B | the writes below |
+| GSI `All` entry | `LIBRARIES` | `{name|lower}#{libraryId}` | `LIBRARIES`<br>`{name}#lib_1` | 215 B / 500 B | DynamoDB, from the item's `AllPK`/`AllSK` attributes (eventually consistent). Sparse: absent when a key field is empty. |
 | Claim `Slug` | `UNIQUE#Library.Slug#{slug}` | `UNIQUE` | `UNIQUE#Library.Slug#greenwood`<br>`UNIQUE` | ~230 B each | the writes below, in the same transaction; a conditional put makes `slug` unique. |
+
+#### Indexes
+
+- **All** (global secondary index, maintained by DynamoDB, eventually consistent; chosen because no read through it needs immediate freshness). Every library, alphabetically, for the operators' admin pages: the tenant list. Projection: `slug`, `openedAt` plus key fields.
 
 #### Uniqueness
 
@@ -418,16 +442,18 @@ Every item that exists because of a Library, and what keeps it up to date.
 | `GetBySlug` | claim `Slug`, then the item | `PK = UNIQUE#Library.Slug#{slug}` | strong | GetItem (claim) → GetItem | 2 |
 | `MemberStats` | counter `MemberCounts` | `PK = LIB#{libraryId}`, `SK = COUNTS#MEMBERS` | eventual | GetItem | 0.5 |
 | `ToolStats` | counter `ToolCounts` | `PK = LIB#{libraryId}`, `SK = COUNTS#TOOLS` | eventual | GetItem | 0.5 |
+| `List` | GSI `All`, page 50 (max 100) | `AllPK = LIBRARIES`, ascending | eventual (GSI) | Query | 1.5 / 3.5 |
 
 - `MemberStats`: The member counts, read from the library's page.
+- `List`: Every library, a page at a time, for the operators.
 
 #### Writes
 
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
-| `Open` | create (fails if it exists) | Library<br>claim Slug | no | transaction (2 items) | — | 4 | `ErrLibraryExists`<br>`ErrLibrarySlugTaken` |
-| `Rename` | set `name` if given | Library | no | single item | **required** | 1 | `ErrLibraryNotFound`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrVersionRequired` |
-| `ChangeSlug` | set `slug` | Library<br>claim Slug (moved: put + delete) | yes (1 consistent read; none with `dynago.From`) | transaction (3 items) | **required** | 6 | `ErrLibraryNotFound`<br>`ErrLibrarySlugTaken`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrVersionRequired`<br>`dynago.ErrConflict` (after retries) |
+| `Open` | create (fails if it exists) | Library<br>GSI All entry<br>claim Slug | no | transaction (2 items) | — | 5 | `ErrLibraryExists`<br>`dynago.ErrFieldRequired` (a required field is empty)<br>`ErrLibrarySlugTaken` |
+| `Rename` | set `name` if given | Library<br>GSI All entry (moved: delete + put) | yes (1 consistent read; none with `dynago.From`) | single item | **required** | 3 | `ErrLibraryNotFound`<br>`dynago.ErrFieldRequired` (a required field is empty)<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrVersionRequired`<br>`dynago.ErrConflict` (after retries) |
+| `ChangeSlug` | set `slug` | Library<br>GSI All entry<br>claim Slug (moved: put + delete) | yes (1 consistent read; none with `dynago.From`) | transaction (3 items) | **required** | 7 | `ErrLibraryNotFound`<br>`ErrLibrarySlugTaken`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrVersionRequired`<br>`dynago.ErrConflict` (after retries) |
 
 - `Rename`: A steward editing the library's settings.
 
@@ -516,9 +542,12 @@ Every item that exists because of a Member, and what keeps it up to date.
 
 | Method | Reads | Key condition | Consistency | Requests | RRU per call p50/p99 |
 |---|---|---|---|---|---|
-| `Get` | item by key | `PK = LIB#{libraryId}`, `SK = MEMBER#{memberId}` | eventual | GetItem | 0.5 |
+| `Get` | item by key | `PK = LIB#{libraryId}`, `SK = MEMBER#{memberId}` | strong | GetItem | 1 |
 | `GetByEmail` | claim `Email`, then the item | `PK = UNIQUE#Member.Email#{libraryId}#{email\|lower}` | strong | GetItem (claim) → GetItem | 2 |
 | `Directory` | GSI `ByName`, page 50 (max 100) | `ByNamePK = LIB#{libraryId}#MEMBERS`, ascending | eventual (GSI) | Query | 2 / 4 |
+
+- `Get`: A member's profile, which they see straight after editing it.
+- `GetByEmail`: Sign-in, which may come the moment after joining.
 
 #### Writes
 
@@ -621,6 +650,8 @@ Every item that exists because of a Tool, and what keeps it up to date.
 | `Catalogue` | GSI `ByCategory`, page 25 (max 100) | `ByCategoryPK = LIB#{libraryId}#CAT#{category}`, ascending | eventual (GSI) | Query | 1 / 2.5 |
 | `GetByBarcode` | claim `Barcode`, then the item | `PK = UNIQUE#Tool.Barcode#{libraryId}#{barcodes}` | strong | GetItem (claim) → GetItem | 2 / 7 |
 
+- `GetByBarcode`: The desk scanning a label, perhaps one just attached.
+
 #### Writes
 
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
@@ -637,7 +668,7 @@ Every item that exists because of a Tool, and what keeps it up to date.
 
 A member borrowing a tool.
 
-Schema version **1**. Go type `Loan`, store `Store.Loans`.
+Schema version **2**. Go type `Loan`, store `Store.Loans`.
 
 ```mermaid
 flowchart LR
@@ -675,6 +706,8 @@ flowchart LR
   counter_MemberLoans --> r_ActiveLoans
   r_Totals{{"Totals"}}
   counter_LoanTotals --> r_Totals
+  r_Export{{"Export"}}
+  item_Loan --> r_Export
 ```
 
 Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB; solid arrows are written by the generated code.
@@ -692,6 +725,7 @@ Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB
 | `borrowedAt` | time | `borrowedAt` | 30 / 35 B | required |
 | `dueAt` | time | `dueAt` | 30 / 35 B | required |
 | `returnedAt` | time | `returnedAt` | 30 / 35 B |  |
+| `checkedInBy` | string | `checkedInBy` | 20 / 64 B | holds a Member's key; The steward who took the tool back. A Member's memberId, under another name: the loan's memberId is its borrower. |
 | `notes` | string | `notes` | 0 / 1000 B | Condition notes from the steward. Not listed. |
 
 #### Stored items
@@ -700,7 +734,7 @@ Every item that exists because of a Loan, and what keeps it up to date.
 
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
-| **Loan** | `LIB#{libraryId}#TOOL#{toolId}` | `LOAN#{loanId}` | `LIB#lib_1#TOOL#t_42`<br>`LOAN#ln_9` | 540 B / 1.9 KB | the writes below |
+| **Loan** | `LIB#{libraryId}#TOOL#{toolId}` | `LOAN#{loanId}` | `LIB#lib_1#TOOL#t_42`<br>`LOAN#ln_9` | 571 B / 2.0 KB | the writes below |
 | Copy `ByMember` | `LIB#{libraryId}#MEMBER#{memberId}` | `MYLOAN#{dueAt}#{toolId}#{loanId}` | `LIB#lib_1#MEMBER#m_7`<br>`MYLOAN#2026-10-12T17:00:00.000000000Z#t_42#ln_9` | 393 B / 790 B | the writes below, in the same transaction as the item. Only when `status = "active"`. |
 | GSI `Overdue` entry | `LIB#{libraryId}#DUE` | `{dueAt}#{loanId}` | `LIB#lib_1#DUE`<br>`2026-10-12T17:00:00.000000000Z#ln_9` | 358 B / 799 B | DynamoDB, from the item's `OverduePK`/`OverdueSK` attributes (eventually consistent). Sparse: absent when a key field is empty. Only when `status = "active"`. |
 | Counter `MemberLoans` | `LIB#{libraryId}#MEMBER#{memberId}` | `LOANS` | `LIB#lib_1#MEMBER#m_7`<br>`LOANS` | ~164 B | the writes below, with atomic ADDs in the same transaction. |
@@ -715,31 +749,34 @@ Every item that exists because of a Loan, and what keeps it up to date.
 
 - **MemberLoans**, keyed by `libraryId`, `memberId`. Counts each member's loans.
   - `active`: count of items where `status = "active"`; writes that grow it take a caller-supplied limit. Capped by the member's maxLoans.
-- **LoanTotals**, keyed by `libraryId`. Counts every loan the library has made. Sharded to show how: a counter that every write of a busy entity touches can take ~1,000 writes/s per shard. This library's rate needs one item. Spread over 4 shards; reads sum them with one BatchGetItem.
+- **LoanTotals**, keyed by `libraryId`. Counts every loan the library has made. Sharded to show how: a counter item that every write of a busy entity touches starts to see transaction conflicts at about 20 writes/s, so each shard should take no more than about 10. This library's rate needs one item. Spread over 4 shards; reads sum them with one BatchGetItem.
   - `started`: count of items.
 
 #### Access patterns
 
 | Method | Reads | Key condition | Consistency | Requests | RRU per call p50/p99 |
 |---|---|---|---|---|---|
-| `Get` | item by key | `PK = LIB#{libraryId}#TOOL#{toolId}`, `SK = LOAN#{loanId}` | eventual | GetItem | 0.5 |
-| `History` | entity partition, only `libraryId`, `toolId`, `loanId`, `memberId`, `status`, `borrowedAt`, `dueAt`, `returnedAt`, page 20 (max 100) | `PK = LIB#{libraryId}#TOOL#{toolId}`, `begins_with(SK, "LOAN#")`, descending | eventual | Query | 1.5 / 5 |
+| `Get` | item by key | `PK = LIB#{libraryId}#TOOL#{toolId}`, `SK = LOAN#{loanId}` | strong | GetItem | 1 |
+| `History` | entity partition, only `libraryId`, `toolId`, `loanId`, `memberId`, `status`, `borrowedAt`, `dueAt`, `returnedAt`, page 20 (max 100) | `PK = LIB#{libraryId}#TOOL#{toolId}`, `begins_with(SK, "LOAN#")`, descending | eventual | Query | 1.5 / 5.5 |
 | `MyLoans` | copies `ByMember`, page 50 (max 100) | `PK = LIB#{libraryId}#MEMBER#{memberId}`, `begins_with(SK, "MYLOAN#")`, ascending | strong | Query | 5 / 10 |
 | `Overdue` | GSI `Overdue`, page 50 (max 100) | `OverduePK = LIB#{libraryId}#DUE`, `OverdueSK` between optional bounds on `dueAt`, ascending | eventual (GSI) | Query | 2.5 / 5 |
 | `ActiveLoans` | counter `MemberLoans` | `PK = LIB#{libraryId}#MEMBER#{memberId}`, `SK = LOANS` | eventual | GetItem | 0.5 |
 | `Totals` | counter `LoanTotals` | `PK = LIB#{libraryId}#LOANTOTALS`, `SK = TOTALS` | eventual | BatchGetItem (4 shards) | 2 |
+| `Export` | the whole table, page 50 (max 100) | none: a Scan, filtered to `_t = Loan` | eventual | Scan (one page) | 3.5 / 13 |
 
+- `Get`: A loan as the steward checks it in, straight after any change.
 - `History`: A tool's loans, newest first, without the notes.
 - `MyLoans`: A member's current loans, soonest due first.
+- `ActiveLoans`: Shown beside the member's loans. Borrow enforces the cap itself.
 
 #### Writes
 
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
-| `Borrow` | create (fails if it exists), set `status` = "active"; requires the Member to exist with status = "active"; requires the Tool to exist with status = "available" and sets its status to "onLoan"; requires any Hold to have memberId = Loan.memberId (an absent or expired one passes) and deletes the Hold if there is one | Loan<br>copy ByMember<br>GSI Overdue entry<br>counter MemberLoans<br>counter LoanTotals<br>check Member<br>Tool (sets its status to "onLoan")<br>Tool's GSI ByCategory entry<br>Tool's counter ToolCounts<br>Hold (deletes the Hold if there is one)<br>Hold's GSI ByCode entry | no | transaction (8 items) | — | 23 / 61 | `ErrLoanExists`<br>`ErrLoanBorrowRequiresMember`<br>`ErrLoanBorrowRequiresTool`<br>`ErrLoanBorrowRequiresHold`<br>`dynago.ErrFieldRequired` (a required field is empty)<br>`dynago.ErrLimitRequired` (no limit given)<br>`ErrMemberLoansActiveLimit` |
-| `Return` | set `returnedAt`, set `status` = "returned" when `status = "active"`; requires the Tool to exist with status = "onLoan" and sets its status to "available" | Loan<br>copy ByMember (moved: put + delete)<br>GSI Overdue entry (moved: delete + put)<br>counter MemberLoans<br>Tool (sets its status to "available")<br>Tool's GSI ByCategory entry<br>Tool's counter ToolCounts | yes (1 consistent read; none with `dynago.From`) | transaction (6 items) | optional | 19 / 57 | `ErrLoanNotFound`<br>`ErrLoanReturnPrecondition`<br>`ErrLoanReturnRequiresTool`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
-| `Extend` | set `dueAt` when `status = "active"` | Loan<br>copy ByMember (moved: put + delete)<br>GSI Overdue entry (moved: delete + put) | yes (1 consistent read; none with `dynago.From`) | transaction (3 items) | optional | 8 / 10 | `ErrLoanNotFound`<br>`ErrLoanExtendPrecondition`<br>`dynago.ErrFieldRequired` (a required field is empty)<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
-| `AddNote` | set `notes` if given | Loan | no | single item | optional | 1 / 2 | `ErrLoanNotFound`<br>`dynago.ErrVersionMismatch` (with a version) |
+| `Borrow` | create (fails if it exists), set `status` = "active"; requires the Member to exist with status = "active"; requires the Tool to exist with status = "available" and sets its status to "onLoan"; requires any Hold to have memberId = Loan.memberId (an absent or expired one passes) and deletes the Hold if there is one | Loan<br>copy ByMember<br>GSI Overdue entry<br>counter MemberLoans<br>counter LoanTotals<br>check Member<br>Tool (sets its status to "onLoan")<br>Tool's GSI ByCategory entry<br>Tool's counter ToolCounts<br>Hold (deletes the Hold if there is one)<br>Hold's GSI ByCode entry | no | transaction (8 items) | — | 23 / 63 | `ErrLoanExists`<br>`ErrLoanBorrowRequiresMember`<br>`ErrLoanBorrowRequiresTool`<br>`ErrLoanBorrowRequiresHold`<br>`dynago.ErrFieldRequired` (a required field is empty)<br>`dynago.ErrLimitRequired` (no limit given)<br>`ErrMemberLoansActiveLimit` |
+| `Return` | set `returnedAt`, set `checkedInBy`, set `status` = "returned" when `status = "active"`; requires the Tool to exist with status = "onLoan" and sets its status to "available" | Loan<br>copy ByMember (moved: put + delete)<br>GSI Overdue entry (moved: delete + put)<br>counter MemberLoans<br>Tool (sets its status to "available")<br>Tool's GSI ByCategory entry<br>Tool's counter ToolCounts | yes (1 consistent read; none with `dynago.From`) | transaction (6 items) | optional | 19 / 59 | `ErrLoanNotFound`<br>`ErrLoanReturnPrecondition`<br>`ErrLoanReturnRequiresTool`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `Extend` | set `dueAt` when `status = "active"` | Loan<br>copy ByMember (moved: put + delete)<br>GSI Overdue entry (moved: delete + put) | yes (1 consistent read; none with `dynago.From`) | transaction (3 items) | optional | 8 / 12 | `ErrLoanNotFound`<br>`ErrLoanExtendPrecondition`<br>`dynago.ErrFieldRequired` (a required field is empty)<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `AddNote` | set `notes` if given | Loan | no | single item | optional | 1 / 3 | `ErrLoanNotFound`<br>`dynago.ErrVersionMismatch` (with a version) |
 
 ### Hold
 
@@ -796,8 +833,10 @@ Every item that exists because of a Hold, and what keeps it up to date.
 
 | Method | Reads | Key condition | Consistency | Requests | RRU per call p50/p99 |
 |---|---|---|---|---|---|
-| `Get` | item by key | `PK = LIB#{libraryId}#TOOL#{toolId}`, `SK = HOLD` | eventual | GetItem | 0.5 |
+| `Get` | item by key | `PK = LIB#{libraryId}#TOOL#{toolId}`, `SK = HOLD` | strong | GetItem | 1 |
 | `FindByCode` | GSI `ByCode`, page 1 (max 1) | `ByCodePK = HOLDCODE#{codeHash}`, ascending | eventual (GSI) | Query | 0.5 |
+
+- `Get`: The member's hold, straight after placing it.
 
 #### Writes
 

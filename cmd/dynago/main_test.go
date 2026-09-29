@@ -29,7 +29,7 @@ func TestCheckReport(t *testing.T) {
 	if code := run([]string{"check", "../../examples/toollibrary/toollibrary.dynago.yaml"}, &out, &errs); code != 0 {
 		t.Fatalf("exit %d: %s", code, errs.String())
 	}
-	for _, want := range []string{"Loan (v1)", "Borrow", "tx 8 items", "estimated total", "[large-field] entity Tool", "partitions", "LIB#{libraryId}#TOOL#{toolId}", "accepted [sparse-index]"} {
+	for _, want := range []string{"Loan (v2)", "Borrow", "tx 8 items", "estimated total", "[large-field] entity Tool", "partitions", "LIB#{libraryId}#TOOL#{toolId}", "accepted [sparse-index]"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("report lacks %q:\n%s", want, out.String())
 		}
@@ -91,7 +91,7 @@ func TestFlagsAfterFiles(t *testing.T) {
 	if code := run([]string{"check", "../../examples/toollibrary/toollibrary.dynago.yaml", "-prices", "1,1,1"}, &out, &errs); code != 0 {
 		t.Fatalf("exit %d: %s", code, errs.String())
 	}
-	if strings.Contains(errs.String(), "-prices") || !strings.Contains(out.String(), "Loan (v1)") {
+	if strings.Contains(errs.String(), "-prices") || !strings.Contains(out.String(), "Loan (v2)") {
 		t.Fatalf("flag after the file was not taken as a flag:\n%s%s", out.String(), errs.String())
 	}
 }
@@ -171,7 +171,7 @@ func TestCheckJSON(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &snap); err != nil {
 		t.Fatal(err)
 	}
-	if snap.Table != "toollibrary" || len(snap.Partitions) < 5 || len(snap.Findings) != 4 {
+	if snap.Table != "toollibrary" || len(snap.Partitions) < 5 || len(snap.Findings) != 6 {
 		t.Errorf("snapshot = %+v", snap)
 	}
 }

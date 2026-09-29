@@ -11,7 +11,7 @@ Table generation **2**: `rekey-g2`. It is filled from generation 1 (`rekey-g1`) 
 | | |
 |---|---|
 | Entities | 1: Person |
-| Reads | 2: 1 by key, 1 counters |
+| Reads | 2: 1 by key, 1 counter |
 | Writes | 1: 1 in a transaction, 0 reading the item first |
 | Indexes | 0 GSIs, 0 copy indexes |
 | Uniqueness claims, counters | 0, 1 |

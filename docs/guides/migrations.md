@@ -12,15 +12,15 @@ table isn't touched, so rolling back means pointing the old version at it again.
    ```yaml
    table:
      name: toollibrary
-     generation: 2
-     retain: [1]
+     generation: 3
+     retain: [2]
    output:
      migrate_cmd: cmd/migrate-toollibrary   # generate the job's main package
    ```
 
 2. **Generate.** dynago prints what changed and that a migration is needed. It writes:
-   - the store for generation 2;
-   - a struct per entity for how generation 1 stored it (`ToolG1`);
+   - the store for generation 3;
+   - a struct per entity for how generation 2 stored it (`LibraryG2`);
    - the migration job;
    - Terraform declaring both tables.
 
@@ -32,13 +32,14 @@ table isn't touched, so rolling back means pointing the old version at it again.
    package toollibrary
 
    func init() {
-       // Generation 2 adds barcodes: label each tool with its serial number.
-       MigrateTool = func(old ToolG1) (Tool, error) {
-           t := AutoMigrateTool(old) // copies the fields that carry over
-           if old.SerialNumber != "" {
-               t.Barcodes = []string{"LBL-" + old.SerialNumber}
+       // Generation 3 requires a library's name, for the tenant list: name the unnamed after
+       // their slug.
+       MigrateLibrary = func(old LibraryG2) (Library, error) {
+           lib := AutoMigrateLibrary(old) // copies the fields that carry over
+           if lib.Name == "" {
+               lib.Name = old.Slug
            }
-           return t, nil
+           return lib, nil
        }
    }
    ```
@@ -57,7 +58,7 @@ table isn't touched, so rolling back means pointing the old version at it again.
 
 6. **Later, clean up.** Once you're sure you won't roll back:
    1. Turn off the old table's deletion protection outside the generated Terraform, for example
-      with `aws dynamodb update-table --table-name prod-toollibrary-g1 --no-deletion-protection-enabled`.
+      with `aws dynamodb update-table --table-name prod-toollibrary-g2 --no-deletion-protection-enabled`.
       The generated Terraform always enables it, so it can't be turned off there.
    2. Remove the generation from `retain` and apply the Terraform, which then deletes the table.
 
@@ -68,7 +69,7 @@ migrate-toollibrary [-table base] [-workers n] [-rate items/s] [-passes n] copy|
 ```
 
 `-table` is the base name (default: the schema's table name), so an environment's tables
-`prod-toollibrary-g1` and `prod-toollibrary-g2` take `-table prod-toollibrary`. It uses the AWS SDK's
+`prod-toollibrary-g2` and `prod-toollibrary-g3` take `-table prod-toollibrary`. It uses the AWS SDK's
 usual environment: credentials, `AWS_REGION`, and `AWS_ENDPOINT_URL_DYNAMODB` for DynamoDB Local.
 
 - **`copy`**, while the old generation serves:
@@ -95,7 +96,8 @@ old table's traffic.
 - for each entity, its copy in the new table, a page of 100 at a time (one BatchGetItem), to
   skip what is already copied at its current revision;
 - the whole new table and, for every copy in it, its source in the old table (a second read of
-  every entity, by key), to find copies whose source is gone or now converts to another key.
+  every entity, by key, a page at a time in one BatchGetItem), to find copies whose source is
+  gone or now converts to another key.
 
 Every read is strongly consistent.
 
@@ -200,7 +202,8 @@ up either.
 - **Resources:** the table ARNs, plus `<table-arn>/index/*` for GSI queries.
 - **Transactions have no IAM action of their own.** Each item in one is authorised by its own
   action, which is why `ConditionCheckItem` is on the list.
-- **The service never needs `Scan`,** because dynago never scans.
+- **The service needs `Scan` only if the schema declares a scan** (`scan: true`, for an export or
+  a backfill). No other read scans.
 - **Rollback:** a rolled-back version needs its old access, to the previous table. Keep that in
   the service's policy while the generation is retained.
 - **The init container in the example runs as the service's service account.** So `finish` run

@@ -337,7 +337,7 @@ func (s *AccountStore) Region(ctx context.Context, k RegionCountsKey) (RegionCou
 // the audit export reads every account
 func (s *AccountStore) Export(ctx context.Context, page dynago.Page) ([]Account, string, error) {
 	var raws []dynamo.Item
-	next, err := dynago.Scan(ctx, s.t, dynago.ScanSpec{Scope: "Account.Export@v1", Type: "Account", PageSize: 2, MaxPage: 100}, page, &raws)
+	next, err := dynago.Scan(ctx, s.t, dynago.ScanSpec{Scope: "Account.Export", Type: "Account", PageSize: 2, MaxPage: 100}, page, &raws)
 	if err != nil {
 		return nil, "", err
 	}

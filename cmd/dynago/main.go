@@ -61,7 +61,8 @@ Flags may come before or after the arguments.
 
   -prices        on-demand prices: $ per million WRU, $ per million RRU, $ per GB-month
                  (default 0.625,0.125,0.25, us-east-1)
-  -policy        the policy file (default: dynago.policy.yaml in the schema's directory or above)
+  -policy        the policy file (default: dynago.policy.yaml in the schema's directory or above,
+                 up to the repository root)
   -new-history   accept a schema whose history the lock file doesn't have (entities above
                  version 1, or a table above generation 1), starting the history there. Only right
                  for a new table: otherwise restore the lock file instead.

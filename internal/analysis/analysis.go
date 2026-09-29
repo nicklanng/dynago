@@ -189,7 +189,7 @@ var Rules = []Rule{
 	{"hot-partition", Error, false, false, "A partition key takes a large share of its throughput at peak: over 50% is a warning, over 100% of a single item is an error."},
 	{"hot-counter", Error, false, false, "A counter item takes more writes than a partition can serve."},
 	{"counter-contention", Warning, false, false, "Transactions update one counter item often enough to conflict and retry."},
-	{"low-cardinality-key", Warning, false, false, "A partition key holds nothing but constants and enums, so all of an entity's items share a few partitions."},
+	{"low-cardinality-key", Warning, false, false, "A partition key holds nothing but constants, enums and bools, so all of an entity's items share a few partitions. A note when the declared volumes and rates keep those partitions small and quiet."},
 	{"sparse-index", Warning, false, false, "An index is keyed by an optional field, so items without it silently drop out of the index and its reads."},
 	{"unenforced-unique", Warning, false, false, "A lookup reads one entry of an index that nothing keeps unique."},
 	{"unused-index", Warning, false, false, "No declared read uses an index, yet every write pays for it."},

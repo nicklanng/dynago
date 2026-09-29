@@ -34,7 +34,7 @@ schema (YAML) ──► Go store + errors          (<table>_dynago.go)
 ```
 
 The example, [`examples/toollibrary`](examples/toollibrary), is a fictional neighbourhood tool
-library that uses almost every feature. Read its [schema](examples/toollibrary/toollibrary.dynago.yaml),
+library that uses most features. Read its [schema](examples/toollibrary/toollibrary.dynago.yaml),
 the [model document](examples/toollibrary/toollibrary.model.md) generated from it, the
 [generated Go](examples/toollibrary/toollibrary_dynago.go). dynago's
 [end-to-end tests](internal/e2e/toollibrary_test.go) run that generated store against DynamoDB
@@ -91,7 +91,7 @@ Loan:
 ```
 
 ```go
-st := toollibrary.New(db, toollibrary.TableName("prod-toollibrary"))   // prod-toollibrary-g2
+st := toollibrary.New(db, toollibrary.TableName("prod-toollibrary"))   // prod-toollibrary-g3
 
 err := st.Loans.Borrow(ctx, loan, toollibrary.LoanBorrowLimits{MemberLoansActive: dynago.Max(member.MaxLoans)})
 switch {
@@ -204,7 +204,7 @@ db := dynagotest.DB(t)   // skips unless DYNAGO_TEST_ENDPOINT is set
 st := toollibrary.New(db, dynagotest.Table(t, db, toollibrary.TableSpec))
 ```
 
-`dynagotest.CountingDB` also counts the reads a call makes. In this repository, `make test` starts
+`dynagotest.CountingDB` also counts the requests a call makes, reads and writes. In this repository, `make test` starts
 DynamoDB Local in Docker and runs everything (with `DYNAGO_REQUIRE_DB=1`, so nothing skips
 silently); `make test-unit` needs no Docker.
 

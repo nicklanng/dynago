@@ -178,7 +178,7 @@ func Scan(ctx context.Context, t dynamo.Table, spec ScanSpec, page Page, out any
 }
 
 // cursorScope ties a cursor to everything that decides which items a page can hold: the access
-// pattern, partition and schema version (spec.Scope) and the range bounds. A cursor from other
+// pattern, the shape of its keys and its partition (spec.Scope) and the range bounds. A cursor from other
 // bounds could start outside them, which DynamoDB rejects.
 func cursorScope(spec QuerySpec) string {
 	bound := func(b *string) string {
@@ -277,7 +277,7 @@ func decodeCursor(scope, s string) (dynamo.PagingKey, error) {
 		return nil, ErrInvalidCursor
 	}
 	if c.Scope != scope {
-		return nil, fmt.Errorf("%w: it belongs to a different query, partition, range or schema version", ErrInvalidCursor)
+		return nil, fmt.Errorf("%w: it belongs to a different query, partition or range, or to how the query was keyed before", ErrInvalidCursor)
 	}
 	lek := make(dynamo.PagingKey, len(c.Key))
 	for k, v := range c.Key {

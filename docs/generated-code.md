@@ -4,7 +4,8 @@
 in it, how it is named, and how each generated method behaves. The generated code depends only on
 [guregu/dynamo](https://github.com/guregu/dynamo) and the small runtime package
 `github.com/nicklanng/dynago`, whose exported names you also use: errors, `Page`, `Limit`, `Max`,
-`Unlimited`, `Ptr`, `From`, `IfVersion`, `ReturnVersion`, `SignCursors` and `SetRetries`.
+`Unlimited`, `Ptr`, `From`, `IfVersion`, `ReturnVersion`, `Timestamps`, `SignCursors` and
+`SetRetries`.
 
 Names below come from [the example](../examples/toollibrary): entities `Loan`, `Member`, `Tool`,
 counter `MemberLoans`, index `Overdue`, and so on.
@@ -13,14 +14,14 @@ counter `MemberLoans`, index `Overdue`, and so on.
 
 | Name | What it is |
 |---|---|
-| `Generation`, `TableName(base) string` | The table generation this code uses, and its table's name for a base name: `TableName("prod-toollibrary")` is `"prod-toollibrary-g2"`. See [Schema changes](guides/schema-changes.md). |
+| `Generation`, `TableName(base) string` | The table generation this code uses, and its table's name for a base name: `TableName("prod-toollibrary")` is `"prod-toollibrary-g3"`. See [Schema changes](guides/schema-changes.md). |
 | `TableSpec` | The table's physical shape (GSIs, TTL attribute), a `dynago.TableSpec`. |
 | `Store` | One field per entity, named as the plural of the entity: `Store.Loans`, `Store.Libraries`. |
 | `New(db *dynamo.DB, tableName string) *Store` | Returns a store for the named table. The table name is a parameter, so environments can differ. |
 | `EnsureTable(ctx, db, tableName) error` | Creates the table (and enables TTL) if it does not exist. For local development and tests; production tables belong in the generated Terraform. |
 | `RunMigration(ctx, db, args, out) error` | The migration job's command line: `copy`, `finish` or `status`. Generation 1 has nothing to migrate. See [Migrations](guides/migrations.md). |
 | `NewMigration(db, base) *dynago.Migration` | The migration job, for running it from your own code. Generation 2 and later. |
-| `ToolG1`, `MigrateTool`, `AutoMigrateTool` | Per entity, generation 2 and later: how the previous generation stored it; the conversion you set when fields can't carry over by themselves; the field-by-field conversion. |
+| `LibraryG2`, `MigrateLibrary`, `AutoMigrateLibrary` | Per entity, generation 2 and later: how the previous generation stored it; the conversion you set when fields can't carry over by themselves; the field-by-field conversion. |
 
 ```go
 db := dynamo.New(cfg)                                   // guregu/dynamo
@@ -76,7 +77,7 @@ And, from the runtime directly:
 | `dynago.ErrInvalidKey` | A key field is empty, contains a separator character of its template, or the entity passed with `From` is a different item. | no |
 | `dynago.ErrFieldRequired` | A write left a `required: true` field at its zero value. | no |
 | `dynago.ErrLimitRequired` | A write that takes a `limit: arg` value was not given one. Pass `dynago.Max(n)`, or `dynago.Unlimited()` deliberately. | no |
-| `dynago.ErrInvalidCursor` | A page cursor is malformed, came from another query, partition or schema version, or fails its signature. | no |
+| `dynago.ErrInvalidCursor` | A page cursor is malformed, came from another query, partition or range, from before a change to how the query is keyed, or fails its signature. | no |
 | `dynago.ErrVersionMismatch` | A version was supplied and the item has changed since. | no: the caller decides |
 | `dynago.ErrVersionRequired` | The write is `versioned: required` and no version was supplied. | no |
 | `dynago.ErrConflict` | The item kept changing, or other transactions kept holding its items (a single-item write can be blocked by a transaction too), until retries ran out (about half a second by default; `dynago.SetRetries` changes the policy). | it is the result of retries |
@@ -134,8 +135,12 @@ for {
 }
 ```
 
-Cursors are opaque, URL-safe strings, tied to the access pattern, the partition, the range bounds
-and the entity's schema version: reused anywhere else they fail with `dynago.ErrInvalidCursor`.
+Cursors are opaque, URL-safe strings, tied to the access pattern, the partition and the range
+bounds: reused anywhere else they fail with `dynago.ErrInvalidCursor`. They are also tied to the
+query's shape (the keys and index it reads, and its order), but not to the entity's schema
+version: a new version that leaves the query alone keeps its cursors working, so a client paging
+through a rolling deploy isn't interrupted. A change to how the query is keyed refuses older
+cursors, rather than resuming from a key that means something else now.
 Call `dynago.SignCursors(secret)` at startup to make them tamper-proof too; they still show the
 key of the last item, so sign them if keys are sensitive. To rotate the secret, deploy
 `dynago.SignCursors(next, current)` (signing with `next`, still accepting `current`), then drop
@@ -314,8 +319,9 @@ ts := tool.Timestamps()          // dynago.Timestamps{Created, Updated time.Time
 
 ## What the generated code does not do
 
-- It does not expose raw DynamoDB access, or filters (the only filter is the one that drops
-  expired items, on entities with a `ttl`). A read that is not declared does not
+- It does not expose raw DynamoDB access, or filters (the only filters are the one that drops
+  expired items, on entities with a `ttl`, and a declared scan's filter to its entity's items). A
+  read that is not declared does not
   exist. Add an access pattern to the schema instead. `dynago vet` finds code that reaches
   DynamoDB around the store.
 - It does not change another entity in arbitrary ways: `requires` can set constants (or the
