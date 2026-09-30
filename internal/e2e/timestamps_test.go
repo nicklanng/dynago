@@ -22,6 +22,7 @@ func (e env) stamps(t *testing.T, pk, sk string) (created, updated string) {
 
 // Every row dynago writes records when it was created and last changed, on every write path.
 func TestTimestamps(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	start := dynago.FmtTime(time.Now())
 	later := func(t *testing.T, what, before, after string) {

@@ -18,6 +18,7 @@ import (
 // Generation 2 keys people by email. A person whose email changes in generation 1 during the
 // migration moves in generation 2: the copy under the old email is removed, and the count holds.
 func TestMigrationFollowsKeyChanges(t *testing.T) {
+	t.Parallel()
 	db := testdb.DB(t)
 	base := testdb.UniqueName(t, "rekey")
 	testdb.TableNamed(t, db, base+"-g1", rekey.TableSpec)
@@ -58,6 +59,7 @@ func TestMigrationFollowsKeyChanges(t *testing.T) {
 // over) stops, and writes nothing more: every write it makes is fenced by the lease. Here the
 // takeover is done by hand, the way a new job does it: the lease, then every worker's fence.
 func TestLostLeaseStopsTheJob(t *testing.T) {
+	t.Parallel()
 	g := setupGenerations(t)
 	for i := 0; i < 40; i++ {
 		must(t, g.old.Tools.Add(ctx, &toollibrary.Tool{LibraryID: "lib1", ToolID: fmt.Sprintf("t%02d", i), Name: "Tool", Category: toollibrary.ToolCategoryHand,
@@ -97,6 +99,7 @@ func count(t *testing.T, table dynamo.Table) int {
 // needs a claim a stale copy still holds; the job frees it rather than reporting data that is
 // valid as a conflict, so finish succeeds on the first run.
 func TestMigrationSwappedUniqueValues(t *testing.T) {
+	t.Parallel()
 	g := setupGenerations(t)
 	open := func(id, slug string) {
 		must(t, g.old.Libraries.Open(ctx, &toollibrary.Library{LibraryID: id, Name: id, Slug: slug, OpenedAt: time.Now()}))
@@ -139,6 +142,7 @@ func TestMigrationSwappedUniqueValues(t *testing.T) {
 // segments: 4 segments of 4 would cover the whole table, and treating them as done would skip
 // half of it.
 func TestResumedPassKeepsItsSegments(t *testing.T) {
+	t.Parallel()
 	db := testdb.DB(t)
 	base := testdb.UniqueName(t, "segs")
 	testdb.TableNamed(t, db, base+"-g1", rekey.TableSpec)
@@ -178,6 +182,7 @@ func TestResumedPassKeepsItsSegments(t *testing.T) {
 // Conflict records hold their source's key whatever characters it contains: two people whose ids
 // contain "|" converting to one email are a conflict, and finish must refuse.
 func TestConflictKeysWithSeparators(t *testing.T) {
+	t.Parallel()
 	db := testdb.DB(t)
 	base := testdb.UniqueName(t, "pipes")
 	testdb.TableNamed(t, db, base+"-g1", rekey.TableSpec)
@@ -198,6 +203,7 @@ func TestConflictKeysWithSeparators(t *testing.T) {
 // Removing a copy judged stale spares it if it has been rewritten since: it is then a fresher
 // copy (another worker copied its source again), not the stale one.
 func TestRemovingAStaleCopySparesAFreshOne(t *testing.T) {
+	t.Parallel()
 	db := testdb.DB(t)
 	base := testdb.UniqueName(t, "fresh")
 	testdb.TableNamed(t, db, base+"-g1", rekey.TableSpec)
@@ -231,6 +237,7 @@ func TestRemovingAStaleCopySparesAFreshOne(t *testing.T) {
 // A catch-up pass over items already copied reads their copies a page at a time, not one by one:
 // the final pass runs while writes are stopped, and each read by key is a round trip.
 func TestCatchUpReadsCopiesInBatches(t *testing.T) {
+	t.Parallel()
 	g := setupGenerations(t)
 	for i := 0; i < 30; i++ {
 		id := fmt.Sprintf("t%02d", i)

@@ -35,8 +35,14 @@ func setupGenerations(t *testing.T) *generations {
 	g.old = toollibrary.New(db, g.base+"-g2")
 	g.new = toollibrary.New(db, toollibrary.TableName(g.base))
 	g.oldTable = db.Table(g.base + "-g2")
+	// Tests run in parallel, but toollibrary.MigrateTool is a package variable some of them set
+	// and every job reads: one migration test at a time, once its tables exist.
+	toolMigrations.Lock()
+	t.Cleanup(toolMigrations.Unlock)
 	return g
 }
+
+var toolMigrations sync.Mutex
 
 func (g *generations) run(command string) error {
 	m := toollibrary.NewMigration(g.db, g.base)
@@ -63,6 +69,7 @@ func (g *generations) sameCounts(t *testing.T) {
 }
 
 func TestMigrationCopiesAndCatchesUp(t *testing.T) {
+	t.Parallel()
 	g := setupGenerations(t)
 	old := g.old
 	must(t, old.Libraries.Open(ctx, &toollibrary.Library{LibraryID: "lib1", Name: "Greenwood", Slug: "greenwood", OpenedAt: time.Now()}))
@@ -206,6 +213,7 @@ func TestMigrationCopiesAndCatchesUp(t *testing.T) {
 // be copied: the job reports the conflict and fails, so a rollout gated on it waits. Once the data
 // is fixed in the old table, the job carries on.
 func TestMigrationConflictsGateTheRollout(t *testing.T) {
+	t.Parallel()
 	g := setupGenerations(t)
 	must(t, g.old.Members.Join(ctx, &toollibrary.Member{LibraryID: "lib1", MemberID: "alice", Email: "alice@example.org", Status: toollibrary.MemberStatusActive}))
 	// A duplicate written without its claim, as a generation without the rule would have.

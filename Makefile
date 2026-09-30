@@ -14,6 +14,7 @@ test-unit:
 
 ## test-aws: maintainer only: run every test against real tables in the AWS account whose id is in
 ## DYNAGO_TEST_AWS, with the default AWS credentials and region. Creates and deletes on-demand tables.
+## Use the region nearest you (AWS_REGION=eu-west-2): the migration tests make thousands of requests.
 ## To watch it: make test-aws GOTESTFLAGS=-v PKGS=./internal/e2e/
 test-aws:
 	@test -n "$(DYNAGO_TEST_AWS)" || { echo "set DYNAGO_TEST_AWS to the test account's id" >&2; exit 1; }

@@ -48,6 +48,11 @@ DYNAGO_TEST_AWS=123456789012 make test-aws    # the account id; credentials and 
 DYNAGO_TEST_AWS=123456789012 make aws-sweep   # delete tables a run left behind (ARGS=-n to list only)
 ```
 
+Use the region nearest you (`AWS_REGION=eu-west-2 make test-aws`, and the same for `aws-sweep`):
+the migration tests make thousands of requests in turn, so each round trip adds up. The end-to-end
+tests run in parallel, apart from those that change package-wide settings, so a run takes about
+as long as its slowest test.
+
 The tests refuse to run if the credentials belong to another account. Each test creates an
 on-demand table named `dynagotest-…`, tagged with its creation time, and deletes it when it ends;
 the sweeper deletes only tables with that prefix and tag, older than an hour (`ARGS=-age 0` for
