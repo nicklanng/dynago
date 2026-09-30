@@ -12,21 +12,57 @@ import (
 	"github.com/nicklanng/dynago/internal/schema"
 )
 
+// Storage is what the lock file makes of a change, exactly as `dynago generate` will: whether it
+// refuses it, and each entity's storage changes.
+type Storage struct {
+	Refused error
+	Notes   []lock.Note
+}
+
+// CheckStorage applies next to the lock file recorded with base. Without a recorded history (a
+// base schema with no lock file beside it) the history starts at base, so only what a history
+// would add, such as attributes reused within the generation, goes unchecked. Apply sets
+// next.Previous, which nothing reads after analysis.
+func CheckStorage(base *schema.Model, baseLock *lock.File, next *schema.Model) Storage {
+	if baseLock == nil || len(baseLock.Entities) == 0 {
+		started, _, err := lock.Apply(base, &lock.File{Dynago: 1, Entities: map[string]*lock.History{}}, lock.Options{NewHistory: true})
+		if err != nil {
+			// Only retained generations' tables are unknown to a history started here; record
+			// them as the base's, which Apply only checks exist.
+			b := *base
+			b.Table.Retain = nil
+			if started, _, err = lock.Apply(&b, &lock.File{Dynago: 1, Entities: map[string]*lock.History{}}, lock.Options{NewHistory: true}); err != nil {
+				return Storage{Refused: fmt.Errorf("the base schema: %w", err)}
+			}
+		}
+		for _, g := range next.Table.Retain {
+			if started.Table(g) == nil {
+				started.Tables = append(started.Tables, lock.TableRecord{Generation: g, Spec: *started.Table(base.Table.Generation)})
+			}
+		}
+		baseLock = started
+	}
+	_, notes, err := lock.Apply(next, baseLock, lock.Options{})
+	return Storage{Refused: err, Notes: notes}
+}
+
 // Diff renders the architectural differences from old to next as Markdown, for a pull request. A
-// nil old means the schema is new. It returns "" when nothing architectural changed.
-func Diff(old, next *Snapshot, from, to string) string {
+// nil old means the schema is new. st is what the lock file makes of the change (see
+// CheckStorage). It returns "" when nothing architectural changed.
+func Diff(old, next *Snapshot, st Storage, from, to string) string {
 	d := &differ{}
 	if old == nil {
 		old = &Snapshot{Table: next.Table}
 		d.fresh = true
 	}
-	d.migration(old, next)
+	d.migration(old, next, st)
+	d.workload(old, next)
 	d.entities(old, next)
 	d.guarantees(old, next)
 	d.partitions(old, next)
 	d.findings(old, next)
 	d.costs(old, next)
-	if len(d.sections) == 0 {
+	if len(d.sections) == 0 && d.lead == "" {
 		return ""
 	}
 	slices.SortStableFunc(d.sections, func(a, b section) int {
@@ -48,7 +84,7 @@ func Diff(old, next *Snapshot, from, to string) string {
 }
 
 // sectionOrder is the order sections appear in: the design top down.
-var sectionOrder = []string{"Entities", "Fields", "Indexes", "Uniqueness and counters", "Reads", "Writes", "Guarantees", "Lifecycles", "Partitions", "Findings", "Costs"}
+var sectionOrder = []string{"Workload", "Entities", "Fields", "Indexes", "Uniqueness and counters", "Reads", "Writes", "Guarantees", "Lifecycles", "Partitions", "Findings", "Costs"}
 
 type section struct {
 	title string
@@ -78,28 +114,28 @@ const (
 	changed = "**~**"
 )
 
-// migration says whether existing items fit the new design: a new generation copies the table.
-func (d *differ) migration(old, next *Snapshot) {
+// migration says whether existing items fit the new design, as the lock file decides: a new
+// generation copies the table, and a change `dynago generate` refuses says why.
+func (d *differ) migration(old, next *Snapshot, st Storage) {
 	if d.fresh {
 		d.lead = fmt.Sprintf("A new table, `%s-g%d`.", next.Table, next.Generation)
 		return
 	}
 	var misfits, fits []string
-	for _, ne := range next.Entities {
-		oe := entityByName(old, ne.Name)
-		if oe == nil {
+	for _, n := range st.Notes {
+		if n.Entity == "table" {
 			continue
 		}
-		for _, c := range lock.Changes(oe.Shape, ne.Shape, nil) {
-			line := ne.Name + ": " + c.Text
-			if c.Compatible {
-				fits = append(fits, line)
-			} else {
-				misfits = append(misfits, line)
-			}
+		line := n.Entity + ": " + n.Message
+		if n.Warning {
+			misfits = append(misfits, line)
+		} else {
+			fits = append(fits, line)
 		}
 	}
 	switch {
+	case st.Refused != nil:
+		d.lead = "**`dynago generate` will refuse this change:**\n\n- " + strings.ReplaceAll(st.Refused.Error(), "\n", "\n- ")
 	case next.Generation != old.Generation:
 		// A pass reads the whole old table, the whole new one, and each entity again by key; the
 		// first copies every item.
@@ -112,7 +148,7 @@ func (d *differ) migration(old, next *Snapshot) {
 			wru += e.Count * e.MigrateWRU
 		}
 		rru := math.Ceil(old.BaseBytes/4096) + math.Ceil(next.BaseBytes/4096) + rereads
-		lead := fmt.Sprintf("**Needs a new table generation (%d → %d):** the migration job copies `%s-g%d` into `%s-g%d`, which the old version serves from until the copy catches up; `%s-g%d` stays for rollback.",
+		lead := fmt.Sprintf("**Needs a new table generation (%d → %d):** the migration job copies `%s-g%d` into the new table, `%s-g%d`, while the old version keeps serving from `%s-g%d`, which then stays for rollback.",
 			old.Generation, next.Generation, next.Table, old.Generation, next.Table, next.Generation, next.Table, old.Generation)
 		if items > 0 {
 			lead += fmt.Sprintf(" At the declared volumes that is about %s items (%s in the base table). Each pass reads both tables and each item again by key, about %s RRU; the first also writes every item with what it maintains, about %s WRU.",
@@ -122,10 +158,21 @@ func (d *differ) migration(old, next *Snapshot) {
 			lead += "\n\nChanges existing items don't fit:\n\n- " + strings.Join(misfits, "\n- ")
 		}
 		d.lead = lead
-	case len(misfits) > 0:
-		d.lead = "**Existing items don't fit this change, but the table generation is unchanged:** `dynago generate` will refuse it until `table.generation` goes up.\n\n- " + strings.Join(misfits, "\n- ")
 	case len(fits) > 0:
 		d.lead = "Existing items fit these storage changes, so they happen in place:\n\n- " + strings.Join(fits, "\n- ")
+	}
+}
+
+// workload shows changes to the table-wide assumptions every estimate scales with.
+func (d *differ) workload(old, next *Snapshot) {
+	if d.fresh {
+		return
+	}
+	if old.Workload.Peak != next.Workload.Peak {
+		d.add("Workload", "%s peak: %s× → %s× the average rate", changed, num(old.Workload.Peak), num(next.Workload.Peak))
+	}
+	if old.Workload.Horizon != next.Workload.Horizon {
+		d.add("Workload", "%s horizon: %s → %s", changed, orUnknown(old.Workload.Horizon), orUnknown(next.Workload.Horizon))
 	}
 }
 

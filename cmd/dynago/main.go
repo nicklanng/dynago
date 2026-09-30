@@ -371,7 +371,18 @@ func check(path string, o options, w io.Writer) error {
 		return nil
 	}
 	report := result.Cost
-	fmt.Fprintf(w, "%s: table %s, %d entities, %d GSIs\n\n", path, m.Table.Name, len(m.Entities), len(m.GSIs))
+	fmt.Fprintf(w, "%s: table %s, %s, %s\n", path, m.Table.Name, plural(len(m.Entities), "entity", "entities"), plural(len(m.GSIs), "GSI", "GSIs"))
+	fmt.Fprint(w, "(a/b is typical/p99, or typical/largest; units are per call; ? is unknown until a volume is declared; $ is at the declared rates)\n\n")
+	declared := false // any volume or rate, without which there is no cost to estimate
+	for _, er := range report.Entities {
+		declared = declared || er.Entity.Count > 0
+		for _, rc := range er.Reads {
+			declared = declared || rc.Access.Rate > 0
+		}
+		for _, wc := range er.Writes {
+			declared = declared || wc.Write.Rate > 0
+		}
+	}
 	for _, er := range report.Entities {
 		e := er.Entity
 		fmt.Fprintf(w, "%s (v%d)  item %s / %s", e.Name, e.Version, cost.Human(er.Item.P50), cost.Human(er.Item.P99))
@@ -441,11 +452,22 @@ func check(path string, o options, w io.Writer) error {
 			fmt.Fprintf(w, "accepted [%s] %s: %s\n  reason: %s\n", f.Rule, analysis.SubjectText(f.Subject), f.Message, f.Accepted.Reason)
 		}
 	}
-	fmt.Fprintf(w, "\nestimated total: $%.2f/month at declared volumes and rates\n", report.MonthlyUSD)
+	if declared {
+		fmt.Fprintf(w, "\nestimated total: $%.2f/month at declared volumes and rates\n", report.MonthlyUSD)
+	} else {
+		fmt.Fprint(w, "\nestimated total: not estimated; declare a `volume` on entities and a `rate` on reads and writes (docs/guides/analysis.md)\n")
+	}
 	if len(result.Failing()) > 0 {
 		return fmt.Errorf("%s: %s", path, failText(result))
 	}
 	return nil
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
 }
 
 func estimate(e analysis.Estimate) string {
@@ -527,18 +549,40 @@ func diff(path string, o options, w io.Writer) error {
 		}
 	}
 	var prev *arch.Snapshot
+	var st arch.Storage
 	if data != nil {
 		old, err := schema.ParseEarlier(data)
 		if err != nil {
 			return fmt.Errorf("%s at %s: %w", path, from, err)
 		}
 		prev = arch.Build(analysis.Analyze(old, o.prices, pol))
+		// The lock file recorded with the base schema, so the diff judges storage changes as
+		// generate will.
+		var lockData []byte
+		if o.from != "" {
+			lockData, err = os.ReadFile(filepath.Join(filepath.Dir(o.from), old.Output.Lock))
+			if errors.Is(err, os.ErrNotExist) {
+				lockData, err = nil, nil
+			}
+		} else {
+			lockData, err = gitShow(from, filepath.Join(filepath.Dir(path), old.Output.Lock))
+		}
+		if err != nil {
+			return err
+		}
+		var baseLock *lock.File
+		if lockData != nil {
+			if baseLock, err = lock.Parse(lockData); err != nil {
+				return fmt.Errorf("%s at %s: %w", old.Output.Lock, from, err)
+			}
+		}
+		st = arch.CheckStorage(old, baseLock, m)
 	}
 	to := path
 	if o.from == "" {
 		to = "working tree"
 	}
-	out := arch.Diff(prev, next, from, to)
+	out := arch.Diff(prev, next, st, from, to)
 	if out == "" {
 		fmt.Fprintf(w, "`%s`: no architectural changes (%s → %s).\n", m.Table.Name, from, to)
 		return nil

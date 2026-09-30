@@ -137,9 +137,18 @@ func Read(path string) (*File, error) {
 	if err != nil {
 		return nil, err
 	}
+	f, err := Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return f, nil
+}
+
+// Parse reads a lock file's content.
+func Parse(data []byte) (*File, error) {
 	f := &File{}
 	if err := json.Unmarshal(data, f); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, err
 	}
 	if f.Entities == nil {
 		f.Entities = map[string]*History{}
@@ -196,6 +205,10 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 		errs = append(errs, fmt.Errorf("table: generation %d is older than the recorded generation %d; generations only go up", gen, prevGen))
 	case newGen && gen != prevGen+1:
 		errs = append(errs, fmt.Errorf("table: generation goes from %d to %d; it must go up by one, since the migration job copies from the previous generation", prevGen, gen))
+	case newGen && !slices.Contains(m.Table.Retain, prevGen):
+		// Leaving it out would drop it from the Terraform while the migration job still reads it.
+		errs = append(errs, fmt.Errorf("table: generation goes from %d to %d, so add %d to `table.retain`: the migration job copies from %s, and it is the table to roll back to. Remove it from `retain` in a later change, once this generation is settled",
+			prevGen, gen, prevGen, m.Table.GenerationTable(prevGen)))
 	}
 	for _, e := range m.Entities {
 		shape := ShapeOf(e, m.Table.TTLAttr)
@@ -234,9 +247,6 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 			errs = append(errs, fmt.Errorf("entity %s: version %d is older than the recorded version %d; versions only go up", e.Name, e.Version, last.Version))
 		case e.Version == last.Version && same:
 			h.Versions[n-1] = Version{last.Version, last.gen(), fp, shape, last.StartsGeneration}
-		case e.Version == last.Version:
-			errs = append(errs, fmt.Errorf("entity %s: its storage shape changed but its version is still %d. Set `version: %d` so stored items record which shape wrote them. Changes: %s",
-				e.Name, e.Version, e.Version+1, strings.Join(texts(Changes(last.Shape, shape, e)), "; ")))
 		default:
 			changes := Changes(last.Shape, shape, e)
 			if !newGen {
@@ -250,9 +260,19 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 					misfits = append(misfits, c.Text)
 				}
 			}
+			if e.Version == last.Version {
+				// Say everything the change needs at once, not one fix per run.
+				msg := fmt.Sprintf("entity %s: its storage shape changed but its version is still %d. Set `version: %d` so stored items record which shape wrote them",
+					e.Name, e.Version, e.Version+1)
+				if len(misfits) > 0 && !newGen {
+					msg += fmt.Sprintf(", and start a new table generation (`table.generation: %d`), since existing items don't fit: %s", gen+1, strings.Join(misfits, "; "))
+				}
+				errs = append(errs, fmt.Errorf("%s. Changes: %s", msg, strings.Join(texts(dedupeChanges(changes)), "; ")))
+				continue
+			}
 			if len(misfits) > 0 && !newGen {
-				errs = append(errs, fmt.Errorf("entity %s: existing items don't fit version %d: %s. Start a new table generation (`table.generation: %d`): the generated migration job copies every item into the new table, and the old one stays for rollback",
-					e.Name, e.Version, strings.Join(misfits, "; "), gen+1))
+				errs = append(errs, fmt.Errorf("entity %s: existing items don't fit version %d: %s. Start a new table generation (`table.generation: %d`, and `retain: [%d]` to keep the old table for the migration job and rollback): the generated migration job copies every item into the new table",
+					e.Name, e.Version, strings.Join(misfits, "; "), gen+1, gen))
 				continue
 			}
 			if len(changes) == 0 {
@@ -265,8 +285,12 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 		}
 	}
 	if newGen && len(errs) == 0 {
-		notes = append(notes, Note{"table", true, fmt.Sprintf("generation %d → %d: a new table, %s. Run the migration job to copy %s into it before this version serves; %s stays for rollback until you remove it",
-			prevGen, gen, m.Table.GenerationTable(gen), m.Table.GenerationTable(prevGen), m.Table.GenerationTable(prevGen))})
+		job := "Run the migration job"
+		if m.Output.MigrateCmd == "" {
+			job = "Set `output.migrate_cmd` to generate the migration job, and run it"
+		}
+		notes = append(notes, Note{"table", true, fmt.Sprintf("generation %d → %d: a new table, %s. %s to copy %s into it before this version serves; %s stays for rollback until you remove it from `table.retain`",
+			prevGen, gen, m.Table.GenerationTable(gen), job, m.Table.GenerationTable(prevGen), m.Table.GenerationTable(prevGen))})
 	}
 	// Record this generation's table, and check retained ones are known.
 	spec := infra.Spec(m)

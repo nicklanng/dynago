@@ -50,14 +50,26 @@ func snapshot(t *testing.T, src string) *Snapshot {
 	return Build(analysis.Analyze(m, cost.DefaultPrices, nil))
 }
 
+// diff compares two schemas as `dynago diff` does, with the lock history started at before.
+func diff(t *testing.T, before, after string) string {
+	t.Helper()
+	parse := func(src string) *schema.Model {
+		m, err := schema.Parse([]byte(src))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	return Diff(snapshot(t, before), snapshot(t, after), CheckStorage(parse(before), nil, parse(after)), "main", "branch")
+}
+
 func TestNoChange(t *testing.T) {
-	s := snapshot(t, before)
-	if out := Diff(s, snapshot(t, before), "main", "branch"); out != "" {
+	if out := diff(t, before, before); out != "" {
 		t.Errorf("identical schemas differ:\n%s", out)
 	}
 	// Documentation isn't architecture.
 	docs := strings.Replace(before, "    fields: { shopId: string }", "    doc: A shop.\n    fields: { shopId: string }", 1)
-	if out := Diff(s, snapshot(t, docs), "main", "branch"); out != "" {
+	if out := diff(t, before, docs); out != "" {
 		t.Errorf("a doc change is an architecture change:\n%s", out)
 	}
 }
@@ -66,11 +78,12 @@ func TestNoChange(t *testing.T) {
 // the read, the writes it now makes transactions, and that existing items need a migration.
 func TestFreshnessChange(t *testing.T) {
 	after := strings.Replace(before, "Recent: { query: Recent, freshness: eventual, rate: 5 }", "Recent: { query: Recent, freshness: immediate, rate: 5 }", 1)
-	out := Diff(snapshot(t, before), snapshot(t, after), "main", "branch")
+	out := diff(t, before, after)
 	for _, want := range []string{
 		"### `shop`: architecture changes (main → branch)",
-		"**Existing items don't fit this change, but the table generation is unchanged:**",
-		"Order: index Recent",
+		"**`dynago generate` will refuse this change:**",
+		"Set `version: 2` so stored items record which shape wrote them, and start a new table generation (`table.generation: 2`",
+		"index Recent",
 		"**~** `Order.Recent`: GSI (maintained by DynamoDB, eventually consistent) → copy (written in the write's transaction, read-your-writes) (Recent needs immediate freshness)",
 		"**~** `Order.Recent`: Query of GSI Recent → Query of copy Recent; eventual → immediate",
 		"**~** `Order.Place`: single item → transaction of 2 items",
@@ -85,9 +98,10 @@ func TestFreshnessChange(t *testing.T) {
 
 // A new generation estimates the copy from the old table's declared volumes.
 func TestNewGeneration(t *testing.T) {
-	after := strings.Replace(before, "table: { name: shop }", "table: { name: shop, generation: 2 }", 1)
+	after := strings.Replace(before, "table: { name: shop }", "table: { name: shop, generation: 2, retain: [1] }", 1)
 	after = strings.Replace(after, "      placedAt: time\n", "      placedAt: time\n      total: { type: int, required: true }\n", 1)
-	out := Diff(snapshot(t, before), snapshot(t, after), "main", "branch")
+	after = strings.Replace(after, "  Order:\n", "  Order:\n    version: 2\n", 1)
+	out := diff(t, before, after)
 	for _, want := range []string{
 		"**Needs a new table generation (1 → 2):**",
 		"about 100,100 items",
@@ -111,7 +125,7 @@ func TestFindingChanges(t *testing.T) {
     access:
       Get: get
 `, 1)
-	out := Diff(snapshot(t, before), snapshot(t, after), "main", "branch")
+	out := diff(t, before, after)
 	for _, want := range []string{
 		"**+** `Order.ByNote`: GSI",
 		"**+** warning `unused-index`, index Order.ByNote",
@@ -124,8 +138,44 @@ func TestFindingChanges(t *testing.T) {
 }
 
 func TestNewSchema(t *testing.T) {
-	out := Diff(nil, snapshot(t, before), "main", "branch")
+	out := Diff(nil, snapshot(t, before), Storage{}, "main", "branch")
 	if !strings.Contains(out, "A new table, `shop-g1`.") || !strings.Contains(out, "**+** `Order.Recent`") {
 		t.Errorf("new schema diff:\n%s", out)
+	}
+}
+
+// A change only the lock sees (a generation bump, a stored attribute renamed) still leads the diff,
+// even when no section has anything to show.
+func TestStorageOnlyChanges(t *testing.T) {
+	gen := strings.Replace(before, "table: { name: shop }", "table: { name: shop, generation: 2, retain: [1] }", 1)
+	if out := diff(t, before, gen); !strings.Contains(out, "**Needs a new table generation (1 → 2):**") {
+		t.Errorf("generation bump:\n%s", out)
+	}
+	attr := strings.Replace(before, "      customerId: { type: string, required: true }", "      customerId: { type: string, required: true, attr: cust }", 1)
+	if out := diff(t, before, attr); !strings.Contains(out, "**`dynago generate` will refuse this change:**") || !strings.Contains(out, "table.generation: 2") {
+		t.Errorf("attribute renamed:\n%s", out)
+	}
+}
+
+// The diff agrees with the lock: a compatible change still needs a version bump.
+func TestInPlaceChangeNeedsAVersion(t *testing.T) {
+	added := strings.Replace(before, "      placedAt: time\n", "      placedAt: time\n      note: string\n", 1)
+	if out := diff(t, before, added); !strings.Contains(out, "will refuse this change") || !strings.Contains(out, "Set `version: 2`") {
+		t.Errorf("unversioned:\n%s", out)
+	}
+	versioned := strings.Replace(added, "  Order:\n", "  Order:\n    version: 2\n", 1)
+	if out := diff(t, before, versioned); !strings.Contains(out, "Existing items fit these storage changes, so they happen in place:\n\n- Order: v1 → v2: field note added") {
+		t.Errorf("versioned:\n%s", out)
+	}
+}
+
+// The workload scales every partition's load, so a change to it is architectural.
+func TestWorkloadChange(t *testing.T) {
+	after := strings.Replace(before, "workload: { peak: 3 }", "workload: { peak: 30, horizon: 5 years }", 1)
+	out := diff(t, before, after)
+	for _, want := range []string{"#### Workload", "**~** peak: 3× → 30× the average rate", "**~** horizon: unknown → 5 years"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("diff lacks %q:\n%s", want, out)
+		}
 	}
 }

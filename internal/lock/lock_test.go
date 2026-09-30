@@ -35,11 +35,19 @@ const counter = `    counters:
 func model(t *testing.T, gen, version int, fields, extra string) *schema.Model {
 	t.Helper()
 	r := strings.NewReplacer("%g", strconv.Itoa(gen), "%d", strconv.Itoa(version), "%f", fields, "%s", extra)
-	m, err := schema.Parse([]byte(r.Replace(v1)))
+	m, err := schema.Parse([]byte(r.Replace(retaining(v1, gen))))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return m
+}
+
+// retaining keeps the previous generation, as a generation bump must.
+func retaining(src string, gen int) string {
+	if gen < 2 {
+		return src
+	}
+	return strings.Replace(src, "generation: %g", "generation: %g, retain: ["+strconv.Itoa(gen-1)+"]", 1)
 }
 
 func empty() *File { return &File{Dynago: 1, Entities: map[string]*History{}} }
@@ -172,6 +180,33 @@ func TestGenerationsGoUpByOne(t *testing.T) {
 	}
 }
 
+// A new generation must keep the one the migration job copies from, or the Terraform would drop it.
+func TestNewGenerationRetainsThePrevious(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "", ""), empty())
+	m, err := schema.Parse([]byte(strings.NewReplacer("%g", "2", "%d", "1", "%f", "", "%s", "").Replace(v1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Apply(m, l1, Options{}); err == nil || !strings.Contains(err.Error(), "add 1 to `table.retain`") {
+		t.Fatalf("got %v", err)
+	}
+	// Once the generation is settled, the old table can go.
+	l2 := apply(t, model(t, 2, 1, "", ""), l1)
+	if _, _, err := Apply(m, l2, Options{}); err != nil {
+		t.Fatalf("dropping a retained generation later: %v", err)
+	}
+}
+
+// An incompatible change without a version bump says both what the version and the generation
+// need, in one run.
+func TestUnversionedMisfitNamesEveryFix(t *testing.T) {
+	l1 := apply(t, model(t, 1, 1, "", ""), empty())
+	_, _, err := Apply(model(t, 1, 1, "", counter), l1, Options{})
+	if err == nil || !strings.Contains(err.Error(), "Set `version: 2`") || !strings.Contains(err.Error(), "`table.generation: 2`") {
+		t.Fatalf("got %v", err)
+	}
+}
+
 func TestRetainNeedsARecordedTable(t *testing.T) {
 	src := strings.Replace(v1, "generation: %g }", "generation: %g, retain: [1] }", 1)
 	m, err := schema.Parse([]byte(strings.NewReplacer("%g", "2", "%d", "1", "%f", "", "%s", "").Replace(src)))
@@ -279,7 +314,7 @@ entities:
     ttl: expiresAt
 `
 	parse := func(gen, version int, attr string) *schema.Model {
-		m, err := schema.Parse([]byte(strings.NewReplacer("%g", strconv.Itoa(gen), "%d", strconv.Itoa(version), "%a", attr).Replace(src)))
+		m, err := schema.Parse([]byte(strings.NewReplacer("%g", strconv.Itoa(gen), "%d", strconv.Itoa(version), "%a", attr).Replace(retaining(src, gen))))
 		if err != nil {
 			t.Fatal(err)
 		}

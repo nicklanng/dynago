@@ -1,7 +1,8 @@
 // Package vet finds DynamoDB calls made outside generated code: requests through the AWS SDK's
 // DynamoDB client, guregu/dynamo, or dynago's runtime, which bypass the schema's declared reads
-// and writes. A call that must stay can be marked `//dynago:raw <reason>`, on its line, the line
-// above, or its function's doc comment; the reason is required and listed.
+// and writes, and function values that would (`retry(c.PutItem)`). A call that must stay can be
+// marked `//dynago:raw <reason>`: at the end of its line or its statement's last line, alone above
+// its statement, or in its function's doc comment; the reason is required and listed.
 package vet
 
 import (
@@ -114,9 +115,11 @@ func Run(dir string, patterns []string, tests bool) (*Result, error) {
 	return res, nil
 }
 
-// check finds the DynamoDB calls in one file.
+// check finds the DynamoDB calls in one file, and the method values and function values that
+// would make them (`retry(c.PutItem)`).
 func check(fset *token.FileSet, info *types.Info, f *ast.File) []Call {
-	// Directives by line: a trailing one marks its own line; one alone on its line marks the next.
+	// Directives by line: a trailing one marks its own line; one alone on its line marks the line
+	// after its comment group, so explanation may follow it.
 	var src []string
 	if data, err := os.ReadFile(fset.Position(f.Pos()).Filename); err == nil {
 		src = strings.Split(string(data), "\n")
@@ -130,61 +133,155 @@ func check(fset *token.FileSet, info *types.Info, f *ast.File) []Call {
 			}
 			p := fset.Position(c.Pos())
 			if p.Line-1 < len(src) && strings.HasPrefix(strings.TrimSpace(src[p.Line-1]), "//") {
-				above[p.Line+1] = reason
+				above[fset.Position(cg.End()).Line+1] = reason
 			} else {
 				trailing[p.Line] = reason
 			}
 		}
 	}
+	line := func(p token.Pos) int { return fset.Position(p).Line }
 	var out []Call
-	var funcMark *string
-	var visit func(n ast.Node) bool
-	visit = func(n ast.Node) bool {
+	// called holds the callee expressions of calls, which are reported as calls, not as values.
+	called := map[ast.Expr]bool{}
+	ast.PreorderStack(f, nil, func(n ast.Node, stack []ast.Node) bool {
+		var name string
+		var at token.Pos
+		var ok bool
+		var start, end int // the lines the call or value spans, for marks
 		switch n := n.(type) {
-		case *ast.FuncDecl:
-			var mark *string
-			if n.Doc != nil {
-				for _, c := range n.Doc.List {
-					if reason, ok := directive(c.Text); ok {
-						mark = &reason
-					}
-				}
-			}
-			prev := funcMark
-			funcMark = mark
-			if n.Body != nil {
-				ast.Inspect(n.Body, visit)
-			}
-			funcMark = prev
-			return false
 		case *ast.CallExpr:
-			name, at, ok := callee(info, n.Fun)
-			if !ok {
+			called[calleeExpr(n.Fun)] = true
+			if name, at, ok = callee(info, n.Fun); !ok {
 				return true
 			}
-			// Report the called name's position (calls chained on one receiver all start at the
-			// receiver), but match marks by where the chain starts, so a mark above a chain that
-			// spans lines covers all of it.
-			pos := fset.Position(at)
-			start := fset.Position(n.Pos()).Line
-			c := Call{Pos: pos, Name: name}
-			if funcMark != nil {
-				c.Marked, c.Reason = true, *funcMark
+			// Marks match by where the chain starts (calls chained on one receiver all start at
+			// the receiver) and where the outermost call of the chain ends, so a mark above a
+			// chain spread over lines, or after its closing `})`, covers all of it.
+			start, end = line(n.Pos()), line(chainEnd(n, stack).End())
+		case *ast.SelectorExpr:
+			if called[n] {
+				return true
 			}
-			if reason, ok := above[start]; ok {
-				c.Marked, c.Reason = true, reason
+			if name, ok = request(info, n.Sel); !ok {
+				return true
 			}
-			for line := start; line <= pos.Line; line++ {
-				if reason, ok := trailing[line]; ok {
-					c.Marked, c.Reason = true, reason
-				}
-			}
-			out = append(out, c)
+			at, start, end = n.Sel.Pos(), line(n.Pos()), line(n.End())
+		default:
+			return true
 		}
+		pos := fset.Position(at)
+		c := Call{Pos: pos, Name: name}
+		mark := func(reason string) { c.Marked, c.Reason = true, reason }
+		if reason, ok := funcMark(stack); ok {
+			mark(reason)
+		}
+		// Above the call or its statement; trailing on any line from its start to its name, on its
+		// last line, or on its statement's last line.
+		lines := []int{start}
+		stmt := enclosingStmt(stack)
+		if stmt != nil {
+			lines = append(lines, line(stmt.Pos()))
+		}
+		for _, l := range lines {
+			if reason, ok := above[l]; ok {
+				mark(reason)
+			}
+		}
+		lines = []int{end}
+		for l := start; l <= pos.Line; l++ {
+			lines = append(lines, l)
+		}
+		if simpleStmt(stmt) {
+			lines = append(lines, line(stmt.End()))
+		}
+		for _, l := range lines {
+			if reason, ok := trailing[l]; ok {
+				mark(reason)
+			}
+		}
+		out = append(out, c)
+		return true
+	})
+	return out
+}
+
+// calleeExpr strips parentheses and generic instantiation from a call's function.
+func calleeExpr(fun ast.Expr) ast.Expr {
+	for {
+		switch f := ast.Unparen(fun).(type) {
+		case *ast.IndexExpr:
+			fun = f.X
+		case *ast.IndexListExpr:
+			fun = f.X
+		default:
+			return f
+		}
+	}
+}
+
+// chainEnd returns the outermost call of the chain a call is the receiver of: for
+// `db.Table("x").Get("PK", "a").All(ctx, &out)` and any of its calls, the call to All.
+func chainEnd(call *ast.CallExpr, stack []ast.Node) *ast.CallExpr {
+	var cur ast.Expr = call
+	for i := len(stack) - 1; i >= 1; i -= 2 {
+		sel, ok := stack[i].(*ast.SelectorExpr)
+		if !ok || ast.Unparen(sel.X) != cur {
+			break
+		}
+		next, ok := stack[i-1].(*ast.CallExpr)
+		if !ok || calleeExpr(next.Fun) != sel {
+			break
+		}
+		call, cur = next, next
+	}
+	return call
+}
+
+// funcMark returns the //dynago:raw reason in the doc comment of the function declaration
+// enclosing a node.
+func funcMark(stack []ast.Node) (string, bool) {
+	for i := len(stack) - 1; i >= 0; i-- {
+		fd, ok := stack[i].(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		if fd.Doc == nil {
+			return "", false
+		}
+		var reason string
+		var found bool
+		for _, c := range fd.Doc.List {
+			if r, ok := directive(c.Text); ok {
+				reason, found = r, true
+			}
+		}
+		return reason, found
+	}
+	return "", false
+}
+
+// enclosingStmt returns the innermost statement enclosing a node, or nil outside any.
+func enclosingStmt(stack []ast.Node) ast.Stmt {
+	for i := len(stack) - 1; i >= 0; i-- {
+		switch s := stack[i].(type) {
+		case *ast.FuncLit, *ast.FuncDecl:
+			return nil
+		case ast.Stmt:
+			return s
+		}
+	}
+	return nil
+}
+
+// simpleStmt reports whether a statement holds no block, so a mark at the end of its last line is
+// about it, not about a block's closing brace.
+func simpleStmt(s ast.Stmt) bool {
+	switch s.(type) {
+	case *ast.ExprStmt, *ast.AssignStmt, *ast.ReturnStmt, *ast.DeclStmt, *ast.GoStmt,
+		*ast.DeferStmt, *ast.SendStmt, *ast.IncDecStmt:
 		return true
 	}
-	ast.Inspect(f, visit)
-	return out
+	return false
 }
 
 func directive(text string) (string, bool) {

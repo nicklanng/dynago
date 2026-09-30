@@ -76,8 +76,8 @@ type Partition struct {
 	// Undeclared lists partition key fields whose cardinality nothing declares, which leave the
 	// partition's counts unknown.
 	Undeclared []string
-	// busiest is the member taking the most write capacity at the busiest key.
-	busiestWRU map[*Member]float64
+	// busiestWRU and busiestRRU are each member's load on the busiest key, which Busiest weighs.
+	busiestWRU, busiestRRU map[*Member]float64
 }
 
 // Space names where the partition lives: "base table" or "GSI Name".
@@ -564,6 +564,10 @@ func (a *analyzer) traffic() {
 					calls = w.Rate * peak * s
 				}
 				units := t.Units.P50
+				if t.Count.Spread && t.Count.P50 > 1 {
+					// A moved key, or one claim per element: each key takes one of the items.
+					units /= float64(t.Count.P50)
+				}
 				if !t.Async {
 					units *= tx
 				}
@@ -607,6 +611,10 @@ func (a *analyzer) traffic() {
 				p := mb.Partition
 				p.Rated = true
 				p.PeakRRU += ac.Rate * peak * s * units
+				if p.busiestRRU == nil {
+					p.busiestRRU = map[*Member]float64{}
+				}
+				p.busiestRRU[mb] += ac.Rate * peak * s * units
 			}
 		}
 	}
@@ -626,11 +634,15 @@ func (a *analyzer) traffic() {
 	}
 }
 
-// Busiest returns the member taking most of the partition's write capacity, or its first member.
+// Busiest returns the member taking most of the partition's capacity, reads and writes each as a
+// share of what a partition serves, or its first member.
 func (p *Partition) Busiest() *Member {
+	load := func(mb *Member) float64 {
+		return p.busiestWRU[mb]/cost.PartitionWCU + p.busiestRRU[mb]/cost.PartitionRCU
+	}
 	var best *Member
 	for _, mb := range p.Members {
-		if best == nil || p.busiestWRU[mb] > p.busiestWRU[best] {
+		if best == nil || load(mb) > load(best) {
 			best = mb
 		}
 	}

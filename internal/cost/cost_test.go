@@ -108,3 +108,43 @@ entities:
 		t.Errorf("scan cost = %+v", rc)
 	}
 }
+
+// A scan page reads page items of every entity, the filter to one entity applying after: scanning
+// small tags in a table of big documents reads a page of documents.
+func TestScanPageReadsTheWholeTable(t *testing.T) {
+	m, err := schema.Parse([]byte(`
+dynago: 1
+package: docs
+table: { name: docs }
+entities:
+  Doc:
+    fields:
+      docId: string
+      body: { type: string, size: 20000 }
+    key: { pk: "DOC#{docId}", sk: "DOC" }
+    writes: { Add: create }
+    volume: 9000
+  Tag:
+    fields:
+      tagId: string
+    key: { pk: "TAG#{tagId}", sk: "TAG" }
+    access:
+      Export: { scan: true, page: 10, reason: the nightly export }
+    writes: { Add: create }
+    volume: 1000
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := Analyze(m, DefaultPrices)
+	for _, er := range r.Entities {
+		if er.Entity.Name == "Tag" {
+			// Ten items averaging about 18 KB is about 176 KB: 44 RRU, 22 eventually consistent.
+			if got := er.Reads[0].RRU.P50; got < 20 {
+				t.Errorf("a page of the scan costs %v RRU, as if it read only Tags", got)
+			}
+			return
+		}
+	}
+	t.Fatal("no Tag")
+}

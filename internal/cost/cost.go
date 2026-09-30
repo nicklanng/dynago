@@ -47,11 +47,18 @@ type Units struct{ P50, P99 float64 }
 func (u Units) add(o Units) Units { return Units{u.P50 + o.P50, u.P99 + o.P99} }
 
 // Count is how many items of one kind a write touches, typically (P50) and at worst (P99).
-type Count struct{ P50, P99 int }
+type Count struct {
+	P50, P99 int
+	// Spread says the items are on different partition keys (a key moved, or one claim per
+	// element), so each key takes one of them rather than all.
+	Spread bool
+}
 
 var (
-	once  = Count{1, 1}
-	twice = Count{2, 2}
+	once  = Count{1, 1, false}
+	twice = Count{2, 2, false}
+	// apart is two items on two partition keys: an entry or counter whose partition key moved.
+	apart = Count{2, 2, true}
 )
 
 // TargetKind is a kind of stored item.
@@ -184,12 +191,17 @@ func Analyze(m *schema.Model, p Prices) *Report {
 		r.BaseBytes += er.BaseBytes
 		r.BaseItems += er.BaseItems
 	}
-	// A scan's full pass reads the whole table, which is known once every entity is.
+	// A scan reads the whole table, which is known once every entity is: its full pass, and a
+	// page, which reads page items of every entity (the filter to one entity applies after).
 	for _, er := range r.Entities {
 		for i := range er.Reads {
 			rc := &er.Reads[i]
 			if rc.Access.Kind == schema.AccessScan {
 				rc.FullPassRRU = math.Ceil(r.BaseBytes/4096) * readFactor(rc.Access)
+				if r.BaseItems > 0 {
+					page := rru(int(math.Ceil(r.BaseBytes/r.BaseItems))*rc.Access.Page, readFactor(rc.Access))
+					rc.RRU = Units{page, math.Max(page, rc.RRU.P99)}
+				}
 			}
 		}
 	}
@@ -421,7 +433,7 @@ const setElementBytes = 20
 // setElements estimates the number of elements of a string set field.
 func setElements(f *schema.Field) Count {
 	n := func(size int) int { return max(1, (size+setElementBytes-1)/setElementBytes) }
-	return Count{n(f.SizeP50), n(f.SizeP99)}
+	return Count{n(f.SizeP50), n(f.SizeP99), true}
 }
 
 // derivedWrites records the index entries, copies, counters and claims a write of e changes. A
@@ -447,13 +459,17 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 		keyFields = append(keyFields, predFields(ix.Where)...)
 		moved, projected := touches(keyFields), ix.Projection == schema.ProjectAll || touches(ix.ProjectedFields())
 		size := er.Indexes[ix.Name]
+		movedN := twice
+		if touches(ix.PK.Fields) {
+			movedN = apart
+		}
 		if ix.Strategy == schema.StrategyGSI {
 			t := Target{Kind: TargetGSI, Entity: e, Index: ix}
 			switch {
 			case all:
 				write(t, false, true, owner+"GSI "+ix.Name+" entry", size, once)
 			case moved:
-				write(t, false, true, owner+"GSI "+ix.Name+" entry (moved: delete + put)", size, twice)
+				write(t, false, true, owner+"GSI "+ix.Name+" entry (moved: delete + put)", size, movedN)
 			case projected:
 				write(t, false, true, owner+"GSI "+ix.Name+" entry", size, once)
 			}
@@ -464,7 +480,7 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 		case all:
 			write(t, false, false, owner+"copy "+ix.Name, size, once)
 		case moved:
-			write(t, false, false, owner+"copy "+ix.Name+" (moved: put + delete)", size, twice)
+			write(t, false, false, owner+"copy "+ix.Name+" (moved: put + delete)", size, movedN)
 		case projected:
 			write(t, false, false, owner+"copy "+ix.Name, size, once)
 		}
@@ -483,7 +499,11 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 		case all:
 			write(t, false, false, owner+"counter "+c.Name, size, once)
 		case touches(c.KeyFields()):
-			write(t, false, false, owner+"counter "+c.Name+" (moved: two counter items)", size, twice)
+			movedN := twice
+			if touches(c.PK.Fields) {
+				movedN = apart
+			}
+			write(t, false, false, owner+"counter "+c.Name+" (moved: two counter items)", size, movedN)
 		case touches(in...):
 			write(t, false, false, owner+"counter "+c.Name, size, once)
 		}
@@ -498,7 +518,7 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 			case all:
 				write(t, false, false, fmt.Sprintf("%sclaims %s (one per %s element)", owner, u.Name, u.Set.Name), claimSize, n)
 			case touches(u.Fields):
-				write(t, false, false, fmt.Sprintf("%sclaims %s (added and dropped %s elements)", owner, u.Name, u.Set.Name), claimSize, Count{2, 2 * n.P99})
+				write(t, false, false, fmt.Sprintf("%sclaims %s (added and dropped %s elements)", owner, u.Name, u.Set.Name), claimSize, Count{2, 2 * n.P99, true})
 			}
 			continue
 		}
@@ -508,7 +528,7 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 		case touches(u.Fields) && clears(w, u.Fields):
 			write(t, false, false, owner+"claim "+u.Name+" (released)", claimSize, once)
 		case touches(u.Fields):
-			write(t, false, false, owner+"claim "+u.Name+" (moved: put + delete)", claimSize, twice)
+			write(t, false, false, owner+"claim "+u.Name+" (moved: put + delete)", claimSize, apart)
 		}
 	}
 }

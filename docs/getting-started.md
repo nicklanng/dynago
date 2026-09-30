@@ -74,6 +74,18 @@ wrote tasks.table.json       # the same, for `aws dynamodb create-table`
 wrote tasks.dynago.lock      # the schema's version history
 ```
 
+The generated store imports dynago's runtime, guregu/dynamo and the AWS SDK. Add them to your
+module:
+
+```sh
+go mod tidy
+```
+
+`check` prints each read and write with its cost per call, and each partition with how many items
+it holds. Its numbers are typical / p99 (or typical / largest), and `?` means unknown: this schema
+declares no `volume` or `rate`, so nothing is estimated yet. [Analysis](guides/analysis.md) explains
+how to declare them.
+
 Open `tasks.model.md`. It shows every item the schema creates, the key of each, which writes touch
 the counter, and what each call costs. This file is what a reviewer reads.
 
@@ -89,14 +101,21 @@ package tasks
 
 ```go
 import (
+    "context"
+    "errors"
+    "fmt"
+    "time"
+
+    "github.com/aws/aws-sdk-go-v2/config"
     "github.com/guregu/dynamo/v2"
     "github.com/nicklanng/dynago"
     "example.com/todo/tasks"
 )
 
+awsConfig, err := config.LoadDefaultConfig(ctx)   // credentials and region from the environment
 st := tasks.New(dynamo.New(awsConfig), tasks.TableName("tasks"))   // the table "tasks-g1"
 
-err := st.Tasks.Add(ctx, &tasks.Task{ProjectID: "p1", TaskID: "t1", Title: "Write docs"})
+err = st.Tasks.Add(ctx, &tasks.Task{ProjectID: "p1", TaskID: "t1", Title: "Write docs"})
 
 // Completing is conditional on the task not being done, and moves it from open to done
 // in the same transaction.
@@ -124,6 +143,15 @@ docker run -d --name dynamodb-local -p 8000:8000 amazon/dynamodb-local -jar Dyna
 
 ```go
 package tasks_test
+
+import (
+    "context"
+    "testing"
+    "time"
+
+    "github.com/nicklanng/dynago/dynagotest"
+    "example.com/todo/tasks"
+)
 
 func TestTasks(t *testing.T) {
     ctx := context.Background()
@@ -186,9 +214,15 @@ tasks.dynago.yaml: entity Task: its storage shape changed but its version is sti
 items record which shape wrote them. Changes: field dueAt added
 ```
 
-Set `version: 2` and generate again. The lock file records both versions. Read
-[Schema changes](guides/schema-changes.md) before changing keys, indexes, claims or counters on live
-data.
+Set `version: 2` on the entity (under `Task:`, beside `doc:`) and generate again. The lock file
+records both versions.
+
+Adding an optional field is a change existing items fit. A change they don't fit, such as a new
+index, claim or counter, or a changed key, also needs a new table generation:
+`table: { name: tasks, generation: 2, retain: [1] }`, with `output.migrate_cmd` set so dynago
+generates the job that copies the old table into the new one. `generate` says which a change needs.
+Read [Schema changes](guides/schema-changes.md) and [Migrations](guides/migrations.md) before
+changing keys, indexes, claims or counters on live data.
 
 ## Next
 
