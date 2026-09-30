@@ -53,7 +53,7 @@ is on-demand. Several entities can share a table; dynago checks they can never b
 | `doc` | no | | Shown at the top of the model document and on the generated `Store`. |
 | `ttl_attribute` | no | `ttl` | Attribute DynamoDB's TTL reads (epoch seconds). Only enabled if an entity declares `ttl`. |
 | `generation` | no | `1` | The table generation. Changes existing items don't fit need a new generation: a new table, filled by the generated migration job. See [Migrations](guides/migrations.md). |
-| `retain` | no | | Older generations whose tables stay in the Terraform, for rollback: `[2]`. To delete one, turn off its deletion protection outside the Terraform (the generated Terraform always enables it), then remove it here. |
+| `retain` | no | | Older generations whose tables stay in the Terraform, for rollback: `[2]`. It must include the previous generation in the change that bumps `generation`, since the migration job copies from that table. To delete one, turn off its deletion protection outside the Terraform (the generated Terraform always enables it), then remove it here. |
 | `accept` | no | | Findings about the table as a whole recorded as deliberate. See [Accepting findings](#accept). |
 
 ## Output

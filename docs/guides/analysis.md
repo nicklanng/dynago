@@ -148,8 +148,8 @@ Every finding has a severity, a rule id, and the schema object it's about.
 | `transaction-too-large` | error, limit | A write's transaction can exceed DynamoDB's 4 MB limit. |
 | `accept-invalid` | error, limit | An acceptance names an unknown rule, an error, or a finding the object doesn't have. |
 | `hot-partition` | warning; error on a single item over capacity | A partition key's busiest value takes over half its throughput at peak. |
-| `hot-counter` | error | A counter item takes more write units per second than a partition can serve. Suggests a shard count. |
-| `counter-contention` | warning, or note | Transactions update one counter item often enough (over ~20 a second) to conflict and retry. |
+| `hot-counter` | error | A counter item takes more write units per second than a partition can serve, summed over every write that changes it. Suggests a shard count. |
+| `counter-contention` | warning, or note | Transactions update one counter item often enough (over ~20 a second, summed over every write that changes it) to conflict and retry. Reported on the counter, naming each write's share. |
 | `low-cardinality-key` | warning, or note | A partition key holds nothing but constants, enums and bools (`STATUS#{status}`), so all of an entity's items share a few partitions. A note, with the figures, when the declared volumes and rates put those partitions at low risk: a list of every tenant under one key is often the right design. |
 | `sparse-index` | warning | An index is keyed by an optional field, so items without it silently drop out of the index and every read through it. |
 | `unenforced-unique` | warning | A read takes one entry of an index (`max_page: 1`, no sort key) as if its key were unique, but no unique constraint makes it so. |
@@ -191,8 +191,7 @@ indexes:
 ```
 
 The model document lists accepted findings with their reasons, so the decision is reviewed with
-the design. An acceptance covers every finding of its rule about its object: a write touching two
-hot counters has two `counter-contention` findings, and one acceptance covers both. Errors can't be accepted. An acceptance that no longer matches a finding is an error,
+the design. An acceptance covers every finding of its rule about its object, however many there are. Errors can't be accepted. An acceptance that no longer matches a finding is an error,
 so reasons don't outlive what they explained.
 
 ## Policy

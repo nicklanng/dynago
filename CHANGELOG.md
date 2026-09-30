@@ -19,7 +19,9 @@ First version.
 - Findings with rule ids, severities and subjects: DynamoDB's limits (item size, partitions,
   transactions, indexes), hot partitions and counters, contention, low-cardinality keys, sparse
   indexes, unenforced uniqueness, unused and unneeded indexes, copies that drift (with their
-  fan-out), scans, and what a policy requires. `accept: { rule: reason }` on the table, an entity,
+  fan-out), scans, and what a policy requires. A counter item's load is summed over every write
+  that changes it, and reported on the counter; a partition's busiest member is weighed by reads
+  as well as writes; a key that moves loads each of its two keys once. `accept: { rule: reason }` on the table, an entity,
   field, index, constraint, counter, read or write records one as deliberate; errors can't be
   accepted, and stale acceptances are errors.
 - `dynago.policy.yaml`: `fail_on`, rule severities, limits (item and partition size, transaction
@@ -34,10 +36,15 @@ First version.
   catalogues of every read and write, the indexes and a partition map, then risks and costs, and
   ends with per-entity reference detail.
 - `dynago check`: the analysis (costs, partitions, findings), without writing anything; `-json`
-  prints the analysed design as JSON.
+  prints the analysed design as JSON. Its output explains its figures, and says a cost is not
+  estimated when nothing declares a volume or rate.
 - `dynago diff`: the architectural changes since a git ref or another file, as Markdown, including
-  whether existing items need a new table generation and what migrating them costs.
+  whether existing items need a new table generation and what migrating them costs. Storage
+  changes are judged against the base's lock file, as `dynago generate` will judge them, and
+  changes to the workload are shown.
 - `dynago vet`: DynamoDB calls outside generated code, with `//dynago:raw <reason>` for exceptions.
+  Methods passed as values (`retry(c.PutItem)`) are reported too, and a mark may follow a
+  multi-line call's closing `})` or precede further comment lines above the call.
 
 ### Schema and generator
 
@@ -77,7 +84,9 @@ First version.
 - Table generations: a change existing items don't fit (a new, changed or dropped index, claim or
   counter; a new key; a field's type, a reused attribute, or a field made required) needs a new
   generation, a new table named `<name>-g<n>`, with older ones retained
-  for rollback (`table.retain`, declared in the Terraform). Within a generation, rewrites keep
+  for rollback (`table.retain`, declared in the Terraform). The change that bumps the generation
+  must retain the previous one, which the migration job copies from. An unversioned change that
+  also needs a new generation says both at once. Within a generation, rewrites keep
   attributes the code doesn't know, so compatible versions can share a table during rolling
   deploys and rollbacks.
 - A generated migration job (`RunMigration`, and a `main` package with `output.migrate_cmd`):

@@ -39,6 +39,8 @@ It compares the schema with the version at a git ref (default `HEAD`), or with a
 
 - **Migration first.** Whether existing items still fit, and if the change needs a new table
   generation, what the migration job copies: items, gigabytes, and the capacity each pass takes.
+  This is judged against the base's lock file, as `dynago generate` will, so a change it would
+  refuse (a missing version bump, a generation the old table isn't retained for) says so.
 - **Entities, fields, indexes, claims and counters** added, removed or changed: a GSI becoming a
   copy, a projection widening, a field becoming required.
 - **Reads and writes**: new and removed methods, changed freshness, a write that now reads first
@@ -98,12 +100,15 @@ including calls that only build a request or hand out the client (such as guregu
   of your own;
 - dynago's runtime functions that generated code uses (`dynago.Query`, `dynago.Run`, …).
 
+Handing one of these to a helper as a value (`retry(c.PutItem)`) counts as calling it.
+
 Creating a client (`dynamo.New`, `dynamodb.NewFromConfig`) is allowed: the generated `New` takes
 one. Test files are skipped unless `-tests` is given.
 
 A call that must stay (a one-off backfill, an admin tool) is marked with the reason: at the end of
-its line, alone on the line above the statement (which covers a call chain spread over several
-lines), or in its function's doc comment:
+its line, at the end of its statement's last line (after a multi-line call's closing `})`), alone
+above the statement (further comment lines may follow the mark; either covers a call chain spread
+over several lines), or in its function's doc comment:
 
 ```go
 // Backfill copies legacy rows into the new table.

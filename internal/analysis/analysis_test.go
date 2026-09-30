@@ -257,7 +257,7 @@ func TestRules(t *testing.T) {
 		{"scan", "    access:\n      Export: { scan: true, reason: the nightly export }\n",
 			"scan", Note, "Thing.Export", "the nightly export"},
 		{"hot counter", "    counters:\n      Total: { pk: \"TOTAL\", sk: \"TOTAL\", values: { n: count } }\n    writes:\n      Put: { create: true, hot_key_rate: 800 }\n",
-			"hot-counter", Error, "Thing.Put", "at 800 writes/s to one Total key"},
+			"hot-counter", Error, "Thing.Total", "at 800 writes/s to one Total key"},
 		{"item too large", "      blob: { type: string, size: 1000/500000 }\n",
 			"item-too-large", Error, "Thing", "over DynamoDB's 400 KB limit"},
 	}
@@ -316,11 +316,28 @@ func TestHotPartition(t *testing.T) {
 	src = strings.Replace(src, "table: { name: things }", "table: { name: things }\nworkload: { peak: 2 }", 1)
 	r := Analyze(parse(t, src), cost.DefaultPrices, nil)
 	// The biggest org has 1,000 of 1,000 things: all 800 peak writes/s land on it.
-	if !has(r, "hot-counter", Error, "Thing.Add", "at 800 writes/s to one Things key") {
+	if !has(r, "hot-counter", Error, "Thing.Things", "at 800 writes/s to one Things key") {
 		t.Errorf("hot counter:\n%s", dump(r))
 	}
 	if !has(r, "hot-partition", Warning, "Thing", "the busiest base table key (ORG#{orgId})") {
 		t.Errorf("hot partition:\n%s", dump(r))
+	}
+}
+
+// Every write to a counter item contends with the others: three writes of 15 transactions/s each
+// are 45 on the item, over the ~20 a second where conflicts become routine.
+func TestCounterContentionSumsWrites(t *testing.T) {
+	src := strings.Replace(base, "    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n", `    counters:
+      Kinds: { pk: "ORG#{orgId}", sk: "KINDS", values: { a: { count: true, where: { kind: a } } } }
+    writes:
+      Add: { create: true, hot_key_rate: 15 }
+      MakeA: { set: { kind: a }, when: { kind: b }, hot_key_rate: 15 }
+      MakeB: { set: { kind: b }, when: { kind: a }, hot_key_rate: 15 }
+    volume: { typical: 10, max: 1000 }
+`, 1)
+	r := Analyze(parse(t, src), cost.DefaultPrices, nil)
+	if !has(r, "counter-contention", Warning, "Thing.Kinds", "at 45 writes/s to one Kinds key (Thing.Add 15/s, declared hot_key_rate; Thing.MakeA 15/s") {
+		t.Errorf("summed contention:\n%s", dump(r))
 	}
 }
 
@@ -466,4 +483,42 @@ func TestScanReadsTheWholeTable(t *testing.T) {
 	if r.Cost.BaseBytes >= r.Cost.StorageBytes/1.5 {
 		t.Errorf("base bytes %v include the GSI (storage %v)", r.Cost.BaseBytes, r.Cost.StorageBytes)
 	}
+}
+
+// A partition hot from reads is blamed on what is read, not on whichever entity is listed first.
+func TestHotPartitionFromReads(t *testing.T) {
+	src := strings.Replace(base, "    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n", `    access:
+      List: { query: key, rate: 5000 }
+    writes:
+      Add: create
+    volume: { typical: 10, max: 1000 }
+`, 1)
+	r := Analyze(parse(t, src), cost.DefaultPrices, nil)
+	if !has(r, "hot-partition", Warning, "Thing", "the busiest base table key (ORG#{orgId})") {
+		t.Errorf("read-hot partition:\n%s", dump(r))
+	}
+}
+
+// A GSI entry whose partition key moves is a delete on one key and a put on another: each key
+// takes one of them, not both.
+func TestMovedKeyLoadsEachKeyOnce(t *testing.T) {
+	src := strings.Replace(base, "    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n", `    indexes:
+      ByKind: { pk: "ORG#{orgId}#K#{kind}", sk: "T#{thingId}", project: keys }
+    access:
+      K: { query: ByKind }
+    writes:
+      Add: create
+      Flip: { set: { kind: b }, when: { kind: a }, hot_key_rate: 100 }
+    volume: { typical: 10, max: 1000 }
+`, 1)
+	r := Analyze(parse(t, src), cost.DefaultPrices, nil)
+	for _, p := range r.Partitions {
+		if p.PK == "ORG#{orgId}#K#{kind}" {
+			if p.PeakWRU != 100 {
+				t.Errorf("ByKind's busiest key takes %v WRU/s, want 100 (one 1 KB entry per flip)", p.PeakWRU)
+			}
+			return
+		}
+	}
+	t.Fatalf("no ByKind partition:\n%s", dump(r))
 }

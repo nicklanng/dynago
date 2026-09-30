@@ -75,6 +75,9 @@ table:
   retain: [1]        # keep toollibrary-g1 for rollback
 ```
 
+`retain` must list the previous generation when the generation goes up: the migration job copies
+from it, and it's the table to roll back to. Remove it in a later change.
+
 Each generation's table is named `<name>-g<generation>`: generated code has `Generation` and
 `TableName(base)`, and the Terraform declares the current table and every retained one. A
 generation may change anything. The migration job copies each entity from the previous generation,

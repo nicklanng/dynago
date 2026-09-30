@@ -43,6 +43,7 @@ func (a *analyzer) rules() {
 	if n := a.r.Policy.Limits.GSIs; n > 0 && len(m.GSIs) > n {
 		a.add("gsi-limit", Warning, schema.Subject{Kind: schema.SubjectTable}, "the table has %d GSIs; the policy allows %d.", len(m.GSIs), n)
 	}
+	a.counterLoadRules()
 	a.partitionRules()
 }
 
@@ -52,7 +53,7 @@ func (a *analyzer) itemRules(e *schema.Entity, er *cost.EntityReport) {
 	case item.P99 > cost.MaxItemSize:
 		a.add("item-too-large", Error, entitySubject(e), "p99 item size is %s, over DynamoDB's 400 KB limit; move large fields to S3 or split the item.", cost.Human(item.P99))
 	case item.P99 > 100*1024:
-		a.add("item-large", Warning, entitySubject(e), "p99 item size is %s; every write and every read of it costs %.0f+ units. Consider splitting rarely-read fields into a separate item.", cost.Human(item.P99), math.Ceil(float64(item.P99)/1024))
+		a.add("item-large", Warning, entitySubject(e), "p99 item size is %s; every write of it costs %.0f+ WRU, and every strongly consistent read %.0f RRU. Consider splitting rarely-read fields into a separate item.", cost.Human(item.P99), math.Ceil(float64(item.P99)/1024), math.Ceil(float64(item.P99)/4096))
 	}
 	if n := a.r.Policy.Limits.ItemSize; n > 0 && item.P99 > n {
 		a.add("item-size-limit", Warning, entitySubject(e), "p99 item size is %s; the policy allows %s.", cost.Human(item.P99), cost.Human(n))
@@ -247,10 +248,20 @@ func (a *analyzer) writeRules(w *schema.Write, wc cost.WriteCost) {
 	a.counterRules(w, wc)
 }
 
-// counterRules checks how hard a write hits each counter item: at the declared hot_key_rate, or at
-// the busiest counter key's share of its peak rate.
+// counterLoad is what every write puts on one counter's busiest item at peak.
+type counterLoad struct {
+	c       *schema.Counter
+	rate    float64 // writes/s to the busiest key, over every write
+	wru     float64 // WRU/s on one item
+	tx      float64 // transactions/s on one item
+	writers []string
+	anyTx   bool
+}
+
+// counterRules records how hard a write hits each counter item: at the declared hot_key_rate, or
+// at the busiest counter key's share of its peak rate. counterLoadRules judges the sums, since
+// every write to a counter item contends with the others.
 func (a *analyzer) counterRules(w *schema.Write, wc cost.WriteCost) {
-	s := writeSubject(w)
 	tx := 1.0
 	if wc.Transactional {
 		tx = 2
@@ -271,22 +282,42 @@ func (a *analyzer) counterRules(w *schema.Write, wc cost.WriteCost) {
 			}
 			rate, basis = w.Rate*a.m.Workload.Peak*sh, "the busiest key's share of the peak rate"
 		}
+		l := a.counterLoads[c]
+		if l == nil {
+			l = &counterLoad{c: c}
+			a.counterLoads[c] = l
+			a.counterOrder = append(a.counterOrder, c)
+		}
 		perItem := rate / float64(c.Shards)
-		wruPerItem := perItem * tx * t.Units.P50 / float64(t.Count.P50)
-		suggest := int(math.Ceil(rate / 10))
+		l.rate += rate
+		l.wru += perItem * tx * t.Units.P50 / float64(t.Count.P50)
+		if wc.Transactional {
+			l.tx += perItem
+			l.anyTx = true
+		}
+		l.writers = append(l.writers, fmt.Sprintf("%s.%s %s/s, %s", w.Entity.Name, w.Name, schema.Number(round(rate)), basis))
+	}
+}
+
+func (a *analyzer) counterLoadRules() {
+	for _, c := range a.counterOrder {
+		l := a.counterLoads[c]
+		s := counterSubject(c)
+		from := strings.Join(l.writers, "; ")
+		suggest := int(math.Ceil(l.rate / 10))
 		switch {
-		case wruPerItem > cost.PartitionWCU:
+		case l.wru > cost.PartitionWCU:
 			a.add("hot-counter", Error, s,
 				"at %s writes/s to one %s key (%s), each counter item takes %.0f WRU/s, over a partition's %d: it will throttle. Set shards: %d or more.",
-				schema.Number(round(rate)), c.Name, basis, wruPerItem, cost.PartitionWCU, suggest)
-		case wc.Transactional && perItem > conflictRate:
+				schema.Number(round(l.rate)), c.Name, from, l.wru, cost.PartitionWCU, suggest)
+		case l.anyTx && l.tx > conflictRate:
 			a.add("counter-contention", Warning, s,
 				"at %s writes/s to one %s key (%s), each counter item is written by ~%.0f transactions/s. Transactions touching the same item at once conflict and retry (about half a second by default; see dynago.SetRetries), so expect latency and ErrConflict under bursts. Set shards: %d (about 10 transactions/s per item)%s.",
-				schema.Number(round(rate)), c.Name, basis, perItem, suggest, boundedNote(c))
-		case wc.Transactional && perItem >= 5:
+				schema.Number(round(l.rate)), c.Name, from, l.tx, suggest, boundedNote(c))
+		case l.anyTx && l.tx >= 5:
 			a.add("counter-contention", Note, s,
 				"at %s writes/s to one %s key (%s), each counter item takes ~%.0f transactions/s: occasional conflicts, retried.",
-				schema.Number(round(rate)), c.Name, basis, perItem)
+				schema.Number(round(l.rate)), c.Name, from, l.tx)
 		}
 	}
 }

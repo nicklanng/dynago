@@ -122,7 +122,7 @@ func Analyze(m *schema.Model, prices cost.Prices, p *Policy) *Result {
 		r: &Result{Model: m, Cost: cost.Analyze(m, prices), Policy: p,
 			Alternatives: map[*schema.Index]*Alternative{}, Reads: map[*schema.Access]*ReadStats{},
 			targets: map[targetKey]*Member{}},
-		m: m,
+		m: m, counterLoads: map[*schema.Counter]*counterLoad{},
 	}
 	a.assumptions()
 	a.partitions()
@@ -143,6 +143,9 @@ func Analyze(m *schema.Model, prices cost.Prices, p *Policy) *Result {
 type analyzer struct {
 	r *Result
 	m *schema.Model
+	// counterLoads sums the writes on each counter item, in the order counters were first written.
+	counterLoads map[*schema.Counter]*counterLoad
+	counterOrder []*schema.Counter
 }
 
 func (a *analyzer) add(rule string, sev Severity, s schema.Subject, format string, args ...any) {

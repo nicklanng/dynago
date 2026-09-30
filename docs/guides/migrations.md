@@ -7,7 +7,8 @@ table isn't touched, so rolling back means pointing the old version at it again.
 
 ## The workflow
 
-1. **Bump the generation**, and keep the old one for rollback:
+1. **Bump the generation**, and keep the old one: the job copies from it, and it's what you roll
+   back to. `dynago generate` refuses a new generation whose `retain` leaves out the previous one:
 
    ```yaml
    table:

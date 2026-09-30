@@ -62,13 +62,19 @@ It compares the schema with its version at a git ref (`-base`, default `HEAD`), 
 schema file (`-from`). A schema that didn't exist at the ref is shown as new. Documentation-only
 changes print "no architectural changes".
 
+Storage changes are judged against the lock file recorded with the base (at the ref, or beside the
+`-from` file), exactly as `dynago generate` will judge them: a change it would refuse, such as a
+missing version bump, leads the diff with why. Without a lock file there, the history starts at
+the base schema.
+
 ## `dynago vet`
 
 Finds DynamoDB calls outside generated code in the given packages (default `./...`): methods of
 guregu/dynamo's types and of the AWS SDK's DynamoDB client, its paginators and waiters, methods
 of interfaces over the client (taking the SDK's request inputs), and dynago's runtime functions.
-Creating a client is allowed. A call marked `//dynago:raw <reason>` (at the end of its line, alone
-on the line above its statement, or in its function's doc comment) is allowed; `-list` prints those
+Method values and function values of these (`retry(c.PutItem)`) count as calls. Creating a client
+is allowed. A call marked `//dynago:raw <reason>` (at the end of its line or of its statement's last
+line, alone above its statement, or in its function's doc comment) is allowed; `-list` prints those
 with their reasons. Test files are skipped unless `-tests` is given. Fails if any unmarked call is
 found. See [Reviewing designs and changes](guides/review.md#only-declared-access).
 
