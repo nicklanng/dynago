@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -68,7 +70,16 @@ func Client(t testing.TB) *dynamodb.Client {
 
 // connect loads the default AWS configuration and checks it is for the expected account.
 func connect(ctx context.Context, account string) (*dynamodb.Client, error) {
-	cfg, err := config.LoadDefaultConfig(ctx)
+	// Tests run in parallel and some write at volume, faster than a new on-demand table takes at
+	// first: retry throttling for longer than the SDK's default, and without its retry budget,
+	// which throttling across many goroutines would use up.
+	retryer := func() aws.Retryer {
+		return retry.NewStandard(func(o *retry.StandardOptions) {
+			o.MaxAttempts = 12
+			o.RateLimiter = ratelimit.None
+		})
+	}
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRetryer(retryer))
 	if err != nil {
 		return nil, fmt.Errorf("%s: loading AWS configuration: %w", EnvAWS, err)
 	}

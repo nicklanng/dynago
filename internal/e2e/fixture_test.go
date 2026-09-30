@@ -14,6 +14,7 @@ import (
 // operations on one item), and the successor is read first, because its region counter is keyed
 // by a field the requirement doesn't pin.
 func TestHandOverChangesAnotherItemOfTheSameEntity(t *testing.T) {
+	t.Parallel()
 	db, n := testdb.CountingDB(t)
 	st := fixture.New(db, testdb.Table(t, db, fixture.TableSpec))
 	open := func(id, region string) {
@@ -58,6 +59,7 @@ func TestHandOverChangesAnotherItemOfTheSameEntity(t *testing.T) {
 // A declared scan pages through the whole table and returns only the entity's items: the counter
 // items it also reads are left out, so pages can be short.
 func TestScanReturnsOnlyTheEntity(t *testing.T) {
+	t.Parallel()
 	db := testdb.DB(t)
 	st := fixture.New(db, testdb.Table(t, db, fixture.TableSpec))
 	for _, id := range []string{"a1", "a2", "a3", "a4", "a5"} {

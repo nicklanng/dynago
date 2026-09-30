@@ -123,6 +123,7 @@ func (e env) reads(fn func()) int64 {
 
 // The tenant list pages through every library by name, ignoring case, whatever its id.
 func TestLibraryList(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	for id, name := range map[string]string{"lib1": "Oakfield", "lib2": "ashby", "lib3": "Birchwood"} {
 		must(t, e.st.Libraries.Open(ctx, &toollibrary.Library{LibraryID: id, Name: name, Slug: strings.ToLower(name), OpenedAt: time.Now()}))
@@ -151,6 +152,7 @@ func TestLibraryList(t *testing.T) {
 }
 
 func TestLibrarySlugAndVersionedEdits(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	lib := &toollibrary.Library{LibraryID: "lib1", Name: "Greenwood Tool Library", Slug: "greenwood", OpenedAt: time.Now()}
 	must(t, e.st.Libraries.Open(ctx, lib))
@@ -185,6 +187,7 @@ func TestLibrarySlugAndVersionedEdits(t *testing.T) {
 }
 
 func TestMembers(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	e.join(t, "alice", toollibrary.MemberRoleSteward, 2)
 	e.join(t, "bob", toollibrary.MemberRoleMember, 2)
@@ -261,6 +264,7 @@ func TestMembers(t *testing.T) {
 }
 
 func TestKeySeparators(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	// libraryId is followed by "#" in keys that identify items: a value containing it could
 	// render another library's keys.
@@ -285,6 +289,7 @@ func TestKeySeparators(t *testing.T) {
 }
 
 func TestToolsCatalogueAndCounts(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	e.join(t, "alice", toollibrary.MemberRoleSteward, 5)
 	e.addTool(t, "t1", "Cordless drill", toollibrary.ToolCategoryPower)
@@ -336,6 +341,7 @@ func TestToolsCatalogueAndCounts(t *testing.T) {
 }
 
 func TestBorrowingRules(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	e.join(t, "alice", toollibrary.MemberRoleSteward, 1)
 	e.join(t, "bob", toollibrary.MemberRoleMember, 2)
@@ -451,6 +457,7 @@ func TestBorrowingRules(t *testing.T) {
 // replaced borrowed and then marked the tool on loan in a second call, so a crash in between left
 // a loan on an "available" tool; now there is no in between.
 func TestBorrowIsAllOrNothing(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	e.join(t, "alice", toollibrary.MemberRoleSteward, 1)
 	e.join(t, "bob", toollibrary.MemberRoleSteward, 1) // so alice isn't the last active steward
@@ -484,6 +491,7 @@ func TestBorrowIsAllOrNothing(t *testing.T) {
 
 // Many members race for one tool: exactly one borrow wins, and the rest are told the tool is out.
 func TestConcurrentBorrowsOfOneTool(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	e.addTool(t, "t1", "Pressure washer", toollibrary.ToolCategoryPower)
 	for i := 0; i < 10; i++ {
@@ -523,6 +531,7 @@ func TestConcurrentBorrowsOfOneTool(t *testing.T) {
 // "My loans" lists current loans, soonest due first. It is a copy index, so it is readable
 // consistently the moment a loan is taken, and a returned loan's copy is deleted with it.
 func TestMyLoans(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	e.join(t, "alice", toollibrary.MemberRoleSteward, 10)
 	now := time.Now().UTC().Truncate(time.Second)
@@ -552,6 +561,7 @@ func TestMyLoans(t *testing.T) {
 }
 
 func TestOverdueRange(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	e.join(t, "alice", toollibrary.MemberRoleSteward, 10)
 	now := time.Now().UTC().Truncate(time.Second)
@@ -596,6 +606,7 @@ func pickupCode(code string) string {
 }
 
 func TestHolds(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	e.join(t, "alice", toollibrary.MemberRoleSteward, 2)
 	e.join(t, "bob", toollibrary.MemberRoleMember, 2)
@@ -661,6 +672,7 @@ func TestHolds(t *testing.T) {
 // version wrote (after a rollback, or during a rolling deploy), and keeps the fields it doesn't
 // know, on every write path.
 func TestOlderCodeKeepsNewerFields(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	e.join(t, "alice", toollibrary.MemberRoleSteward, 2)
 	e.join(t, "bob", toollibrary.MemberRoleSteward, 2)
@@ -695,6 +707,7 @@ func TestOlderCodeKeepsNewerFields(t *testing.T) {
 
 // Concurrent borrowers race for a member's last slot: exactly the limit get through.
 func TestConcurrentBorrowsRespectTheLimit(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	e.join(t, "alice", toollibrary.MemberRoleSteward, 3)
 	for i := 0; i < 10; i++ {
@@ -729,6 +742,7 @@ func TestConcurrentBorrowsRespectTheLimit(t *testing.T) {
 	}
 }
 
+// TestCursors doesn't run in parallel: signing cursors applies to every query in the process.
 func TestCursors(t *testing.T) {
 	e := setup(t)
 	for i := 0; i < 5; i++ {
@@ -768,6 +782,7 @@ func TestCursors(t *testing.T) {
 // {name|lower} in the directory's sort key orders names case-insensitively, and {email|lower} in the
 // claim makes email unique and findable regardless of case.
 func TestCaseInsensitiveKeys(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	for id, name := range map[string]string{"m1": "Zoe", "m2": "adam", "m3": "Bea", "m4": "carl"} {
 		must(t, e.st.Members.Join(ctx, &toollibrary.Member{LibraryID: "lib1", MemberID: id, Name: name,
@@ -808,6 +823,7 @@ func TestCaseInsensitiveKeys(t *testing.T) {
 // Barcodes are a set with one claim per element: a tool can carry several labels, and each label
 // identifies one tool in its library.
 func TestBarcodes(t *testing.T) {
+	t.Parallel()
 	e := setup(t)
 	add := func(lib, id string, codes ...string) error {
 		return e.st.Tools.Add(ctx, &toollibrary.Tool{LibraryID: lib, ToolID: id, Name: "Tool " + id, Category: toollibrary.ToolCategoryHand,

@@ -18,6 +18,7 @@ import (
 // (DYNAGO_TEST_AWS): DynamoDB Local has no pages worth the name, and it takes a few minutes and
 // well under a dollar.
 func TestMigrationAtVolume(t *testing.T) {
+	t.Parallel()
 	if !testdb.AWS() {
 		t.Skip("runs against AWS only: set " + testdb.EnvAWS)
 	}
