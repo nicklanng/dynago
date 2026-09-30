@@ -1,12 +1,15 @@
 # Changelog
 
 All notable changes to dynago are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project will use
-[semantic versioning](https://semver.org) once released.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
+[semantic versioning](https://semver.org). Before 1.0, a minor version may change the schema
+format, the generated code and the runtime API; the changelog says how to move.
 
 ## [Unreleased]
 
-First version.
+## [0.1.0] - 2026-09-30
+
+First release.
 
 ### Analysis and review
 
@@ -152,3 +155,6 @@ First version.
   command and the conversion the last move needs. End-to-end tests
   (`internal/e2e`) show a refused borrow leaves the table unchanged and ten racing borrowers get
   one tool.
+
+[Unreleased]: https://github.com/nicklanng/dynago/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/nicklanng/dynago/releases/tag/v0.1.0
