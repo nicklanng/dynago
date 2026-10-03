@@ -1319,7 +1319,7 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 		if c.Shards > 1 {
 			r.errorf("%s: %s is sharded, so no single item holds its values to check", where, target)
 		}
-		if len(raw.Set)+len(raw.Add)+len(raw.Patch) > 0 || raw.Optional || raw.Consume {
+		if len(raw.Set)+len(raw.Add)+len(raw.Patch) > 0 || raw.Optional || raw.Consume || raw.Ensure != nil {
 			r.errorf("%s: a counter can only be checked with when (an absent value counts as 0)", where)
 		}
 	default:
@@ -1437,7 +1437,7 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 		}
 		for _, s := range req.Sets {
 			if s.Field == f {
-				r.errorf("%s: %s is changed more than once across set, add and patch", where, name)
+				r.errorf("%s: %s is given more than once across set, add, patch and ensure", where, name)
 				return nil
 			}
 		}
@@ -1479,6 +1479,55 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 			req.Sets = append(req.Sets, SetConst{Field: f, Source: sf, IfSet: true})
 		}
 	}
+	if raw.Ensure != nil {
+		req.Ensure = true
+		for _, en := range *raw.Ensure {
+			f := changes("ensure", en.Key)
+			if f == nil {
+				continue
+			}
+			if ref, ok := fieldRef(en.Value); ok {
+				if sf := r.source(e, where+" ensure "+en.Key, ref, te, f); sf != nil {
+					req.EnsureSets = append(req.EnsureSets, SetConst{Field: f, Source: sf})
+				}
+				continue
+			}
+			v, err := coerce(f, en.Value)
+			if err != nil {
+				r.errorf("%s ensure: %s: %v", where, en.Key, err)
+				continue
+			}
+			req.EnsureSets = append(req.EnsureSets, SetConst{Field: f, Value: v})
+		}
+		switch {
+		case req.Optional:
+			r.errorf("%s: ensure creates the %s when it is absent, and optional lets the write go ahead without one: choose one", where, te.Name)
+		case req.Consume:
+			r.errorf("%s: ensure creates the %s when it is absent, and consume deletes it: choose one", where, te.Name)
+		}
+		// A new item needs its required fields: what gives none of them a value can never create it.
+		given := map[*Field]SetConst{}
+		for _, s := range append(append([]SetConst{}, req.EnsureSets...), req.Sets...) {
+			given[s.Field] = s
+		}
+		for _, f := range te.Fields {
+			s, ok := given[f]
+			switch {
+			case !f.Required || f.Key:
+			case !ok:
+				r.errorf("%s: %s.%s is required, so a %s this write creates needs it: give it in ensure (%s: \"{field}\" or a constant)", where, te.Name, f.Name, te.Name, f.Name)
+			case s.Fixes() && isZero(s.Value):
+				r.errorf("%s ensure: %s.%s is required, so it cannot be given its zero value", where, te.Name, f.Name)
+			}
+		}
+		for _, c := range te.Counters {
+			for _, v := range c.Values {
+				if v.LimitArg && CanGrow(req.TargetCreate(), v, true) {
+					r.errorf("%s: creating a %s can grow %s.%s, whose limit callers supply; only %s's own writes can take it", where, te.Name, c.Name, v.Name, te.Name)
+				}
+			}
+		}
+	}
 	if req.Optional && len(req.When) == 0 && !req.Writes() {
 		r.errorf("%s: optional with no when, set or consume checks nothing", where)
 	}
@@ -1500,6 +1549,10 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 			}
 		}
 		req.Fast = !req.Optional && transitionable(te, tw, changed)
+	}
+	if req.Ensure && len(req.Sets) == 0 {
+		// Nothing to change on one that is there: a check, which finds out if it isn't.
+		req.Fast = true
 	}
 	if req.Consume {
 		req.Fast = !te.HasDerived()
@@ -1574,6 +1627,12 @@ func touchesCounter(w *Write, c *Counter) bool {
 // TargetWrite describes the change a requirement makes to its target as an update of it.
 func (rq *Require) TargetWrite() *Write {
 	return &Write{Name: "requires", Entity: rq.Target, Kind: WriteUpdate, Sets: rq.Sets, When: rq.When}
+}
+
+// TargetCreate describes the creation a requirement with ensure makes when its target is absent,
+// as a create of it.
+func (rq *Require) TargetCreate() *Write {
+	return &Write{Name: "requires", Entity: rq.Target, Kind: WriteCreate, Sets: append(append([]SetConst{}, rq.EnsureSets...), rq.Sets...)}
 }
 
 // source resolves a field of the writing entity e that supplies a value for field tf of another

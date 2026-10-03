@@ -450,8 +450,12 @@ func WriteCostOf(m *schema.Model, e *schema.Entity, w *schema.Write, readFirst b
 			ter := EntitySizes(m, rq.Target)
 			tw := rq.TargetWrite()
 			label := rq.Name + " (" + rq.Effect(e.Name) + ")"
-			if rq.Consume {
+			switch {
+			case rq.Consume:
 				tw = &schema.Write{Name: "requires", Entity: rq.Target, Kind: schema.WriteDelete}
+			case rq.Ensure:
+				// Costed as the creation: the most the requirement writes.
+				tw = rq.TargetCreate()
 			}
 			write(Target{Kind: TargetItem, Entity: rq.Target}, false, false, label, ter.Item, once)
 			derivedWrites(rq.Target, tw, ter, rq.Name+"'s ", write)

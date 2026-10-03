@@ -77,6 +77,14 @@ func (a *analyzer) lifecycles() {
 							lc.Deleted = append(lc.Deleted, oe.Name+"."+w.Name)
 							continue
 						}
+						if rq.Ensure {
+							// It may create the item: with the value it gives, or the caller's.
+							to := Any
+							if v, ok := setValue(rq.TargetCreate().Sets, f); ok {
+								to = v
+							}
+							lc.Transitions = append(lc.Transitions, Transition{To: to, By: oe.Name + "." + w.Name})
+						}
 						if ts := transitions(rq.Sets, rq.When, f, oe.Name+"."+w.Name); len(ts) > 0 {
 							lc.Transitions = append(lc.Transitions, ts...)
 							changes = true
@@ -188,16 +196,8 @@ func (a *analyzer) guarantees() {
 		for _, w := range e.Writes {
 			var parts []string
 			for _, rq := range w.Requires {
-				eff := rq.Effect(e.Name)
-				if rq.Optional && len(rq.When) == 0 {
-					parts = append(parts, eff) // it checks nothing: only the effect matters
-					continue
-				}
-				t := "requires " + rq.Condition(e.Name)
-				if eff != "" {
-					t += ", and " + eff
-				}
-				parts = append(parts, t)
+				// One that checks nothing says only what it does.
+				parts = append(parts, rq.Sentence(e.Name, ", and "))
 			}
 			if len(parts) > 0 {
 				a.r.Guarantees = append(a.r.Guarantees, Guarantee{e, "requires", fmt.Sprintf("%s %s, in one transaction.", w.Name, strings.Join(parts, "; ")), e.Name + "." + w.Name})

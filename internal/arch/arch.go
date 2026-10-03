@@ -367,11 +367,7 @@ func does(w *schema.Write) string {
 		parts = append(parts, "when "+schema.PredText(w.When, w.Entity.Name))
 	}
 	for _, rq := range w.Requires {
-		t := "requires " + rq.Condition(w.Entity.Name)
-		if eff := rq.Effect(w.Entity.Name); eff != "" {
-			t += " and " + eff
-		}
-		parts = append(parts, t)
+		parts = append(parts, rq.Sentence(w.Entity.Name, " and "))
 	}
 	if w.VersionRequired {
 		parts = append(parts, "version required")

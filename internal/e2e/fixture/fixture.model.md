@@ -11,10 +11,10 @@ Table generation **1**: `fixture-g1`.
 | | |
 |---|---|
 | Entities | 4: Account, Depot, Parcel, Damage |
-| Reads | 15: 5 by key, 4 queries, 5 counters, 1 scan |
-| Writes | 11: 9 in a transaction, 5 reading the item first |
+| Reads | 16: 5 by key, 4 queries, 6 counters, 1 scan |
+| Writes | 14: 12 in a transaction, 5 reading the item first |
 | Indexes | 1 GSI, 1 copy index (Known, Parcel.OnSite) |
-| Uniqueness claims, counters | 0, 5 |
+| Uniqueness claims, counters | 0, 6 |
 | Workload | No peak factor declared (peaks taken as the averages); volumes declared for 0 of 4 entities |
 | Cost | $0.00/month at the declared volumes and rates |
 | Findings | 0 errors, 0 warnings, 1 note open; 0 accepted |
@@ -40,7 +40,7 @@ erDiagram
 
 | Entity | Related to | How |
 |---|---|---|
-| Parcel | Depot | Lives in (or under) its Depot's partition, and holds its Depot's key in `depotId`. |
+| Parcel | Depot | Lives in (or under) its Depot's partition, and holds its Depot's key in `depotId`; Arrive, Leave require it. |
 | Damage | Parcel | Lives in (or under) its Parcel's partition, and holds its Parcel's key in `depotId`, `parcelId`; File, Dispute require it. |
 
 ### Guarantees
@@ -49,6 +49,9 @@ What the generated code enforces on every write, so no bug or race elsewhere can
 
 - **Account**
   - HandOver requires the Account to exist with status = "pending", and sets its status to "active", in one transaction. *(Account.HandOver)*
+- **Parcel**
+  - Arrive requires any Depot there is to have closed = false, and creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels, in one transaction. *(Parcel.Arrive)*
+  - Leave creates the Depot if there is none, in one transaction. *(Parcel.Leave)*
 - **Damage**
   - File requires the Parcel to exist with state in ["received", "shelved", "returned"], and sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages, in one transaction. *(Damage.File)*
   - Dispute requires the Parcel to exist with state != "lost", and sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes, in one transaction. *(Damage.Dispute)*
@@ -84,6 +87,8 @@ stateDiagram-v2
   state "returned" as s3
   state "lost" as s4
   [*] --> s0: Receive
+  [*] --> s0: Arrive
+  [*] --> s2: Leave
   s0 --> s1: Shelve
   s0 --> s2: SendOut
   s1 --> s2: SendOut
@@ -106,6 +111,7 @@ Every read the code can make. A read that isn't listed has no method, so a new w
 | `Account.Region` | The RegionCounts counts for a region. | counter RegionCounts (GetItem) | eventual (not stated) | the counts | 0.5 | — |
 | `Account.Export` | Every Account in the table. | Scan of the whole table, one page per call | eventual (not stated) | pages of 2, a page at a time (volume not declared) | 0.5 | — |
 | `Depot.Get` | One Depot, by depotId. | GetItem | eventual (not stated) | one | 0.5 | — |
+| `Depot.Totals` | The DepotTotals counts for a . | counter DepotTotals (GetItem) | immediate | the counts | 1 | — |
 | `Depot.Everything` | The Depot, Parcels, Damages under one depotId, each kind on its own. | Query of the whole partition, keeping these kinds | immediate | pages of 4, a page at a time (volume not declared) | 1 | — |
 | `Depot.Newest` | Damages, Parcels under one depotId, each kind on its own. | Query of the whole partition, keeping these kinds | eventual | pages of 50, a page at a time (volume not declared) | 2.5 / 4.5 | — |
 | `Parcel.Get` | One Parcel, by depotId and parcelId. | GetItem | eventual (not stated) | one | 0.5 | — |
@@ -128,8 +134,11 @@ Every write the code can make, and everything each changes. Each is atomic: all 
 | `Account.Open` | Creates a Account | no Account at the key | Account<br>counter TenantCounts<br>counter RegionCounts | no | transaction, 3 items | 6 | — |
 | `Account.Activate` | Sets `status` = "active" | the Account exists; status = "pending" | Account<br>counter TenantCounts<br>counter RegionCounts | yes | transaction, 3 items | 6 | — |
 | `Account.HandOver` | Sets `successorId`, sets `status` = "closed", sets the Account's status to "active" | the Account exists; status = "active"; the Account exists with status = "pending" | Account<br>counter TenantCounts<br>counter RegionCounts<br>Account (sets its status to "active")<br>Account's counter TenantCounts<br>Account's counter RegionCounts | yes | transaction, 6 items | 12 | — |
-| `Depot.Open` | Creates a Depot | no Depot at the key | Depot | no | single item | 1 | — |
+| `Depot.Open` | Creates a Depot | no Depot at the key | Depot<br>counter DepotTotals | no | transaction, 2 items | 4 | — |
+| `Depot.Close` | Sets `closed` = true | the Depot exists | Depot | no | single item | 1 | — |
 | `Parcel.Receive` | Creates a Parcel, sets `state` = "received" | no Parcel at the key | Parcel<br>copy OnSite<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts | no | transaction, 4 items | 9 | — |
+| `Parcel.Arrive` | Creates a Parcel, sets `state` = "received", creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels | no Parcel at the key; any Depot there is has closed = false (none is created) | Parcel<br>copy OnSite<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts<br>Depot (creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels)<br>Depot's counter DepotTotals | no | transaction, 6 items | 13 | — |
+| `Parcel.Leave` | Creates a Parcel, sets `state` = "out", creates the Depot if there is none | no Parcel at the key | Parcel<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts<br>Depot (creates the Depot if there is none)<br>Depot's counter DepotTotals | no | transaction, 5 items | 11 | — |
 | `Parcel.Shelve` | Sets `state` = "shelved" | the Parcel exists; state = "received" | Parcel<br>copy OnSite<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes | transaction, 5 items | 10 | — |
 | `Parcel.SendOut` | Sets `state` = "out" | the Parcel exists; state in ["received", "shelved"] | Parcel<br>copy OnSite (removed)<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes | transaction, 5 items | 10 | — |
 | `Parcel.Lose` | Sets `state` = "lost" | the Parcel exists; state != "lost" | Parcel<br>copy OnSite (removed)<br>GSI Known entry (removed)<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes | transaction, 5 items | 11 | — |
@@ -153,8 +162,8 @@ A GSI is maintained by DynamoDB a moment after each write: writes stay cheap, an
 
 | Index | Kind | Keys | Projection | Read by | Why this kind | The other kind |
 |---|---|---|---|---|---|---|
-| `Parcel.OnSite` | copy | `D#{depotId}#ONSITE` / `P#{parcelId}`; only when `state in ["received", "shelved", "returned"]` | `state`, `damages` plus key fields | OnSite | chosen: OnSite needs immediate freshness | As a GSI: Parcel.Receive 9 → 8 WRU (4 → 3 items); Parcel.Shelve 10 → 9 WRU (5 → 4 items); Parcel.SendOut 10 → 9 WRU (5 → 4 items); Parcel.Lose 11 → 10 WRU (5 → 4 items); Damage.File 8 → 7 WRU (4 → 3 items); OnSite would lose immediate freshness. |
-| `Parcel.Known` | GSI `Known` | `KNOWN#{depotId}` / `P#{parcelId}`; only when `state != "lost"` | key fields only | Known | chosen: no read through it needs immediate freshness | As a copy: Parcel.Receive 9 → 10 WRU (4 → 5 items); Parcel.Lose 11 → 12 WRU (5 → 6 items); reads could see writes immediately. |
+| `Parcel.OnSite` | copy | `D#{depotId}#ONSITE` / `P#{parcelId}`; only when `state in ["received", "shelved", "returned"]` | `state`, `damages` plus key fields | OnSite | chosen: OnSite needs immediate freshness | As a GSI: Parcel.Receive 9 → 8 WRU (4 → 3 items); Parcel.Arrive 13 → 12 WRU (6 → 5 items); Parcel.Shelve 10 → 9 WRU (5 → 4 items); Parcel.SendOut 10 → 9 WRU (5 → 4 items); Parcel.Lose 11 → 10 WRU (5 → 4 items); Damage.File 8 → 7 WRU (4 → 3 items); OnSite would lose immediate freshness. |
+| `Parcel.Known` | GSI `Known` | `KNOWN#{depotId}` / `P#{parcelId}`; only when `state != "lost"` | key fields only | Known | chosen: no read through it needs immediate freshness | As a copy: Parcel.Receive 9 → 10 WRU (4 → 5 items); Parcel.Arrive 13 → 14 WRU (6 → 7 items); Parcel.Leave 11 → 12 WRU (5 → 6 items); Parcel.Lose 11 → 12 WRU (5 → 6 items); reads could see writes immediately. |
 
 ### Partition map
 
@@ -177,23 +186,27 @@ flowchart LR
     p2m4["Damage"]
     p2m5["counter ParcelDamages"]
   end
-  subgraph p3["D#35;{depotId}#35;ONSITE"]
-    p3m0["Parcel OnSite copy"]
+  subgraph p3["DEPOTS"]
+    p3m0["counter DepotTotals"]
   end
-  subgraph p4["GSI Known: KNOWN#35;{depotId}"]
-    p4m0["Parcel Known entry"]
+  subgraph p4["D#35;{depotId}#35;ONSITE"]
+    p4m0["Parcel OnSite copy"]
+  end
+  subgraph p5["GSI Known: KNOWN#35;{depotId}"]
+    p5m0["Parcel Known entry"]
   end
   r_Account_Get{{"Account.Get"}} --> p0
   r_Account_Tenant{{"Account.Tenant"}} --> p0
   r_Account_Region{{"Account.Region"}} --> p1
   r_Depot_Get{{"Depot.Get"}} --> p2
+  r_Depot_Totals{{"Depot.Totals"}} --> p3
   r_Depot_Everything{{"Depot.Everything"}} --> p2
   r_Depot_Newest{{"Depot.Newest"}} --> p2
   r_Parcel_Get{{"Parcel.Get"}} --> p2
   r_Parcel_GetSeveral{{"Parcel.GetSeveral"}} --> p2
   r_Parcel_States{{"Parcel.States"}} --> p2
-  r_Parcel_OnSite{{"Parcel.OnSite"}} --> p3
-  r_Parcel_Known{{"Parcel.Known"}} --> p4
+  r_Parcel_OnSite{{"Parcel.OnSite"}} --> p4
+  r_Parcel_Known{{"Parcel.Known"}} --> p5
   r_Parcel_Counts{{"Parcel.Counts"}} --> p2
   r_Damage_Get{{"Damage.Get"}} --> p2
   r_Damage_Damaged{{"Damage.Damaged"}} --> p2
@@ -210,6 +223,7 @@ Each row is every partition key value one key pattern renders: *Keys* is how man
 | `T#{tenantId}` | base table | unknown | Account: unknown<br>counter TenantCounts: 1 | unknown / unknown | yes: Account never removed | no rates declared | — |
 | `R#{region}` | base table | unknown | counter RegionCounts: 1 | 136 B / 136 B | no | no rates declared | — |
 | `D#{depotId}` | base table | unknown | Depot: 1<br>Parcel: unknown<br>counter DepotParcels: 1<br>counter StateCounts: unknown<br>Damage: unknown<br>counter ParcelDamages: unknown | unknown / unknown | yes: Parcel, Damage never removed | no rates declared | — |
+| `DEPOTS` | base table | unknown | counter DepotTotals: 1 | 119 B / 119 B | no | no rates declared | — |
 | `D#{depotId}#ONSITE` | base table | unknown | Parcel OnSite copy: unknown | unknown / unknown | no | no rates declared | — |
 | `KNOWN#{depotId}` | GSI Known | unknown | Parcel Known entry: unknown | unknown / unknown | no | no rates declared | — |
 
@@ -226,7 +240,7 @@ Unknown counts: nothing declares how many items share a value of `tenantId` in `
 | Entity | Expected items | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
 |---|---|---|---|---|---|
 | Account | not declared | 277 B / 543 B | 0.00 GB | $0.00 | $0.00 |
-| Depot | not declared | 176 B / 310 B | 0.00 GB | $0.00 | $0.00 |
+| Depot | not declared | 198 B / 335 B | 0.00 GB | $0.00 | $0.00 |
 | Parcel | not declared | 372 B / 732 B | 0.00 GB | $0.00 | $0.00 |
 | Damage | not declared | 286 B / 596 B | 0.00 GB | $0.00 | $0.00 |
 
@@ -335,10 +349,15 @@ Schema version **1**. Go type `Depot`, store `Store.Depots`.
 ```mermaid
 flowchart LR
   item_Depot["Depot item<br/>D#35;{depotId}<br/>DEPOT"]
+  counter_DepotTotals["counter DepotTotals<br/>DEPOTS / TOTALS"]
   w_Open(["Open"])
-  w_Open --> item_Depot
+  w_Open --> item_Depot & counter_DepotTotals
+  w_Close(["Close"])
+  w_Close --> item_Depot
   r_Get{{"Get"}}
   item_Depot --> r_Get
+  r_Totals{{"Totals"}}
+  counter_DepotTotals --> r_Totals
   r_Everything{{"Everything"}}
   item_Depot --> r_Everything
   r_Newest{{"Newest"}}
@@ -353,6 +372,8 @@ Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB
 |---|---|---|---|---|
 | `depotId` | string | `depotId` | 20 / 64 B | key |
 | `name` | string | `name` | 20 / 64 B |  |
+| `closed` | bool | `closed` | 1 / 1 B |  |
+| `parcels` | int | `parcels` | 8 / 11 B |  |
 
 #### Stored items
 
@@ -360,13 +381,20 @@ Every item that exists because of a Depot, and what keeps it up to date.
 
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
-| **Depot** | `D#{depotId}` | `DEPOT` | `D#{depotId}`<br>`DEPOT` | 176 B / 310 B | the writes below |
+| **Depot** | `D#{depotId}` | `DEPOT` | `D#{depotId}`<br>`DEPOT` | 198 B / 335 B | the writes below |
+| Counter `DepotTotals` | `DEPOTS` | `TOTALS` | `DEPOTS`<br>`TOTALS` | ~119 B | the writes below, with atomic ADDs in the same transaction. |
+
+#### Counters
+
+- **DepotTotals**, keyed by . 
+  - `depots`: count of items.
 
 #### Access patterns
 
 | Method | Reads | Key condition | Consistency | Requests | RRU per call p50/p99 |
 |---|---|---|---|---|---|
 | `Get` | item by key | `PK = D#{depotId}`, `SK = DEPOT` | eventual | GetItem | 0.5 |
+| `Totals` | counter `DepotTotals` | `PK = DEPOTS`, `SK = TOTALS` | strong | GetItem | 1 |
 | `Everything` | the whole partition, keeping `Depot`, `Parcel`, `Damage`, page 4 (max 100) | `PK = D#{depotId}`, filtered by `_t`, ascending | strong | Query | 1 |
 | `Newest` | the whole partition, keeping `Damage`, `Parcel`, page 50 (max 100) | `PK = D#{depotId}`, filtered by `_t`, descending | eventual | Query | 2.5 / 4.5 |
 
@@ -374,7 +402,8 @@ Every item that exists because of a Depot, and what keeps it up to date.
 
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
-| `Open` | create (fails if it exists) | Depot | no | single item | — | 1 | `ErrDepotExists` |
+| `Open` | create (fails if it exists) | Depot<br>counter DepotTotals | no | transaction (2 items) | — | 4 | `ErrDepotExists` |
+| `Close` | set `closed` = true | Depot | no | single item | optional | 1 | `ErrDepotNotFound`<br>`dynago.ErrVersionMismatch` (with a version) |
 
 ### Parcel
 
@@ -390,6 +419,14 @@ flowchart LR
   counter_StateCounts["counter StateCounts<br/>D#35;{depotId} / STATE#35;{state}"]
   w_Receive(["Receive"])
   w_Receive --> item_Parcel & ix_OnSite & counter_DepotParcels & counter_StateCounts
+  w_Arrive(["Arrive"])
+  w_Arrive --> item_Parcel & ix_OnSite & counter_DepotParcels & counter_StateCounts
+  other_Depot["Depot item"]
+  w_Arrive -. checks and changes .-> other_Depot
+  w_Leave(["Leave"])
+  w_Leave --> item_Parcel & ix_OnSite & counter_DepotParcels & counter_StateCounts
+  other_Depot["Depot item"]
+  w_Leave -. checks .-> other_Depot
   w_Shelve(["Shelve"])
   w_Shelve --> item_Parcel & ix_OnSite & counter_DepotParcels & counter_StateCounts
   w_SendOut(["SendOut"])
@@ -468,6 +505,8 @@ Every item that exists because of a Parcel, and what keeps it up to date.
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
 | `Receive` | create (fails if it exists), set `state` = "received" | Parcel<br>copy OnSite<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts | no | transaction (4 items) | — | 9 | `ErrParcelExists` |
+| `Arrive` | create (fails if it exists), set `state` = "received"; requires any Depot there is to have closed = false and creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels | Parcel<br>copy OnSite<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts<br>Depot (creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels)<br>Depot's counter DepotTotals | no | transaction (6 items) | — | 13 | `ErrParcelExists`<br>`ErrParcelArriveRequiresDepot` |
+| `Leave` | create (fails if it exists), set `state` = "out"; creates the Depot if there is none | Parcel<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts<br>Depot (creates the Depot if there is none)<br>Depot's counter DepotTotals | no | transaction (5 items) | — | 11 | `ErrParcelExists` |
 | `Shelve` | set `state` = "shelved" when `state = "received"` | Parcel<br>copy OnSite<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes (1 consistent read; none with `dynago.From`) | transaction (5 items) | optional | 10 | `ErrParcelNotFound`<br>`ErrParcelShelvePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 | `SendOut` | set `state` = "out" when `state in ["received", "shelved"]` | Parcel<br>copy OnSite (removed)<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes (1 consistent read; none with `dynago.From`) | transaction (5 items) | optional | 10 | `ErrParcelNotFound`<br>`ErrParcelSendOutPrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 | `Lose` | set `state` = "lost" when `state != "lost"` | Parcel<br>copy OnSite (removed)<br>GSI Known entry (removed)<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes (1 consistent read; none with `dynago.From`) | transaction (5 items) | optional | 11 | `ErrParcelNotFound`<br>`ErrParcelLosePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |

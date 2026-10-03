@@ -1056,6 +1056,16 @@
           "$ref": "#/$defs/predicates",
           "description": "Changes the required entity in the same transaction, maintaining its counters, indexes, claims and copies. Values are constants or \"{field}\" of this entity."
         },
+        "ensure": {
+          "type": "object",
+          "description": "Creates the required entity when it is absent, in the same transaction, with its key from key, these fields (constants or \"{field}\" of this entity), and set, add and patch applied; its counters, claims and copies are written as a create of it writes them. One that is there is checked and changed as without ensure. May be empty: {}.",
+          "propertyNames": {
+            "$ref": "#/$defs/camelName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/scalar"
+          }
+        },
         "add": {
           "type": "object",
           "description": "Adds to int fields of the required entity in the same transaction: a whole number (negative to subtract) or \"{field}\", an int field of this entity.",

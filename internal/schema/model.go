@@ -866,6 +866,10 @@ type Require struct {
 	// Optional lets the write go ahead when the target is absent or expired.
 	Optional bool
 	Consume  bool
+	// Ensure makes the write create the target when it is absent, with EnsureSets and then Sets
+	// applied to a new item; When and Sets apply to one that is there, as without it.
+	Ensure     bool
+	EnsureSets []SetConst
 	// Fast is true when the change to the target can be written without reading it first: its
 	// derived changes are known from its key and the state `when` pins. Otherwise it is read.
 	Fast    bool
@@ -873,7 +877,7 @@ type Require struct {
 }
 
 // Writes reports whether the requirement changes its target, rather than only checking it.
-func (rq *Require) Writes() bool { return len(rq.Sets) > 0 || rq.Consume }
+func (rq *Require) Writes() bool { return len(rq.Sets) > 0 || rq.Consume || rq.Ensure }
 
 // Sources returns the fields of the writing entity the requirement reads: its key and references.
 func (rq *Require) Sources() []*Field {
@@ -886,7 +890,7 @@ func (rq *Require) Sources() []*Field {
 			out = append(out, p.Source)
 		}
 	}
-	for _, s := range rq.Sets {
+	for _, s := range append(append([]SetConst{}, rq.Sets...), rq.EnsureSets...) {
 		if s.Source != nil {
 			out = append(out, s.Source)
 		}

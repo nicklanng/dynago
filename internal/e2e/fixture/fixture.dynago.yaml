@@ -52,19 +52,31 @@ entities:
             set: { status: active }
 
   # A depot, its parcels and their damage reports share a partition, and are read together.
+  # A parcel arriving at a depot nobody has opened yet creates the depot in the same transaction
+  # (ensure), counted among the depots like any other.
   Depot:
     fields:
       depotId: string
       name: string
+      closed: bool
+      parcels: int
     key:
       pk: "D#{depotId}"
       sk: "DEPOT"
+    counters:
+      DepotTotals:
+        pk: "DEPOTS"
+        sk: "TOTALS"
+        values:
+          depots: count
     access:
       Get: get
+      Totals: { counter: DepotTotals, freshness: immediate }
       Everything: { query: partition, of: [Depot, Parcel, Damage], page: 4, freshness: immediate }
       Newest: { query: partition, of: [Damage, Parcel], order: desc, freshness: eventual }
     writes:
       Open: create
+      Close: { set: { closed: true } }
 
   # A parcel moves through a depot's states. Its index, counter values and preconditions exclude a
   # state (not) or list several (in), rather than naming one.
@@ -116,6 +128,20 @@ entities:
       Counts: { counter: DepotParcels }
     writes:
       Receive: { create: true, set: { state: received } }
+      Arrive:
+        create: true
+        set: { state: received }
+        requires:
+          Depot:
+            key: { depotId: depotId }
+            when: { closed: false }
+            ensure: { name: unnamed }
+            add: { parcels: 1 }
+      Leave:
+        create: true
+        set: { state: out }
+        requires:
+          Depot: { key: { depotId: depotId }, ensure: {} }
       Shelve: { set: { state: shelved }, when: { state: received } }
       SendOut: { set: { state: out }, when: { state: { in: [received, shelved] } } }
       Lose: { set: { state: lost }, when: { state: { not: lost } } }

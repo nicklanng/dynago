@@ -487,6 +487,8 @@ type RawRequire struct {
 	When Ordered[any]    `yaml:"when"`
 	// Set changes the required item in the same transaction.
 	Set Ordered[any] `yaml:"set"`
+	// Ensure creates the required item when it is absent, with these fields (and set applied).
+	Ensure *Ordered[any] `yaml:"ensure"`
 	// Add adds to int fields of the required item.
 	Add Ordered[any] `yaml:"add"`
 	// Patch sets fields of the required item from this entity's fields, where those have a value.

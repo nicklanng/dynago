@@ -531,6 +531,8 @@ func (s *AccountStore) requireHandOverAccount(ctx context.Context, e *Account, r
 type Depot struct {
 	DepotID string `dynamo:"depotId"`
 	Name    string `dynamo:"name,omitempty"`
+	Closed  bool   `dynamo:"closed,omitempty"`
+	Parcels int64  `dynamo:"parcels,omitempty"`
 
 	loaded *depotLoaded // set when the store returns the entity
 	stamps dynago.Timestamps
@@ -569,6 +571,9 @@ func (e *Depot) clone() Depot {
 
 // checkKeyParts rejects values containing a character their key templates use as a separator.
 func (e *Depot) checkKeyParts() error {
+	if err := dynago.CheckKeyPart("depotId", e.DepotID, "#"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -585,6 +590,9 @@ func (e *Depot) Key() DepotKey {
 func (k DepotKey) dynamoKey() (dynago.Key, error) {
 	if k.DepotID == "" {
 		return dynago.Key{}, fmt.Errorf("%w: Depot needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", k.DepotID, "#"); err != nil {
+		return dynago.Key{}, err
 	}
 	return dynago.Key{PK: "D#" + k.DepotID, SK: "DEPOT"}, nil
 }
@@ -611,13 +619,35 @@ type depotItem struct {
 }
 
 // depotKnown is every attribute this code writes on Depot items.
-var depotKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "depotId": true, "name": true}
+var depotKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "depotId": true, "name": true, "closed": true, "parcels": true}
 
 // depotToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
 // unknown).
 func depotToItem(e *Depot, key dynago.Key, rev int64, created, updated string) *depotItem {
 	it := &depotItem{Depot: *e, PK: key.PK, SK: key.SK, T: "Depot", V: depotVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
 	return it
+}
+
+// DepotTotals is an atomic counter maintained by every Depot write.
+type DepotTotals struct {
+	// Depots counts items.
+	Depots int64 `dynamo:"depots"`
+}
+
+// DepotTotalsKey identifies a DepotTotals counter.
+type DepotTotalsKey struct {
+}
+
+// depotDerived returns the counter contributions, claims and copies that exist because of e.
+func depotDerived(e *Depot, owner dynago.Key) []dynago.Derived {
+	_ = owner // only sharded counters use it
+	var d []dynago.Derived
+	// counter DepotTotals
+	if true {
+		k := dynago.Key{PK: "DEPOTS", SK: "TOTALS"}
+		d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: "DepotTotals", Attr: "depots", Amount: 1})
+	}
+	return d
 }
 
 // DepotStore reads and writes Depot items. Only the access patterns declared in the schema
@@ -663,6 +693,44 @@ func depotDecodeAll(raws []dynamo.Item) ([]Depot, error) {
 	return out, nil
 }
 
+// from returns the entity passed with dynago.From, checked to be this item and read from the
+// store, or nil if none was passed.
+func (s *DepotStore) from(key dynago.Key, o dynago.WriteOptions) (*Depot, error) {
+	if o.From == nil {
+		return nil, nil
+	}
+	from, ok := o.From.(*Depot)
+	if !ok || from == nil || from.loaded == nil {
+		return nil, fmt.Errorf("%w: dynago.From needs a *Depot read from its own item, not built by hand or read through a copy index", dynago.ErrVersionRequired)
+	}
+	if fk, err := from.Key().dynamoKey(); err != nil || fk != key {
+		return nil, fmt.Errorf("%w: the Depot passed with dynago.From is a different item", dynago.ErrInvalidKey)
+	}
+	return from, nil
+}
+
+// guard resolves the conditions a single-request write must meet.
+func (s *DepotStore) guard(key dynago.Key, o dynago.WriteOptions, required bool) (dynago.Guard, error) {
+	expect, err := o.ExpectedRev()
+	if err != nil {
+		return dynago.Guard{}, err
+	}
+	from, err := s.from(key, o)
+	if err != nil {
+		return dynago.Guard{}, err
+	}
+	if from != nil {
+		if expect != 0 && expect != from.loaded.rev {
+			return dynago.Guard{}, dynago.ErrVersionMismatch
+		}
+		expect = from.loaded.rev
+	}
+	if required && expect == 0 {
+		return dynago.Guard{}, dynago.ErrVersionRequired
+	}
+	return dynago.Guard{ExpectRev: expect, NotFound: ErrDepotNotFound}, nil
+}
+
 // Get reads a Depot by primary key with one eventually consistent GetItem.
 func (s *DepotStore) Get(ctx context.Context, k DepotKey) (*Depot, error) {
 	key, err := k.dynamoKey()
@@ -674,6 +742,14 @@ func (s *DepotStore) Get(ctx context.Context, k DepotKey) (*Depot, error) {
 		return nil, err
 	}
 	return &it.Depot, nil
+}
+
+// Totals reads the DepotTotals counter (one strongly consistent GetItem). A counter nothing has
+// touched reads as zero.
+func (s *DepotStore) Totals(ctx context.Context, k DepotTotalsKey) (DepotTotals, error) {
+	var out DepotTotals
+	_, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: "DEPOTS", SK: "TOTALS"}, true, &out)
+	return out, err
 }
 
 // DepotEverything is one page of what Depot.Everything reads: the page's items of each kind.
@@ -697,6 +773,9 @@ type DepotEverythingQuery struct {
 func (s *DepotStore) Everything(ctx context.Context, q DepotEverythingQuery, page dynago.Page) (DepotEverything, string, error) {
 	if q.DepotID == "" {
 		return DepotEverything{}, "", fmt.Errorf("%w: Everything needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return DepotEverything{}, "", err
 	}
 	pk := "D#" + q.DepotID
 	var raws []dynamo.Item
@@ -750,6 +829,9 @@ func (s *DepotStore) Newest(ctx context.Context, q DepotNewestQuery, page dynago
 	if q.DepotID == "" {
 		return DepotNewest{}, "", fmt.Errorf("%w: Newest needs depotId", dynago.ErrInvalidKey)
 	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return DepotNewest{}, "", err
+	}
 	pk := "D#" + q.DepotID
 	var raws []dynamo.Item
 	next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{Scope: "Depot.Newest#98928f05\x00" + pk, PK: pk, PKAttr: "PK", SKAttr: "SK", PageSize: 50, MaxPage: 100, Types: []string{"Damage", "Parcel"}, Desc: true}, page, &raws)
@@ -776,8 +858,8 @@ func (s *DepotStore) Newest(ctx context.Context, q DepotNewestQuery, page dynago
 	return out, next, nil
 }
 
-// Open creates a Depot, failing with ErrDepotExists if one already exists. Afterwards e.Version()
-// returns the new item's version.
+// Open creates a Depot, failing with ErrDepotExists if one already exists. In the same transaction
+// it maintains counter DepotTotals. Afterwards e.Version() returns the new item's version.
 func (s *DepotStore) Open(ctx context.Context, e *Depot) error {
 	key, err := e.Key().dynamoKey()
 	if err != nil {
@@ -792,6 +874,12 @@ func (s *DepotStore) Open(ctx context.Context, e *Depot) error {
 	err = dynago.Retry(ctx, func() error {
 		put := s.t.Put(depotToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
 		ops := []dynago.Op{dynago.CreateOp(key, put, ErrDepotExists, rev)}
+		changes := []dynago.Change{{Owner: key, After: depotDerived(e, key)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
 		if err := dynago.Run(ctx, s.db, ops); err != nil {
 			return err
 		}
@@ -802,6 +890,29 @@ func (s *DepotStore) Open(ctx context.Context, e *Depot) error {
 		e.stamps = dynago.Timestamps{} // not created
 	}
 	return err
+}
+
+// Close updates closed of a Depot with a single conditional UpdateItem.
+func (s *DepotStore) Close(ctx context.Context, k DepotKey, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	sets := []dynago.Set{
+		{Attr: "closed", Value: true},
+	}
+	guard, err := s.guard(key, o, false)
+	if err != nil {
+		return err
+	}
+	return dynago.Retry(ctx, func() error {
+		rev, err := dynago.UpdateFields(ctx, s.t, key, sets, nil, guard, nil)
+		if err == nil {
+			o.Written(rev)
+		}
+		return dynago.StaleAs(guard.ExpectRev != 0, err)
+	})
 }
 
 // ---- Parcel ----
@@ -908,6 +1019,7 @@ var (
 	ErrParcelSendOutPrecondition  = fmt.Errorf("%w: Parcel.SendOut requires state in [\"received\", \"shelved\"]", dynago.ErrPrecondition)
 	ErrParcelLosePrecondition     = fmt.Errorf("%w: Parcel.Lose requires state != \"lost\"", dynago.ErrPrecondition)
 	ErrParcelAnnotatePrecondition = fmt.Errorf("%w: Parcel.Annotate requires state != \"lost\"", dynago.ErrPrecondition)
+	ErrParcelArriveRequiresDepot  = fmt.Errorf("%w: Parcel.Arrive requires any Depot there is to have closed = false", dynago.ErrPrecondition)
 )
 
 const parcelVersion = 1
@@ -1301,6 +1413,108 @@ func (s *ParcelStore) Receive(ctx context.Context, e *Parcel) error {
 	return err
 }
 
+// Arrive creates a Parcel, failing with ErrParcelExists if one already exists. It sets state to
+// "received", whatever e holds. In the same transaction it requires any Depot there is to have
+// closed = false (else ErrParcelArriveRequiresDepot), and creates the Depot if there is none (with
+// name "unnamed"), and adds 1 to its parcels. In the same transaction it maintains counter
+// DepotParcels, counter StateCounts, copy index OnSite. Afterwards e.Version() returns the new
+// item's version.
+func (s *ParcelStore) Arrive(ctx context.Context, e *Parcel) error {
+	e.State = ParcelStateReceived
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		err := dynago.ReadIfNeeded(func(read bool) error {
+			put := s.t.Put(parcelToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+			ops := []dynago.Op{dynago.CreateOp(key, put, ErrParcelExists, rev)}
+			changes := []dynago.Change{{Owner: key, After: parcelDerived(e, key)}}
+			// requires Depot
+			if e.DepotID == "" {
+				return fmt.Errorf("%w: Parcel.Arrive requires the Depot, keyed by depotId", dynago.ErrFieldRequired)
+			}
+			depotOps, depotChange, err := s.requireArriveDepot(ctx, e, read)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, depotOps...)
+			changes = append(changes, depotChange)
+			derived, err := dynago.DiffAll(s.t, changes)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, derived...)
+			return dynago.Run(ctx, s.db, ops)
+		})
+		if err != nil {
+			return err
+		}
+		e.loaded = &parcelLoaded{rev: rev, v: parcelVersion, snapshot: e.clone()}
+		return nil
+	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
+}
+
+// Leave creates a Parcel, failing with ErrParcelExists if one already exists. It sets state to
+// "out", whatever e holds. In the same transaction it creates the Depot if there is none. In the
+// same transaction it maintains counter DepotParcels, counter StateCounts, copy index OnSite.
+// Afterwards e.Version() returns the new item's version.
+func (s *ParcelStore) Leave(ctx context.Context, e *Parcel) error {
+	e.State = ParcelStateOut
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		err := dynago.ReadIfNeeded(func(read bool) error {
+			put := s.t.Put(parcelToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+			ops := []dynago.Op{dynago.CreateOp(key, put, ErrParcelExists, rev)}
+			changes := []dynago.Change{{Owner: key, After: parcelDerived(e, key)}}
+			// requires Depot
+			if e.DepotID == "" {
+				return fmt.Errorf("%w: Parcel.Leave requires the Depot, keyed by depotId", dynago.ErrFieldRequired)
+			}
+			depotOps, depotChange, err := s.requireLeaveDepot(ctx, e, read)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, depotOps...)
+			changes = append(changes, depotChange)
+			derived, err := dynago.DiffAll(s.t, changes)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, derived...)
+			return dynago.Run(ctx, s.db, ops)
+		})
+		if err != nil {
+			return err
+		}
+		e.loaded = &parcelLoaded{rev: rev, v: parcelVersion, snapshot: e.clone()}
+		return nil
+	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
+}
+
 // Shelve updates state of a Parcel when state = "received" (else ErrParcelShelvePrecondition). It
 // reads the item consistently first (not with dynago.From) because the change affects the OnSite
 // index entry, the Known index entry, counter DepotParcels, counter StateCounts, then writes
@@ -1454,6 +1668,93 @@ func (s *ParcelStore) Annotate(ctx context.Context, k ParcelKey, v ParcelAnnotat
 		}
 		return dynago.StaleAs(guard.ExpectRev != 0, err)
 	})
+}
+
+// requireArriveDepot returns the writes Parcel.Arrive makes to the Depot: it requires any Depot
+// there is to have closed = false, and creates the Depot if there is none (with name "unnamed"),
+// and adds 1 to its parcels. Unless read is set, it assumes that state without reading the Depot:
+// if the assumption is wrong, the transaction fails with dynago.ErrNeedsRead and the caller runs
+// again with read set.
+func (s *ParcelStore) requireArriveDepot(ctx context.Context, e *Parcel, read bool) ([]dynago.Op, dynago.Change, error) {
+	k := DepotKey{DepotID: e.DepotID}
+	key, err := k.dynamoKey()
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	if !read {
+		before := Depot{DepotID: k.DepotID, Closed: false}
+		after := before.clone()
+		after.Parcels++
+		sets := []dynago.Set{
+			{Attr: "parcels", Value: 1, Add: true},
+		}
+		u := s.t.Update("PK", key.PK).Range("SK", key.SK)
+		dynago.SetFields(u, sets)
+		dynago.GuardUpdate(u, dynago.Guard{}, dynago.Now())
+		dynago.CondUpdate(u, dynago.Cond{Attr: "closed", Value: false, Zero: true})
+		return []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}, dynago.Change{Owner: key, Before: depotDerived(&before, key), After: depotDerived(&after, key)}, nil
+	}
+	it, err := (&DepotStore{db: s.db, t: s.t}).load(ctx, key, true)
+	if err == ErrDepotNotFound {
+		// There is none: create it, unless one appears before the write commits.
+		after := Depot{DepotID: k.DepotID}
+		after.Name = "unnamed"
+		after.Parcels++
+		if err := after.checkKeyParts(); err != nil {
+			return nil, dynago.Change{}, err
+		}
+		rev, stamp := dynago.NewRev(), dynago.NewStamp()
+		after.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+		put := s.t.Put(depotToItem(&after, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+		return []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}, dynago.Change{Owner: key, After: depotDerived(&after, key)}, nil
+	}
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	before := &it.Depot
+	if before.Closed {
+		return nil, dynago.Change{}, ErrParcelArriveRequiresDepot
+	}
+	after := before.clone()
+	after.Parcels++
+	item, err := dynago.KeepUnknown(it.raw, depotKnown, depotToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	return []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}, dynago.Change{Owner: key, Before: depotDerived(before, key), After: depotDerived(&after, key)}, nil
+}
+
+// requireLeaveDepot returns the writes Parcel.Leave makes to the Depot: it creates the Depot if
+// there is none. Unless read is set, it assumes that state without reading the Depot: if the
+// assumption is wrong, the transaction fails with dynago.ErrNeedsRead and the caller runs again
+// with read set.
+func (s *ParcelStore) requireLeaveDepot(ctx context.Context, e *Parcel, read bool) ([]dynago.Op, dynago.Change, error) {
+	k := DepotKey{DepotID: e.DepotID}
+	key, err := k.dynamoKey()
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	if !read {
+		req := dynago.Requirement{Key: key}
+		return []dynago.Op{dynago.CheckOp(key, dynago.CheckRequirement(s.t, req), dynago.ErrNeedsRead)}, dynago.Change{}, nil
+	}
+	_, err = (&DepotStore{db: s.db, t: s.t}).load(ctx, key, true)
+	if err == ErrDepotNotFound {
+		// There is none: create it, unless one appears before the write commits.
+		after := Depot{DepotID: k.DepotID}
+		if err := after.checkKeyParts(); err != nil {
+			return nil, dynago.Change{}, err
+		}
+		rev, stamp := dynago.NewRev(), dynago.NewStamp()
+		after.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+		put := s.t.Put(depotToItem(&after, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+		return []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}, dynago.Change{Owner: key, After: depotDerived(&after, key)}, nil
+	}
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	req := dynago.Requirement{Key: key}
+	return []dynago.Op{dynago.CheckOp(key, dynago.CheckRequirement(s.t, req), dynago.ErrStale)}, dynago.Change{}, nil
 }
 
 // ---- Damage ----

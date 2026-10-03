@@ -195,10 +195,15 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		g.p("_ = read // the %s is always read: see above", te.Name)
 	} else {
 		g.p("if !read {")
-		if rq.Consume {
+		switch {
+		case rq.Consume:
 			g.p("req := dynago.Requirement{Key: key%s}", g.requirementFields(rq, "e"))
 			g.p("return []dynago.Op{dynago.DeleteOp(key, dynago.ConsumeRequirement(s.t, req), dynago.ErrNeedsRead)}, dynago.Change{}, nil")
-		} else {
+		case len(rq.Sets) == 0:
+			// ensure alone: one that is there is only checked.
+			g.p("req := dynago.Requirement{Key: key%s}", g.requirementFields(rq, "e"))
+			g.p("return []dynago.Op{dynago.CheckOp(key, dynago.CheckRequirement(s.t, req), dynago.ErrNeedsRead)}, dynago.Change{}, nil")
+		default:
 			known := []string{}
 			for _, f := range te.KeyFields() {
 				known = append(known, fmt.Sprintf("%s: k.%s", f.GoName, f.GoName))
@@ -225,19 +230,27 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		}
 		g.p("}")
 	}
-	g.p("it, err := (&%sStore{db: s.db, t: s.t}).load(ctx, key, true)", te.GoName)
+	if !rq.Consume && len(rq.Sets) == 0 && len(rq.When) == 0 {
+		// ensure alone, of anything that is there: only whether it is matters.
+		g.p("_, err = (&%sStore{db: s.db, t: s.t}).load(ctx, key, true)", te.GoName)
+	} else {
+		g.p("it, err := (&%sStore{db: s.db, t: s.t}).load(ctx, key, true)", te.GoName)
+	}
 	g.p("if err == Err%sNotFound {", te.GoName)
-	if rq.Optional {
+	switch {
+	case rq.Ensure:
+		g.ensureTarget(e, rq, limits)
+	case rq.Optional:
 		g.p("// Nothing to change, as long as one doesn't appear before the write commits.")
 		g.p("return []dynago.Op{dynago.CheckOp(key, dynago.CheckAbsent(s.t, key, %q), dynago.ErrStale)}, dynago.Change{}, nil", ttl)
-	} else {
+	default:
 		g.p("return nil, dynago.Change{}, %s", rq.ErrName)
 	}
 	g.p("}")
 	g.p("if err != nil {")
 	g.p("return nil, dynago.Change{}, err")
 	g.p("}")
-	if len(rq.When) > 0 || te.HasDerived() || !rq.Consume {
+	if len(rq.When) > 0 || len(rq.Sets) > 0 || (rq.Consume && te.HasDerived()) {
 		g.p("before := &it.%s", te.GoName)
 	}
 	if len(rq.When) > 0 {
@@ -246,6 +259,15 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		}))
 		g.p("return nil, dynago.Change{}, %s", rq.ErrName)
 		g.p("}")
+	}
+	if !rq.Consume && len(rq.Sets) == 0 {
+		// ensure alone: there is one, and nothing to change on it. It must still be there, as
+		// read, when the write commits.
+		g.p("req := dynago.Requirement{Key: key%s}", g.requirementFields(rq, "e"))
+		g.p("return []dynago.Op{dynago.CheckOp(key, dynago.CheckRequirement(s.t, req), dynago.ErrStale)}, dynago.Change{}, nil")
+		g.p("}")
+		g.p("")
+		return
 	}
 	guard := `.If("$ = ?", "_rev", it.Rev)`
 	ch := "dynago.Change{}"
@@ -278,6 +300,42 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 	}
 	g.p("}")
 	g.p("")
+}
+
+// ensureTarget emits the creation of a requirement's target that isn't there: a new item with the
+// key the requirement names, the fields `ensure` gives and the requirement's changes applied, and
+// everything derived from it, as a create of the entity writes.
+func (g *gen) ensureTarget(e *schema.Entity, rq *schema.Require, limits string) {
+	te := rq.Target
+	tlo := lowerFirst(te.GoName)
+	var kv []string
+	for _, f := range te.KeyFields() {
+		kv = append(kv, fmt.Sprintf("%s: k.%s", f.GoName, f.GoName))
+	}
+	g.p("// There is none: create it, unless one appears before the write commits.")
+	g.p("after := %s{%s}", te.GoName, strings.Join(kv, ", "))
+	for _, s := range rq.EnsureSets {
+		g.targetAssign(e, te, s)
+	}
+	for _, s := range rq.Sets {
+		g.targetAssign(e, te, s)
+	}
+	g.requiredChecks(te, te.Fields, "after", "return nil, dynago.Change{}, err")
+	g.p("if err := after.checkKeyParts(); err != nil {")
+	g.p("return nil, dynago.Change{}, err")
+	g.p("}")
+	g.p("rev, stamp := dynago.NewRev(), dynago.NewStamp()")
+	g.p("after.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}")
+	if te.TTL != nil {
+		g.p("put := s.t.Put(%sToItem(&after, key, rev, stamp, stamp)).If(\"attribute_not_exists($) OR $ <= ?\", \"PK\", %q, dynago.Now())", tlo, g.m.Table.TTLAttr)
+	} else {
+		g.p("put := s.t.Put(%sToItem(&after, key, rev, stamp, stamp)).If(\"attribute_not_exists($)\", \"PK\")", tlo)
+	}
+	ch := "dynago.Change{}"
+	if te.HasDerived() {
+		ch = fmt.Sprintf("dynago.Change{Owner: key, After: %sDerived(&after, key%s)}", tlo, limits)
+	}
+	g.p("return []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}, %s, nil", ch)
 }
 
 // targetAssign emits one change of a requirement to after, the target's state: an assignment, an

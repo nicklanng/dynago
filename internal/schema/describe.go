@@ -90,6 +90,10 @@ func (rq *Require) Condition(source string) string {
 			parts = append(parts, fmt.Sprintf("%s = %d", p.Value.Name, p.Equals))
 		}
 		return fmt.Sprintf("counter %s to have %s (a missing value counts as 0)", rq.Counter.Name, strings.Join(parts, " and "))
+	case rq.Ensure && len(rq.When) > 0:
+		return fmt.Sprintf("any %s there is to have %s", rq.Name, PredText(rq.When, source))
+	case rq.Ensure:
+		return fmt.Sprintf("nothing of the %s", rq.Name)
 	case rq.Optional && len(rq.When) > 0:
 		return fmt.Sprintf("any %s to have %s (an absent or expired one passes)", rq.Name, PredText(rq.When, source))
 	case rq.Optional:
@@ -103,6 +107,19 @@ func (rq *Require) Condition(source string) string {
 // Effect says what the write does to the required item, or "" if it only checks it.
 func (rq *Require) Effect(source string) string {
 	switch {
+	case rq.Ensure:
+		t := "creates the " + rq.Name + " if there is none"
+		var with []string
+		for _, s := range rq.EnsureSets {
+			with = append(with, s.Field.Name+" "+s.valueText(source))
+		}
+		if len(with) > 0 {
+			t += " (with " + JoinAnd(with) + ")"
+		}
+		if len(rq.Sets) > 0 {
+			t += ", and " + ChangeText(rq.Sets, source)
+		}
+		return t
 	case len(rq.Sets) > 0:
 		return ChangeText(rq.Sets, source)
 	case rq.Consume && rq.Optional:
@@ -113,9 +130,23 @@ func (rq *Require) Effect(source string) string {
 	return ""
 }
 
+// Sentence says what the requirement does, completing "<Write> ...": what it requires and what
+// it changes, or only the change when it requires nothing.
+func (rq *Require) Sentence(source, join string) string {
+	eff := rq.Effect(source)
+	if !rq.CanFail() {
+		return eff
+	}
+	t := "requires " + rq.Condition(source)
+	if eff != "" {
+		t += join + eff
+	}
+	return t
+}
+
 // CanFail reports whether the requirement can reject a write (and so has an error).
 func (rq *Require) CanFail() bool {
-	return rq.Counter != nil || !rq.Optional || len(rq.When) > 0
+	return rq.Counter != nil || (!rq.Optional && !rq.Ensure) || len(rq.When) > 0
 }
 
 // JoinAnd joins names for people: "A", "A and B", "A, B and C".

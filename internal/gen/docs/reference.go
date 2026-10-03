@@ -462,11 +462,7 @@ func writeText(w *schema.Write) string {
 func requiresText(w *schema.Write) string {
 	var parts []string
 	for _, rq := range w.Requires {
-		t := "requires " + rq.Condition(w.Entity.Name)
-		if eff := rq.Effect(w.Entity.Name); eff != "" {
-			t += " and " + eff
-		}
-		parts = append(parts, t)
+		parts = append(parts, rq.Sentence(w.Entity.Name, " and "))
 	}
 	if len(parts) == 0 {
 		return ""

@@ -466,6 +466,7 @@ write, and no crash can leave the write half done.
 | `set` | Entities only. Changes the target in the same transaction: its revision, counters, claims, copies and index keys are maintained as by an update of it declared with this `set` and `when`. Values are constants or `"{field}"`. Not key fields; not a counter value whose limit the target's callers supply. The same holds for `add` and `patch`, and a field is changed by one of the three. |
 | `add` | Entities only. Adds to `int` fields of the target: `add: { messageCount: 1 }`. A whole number (negative to subtract) or `"{field}"`, an int field of this entity. Concurrent writes all count: the addition is DynamoDB's atomic `ADD` when the target isn't read, and guarded by the target's revision (and retried) when it is. |
 | `patch` | Entities only. Sets fields of the target from this entity's fields, each only when that field has a value: `patch: { hasAttachments: "{hasAttachments}" }` marks the thread when a message with attachments arrives, and leaves the mark alone when one without arrives. Use `set` to assign whatever the field holds, empty or not. |
+| `ensure` | Entities only. Creates the target when it is absent (or expired), in the same transaction: `ensure: { subject: "{subject}" }`, or `ensure: {}`. The new item has its key from `key`, the fields `ensure` gives (constants or `"{field}"`), then `set`, `add` and `patch` applied, and its counters, claims, copies and index keys are written as a create of it writes them. A target that is there is checked against `when` and changed as without `ensure`; `when` says nothing about one the write creates. Every `required` field of the target must be given by `ensure` or `set`. Exclusive with `optional` and `consume`. See [a parent and its first child](#a-parent-and-its-first-child). |
 | `optional` | Entities only. The write goes ahead if the target is absent or has expired; `when` applies only to one that is there. |
 | `consume` | Entities only. Deletes the target in the same transaction, releasing what it contributed. Exclusive with `set`, `add` and `patch`. |
 
@@ -486,6 +487,32 @@ the steward must be active"). A write with `requires` is always a transaction. U
 first, unless they are read-free and every field the requirements use is known from the call.
 
 The model document shows which writes read first and why, and what each changes.
+
+#### A parent and its first child
+
+A conversation is a thread and its first message; later messages change the thread through
+`requires`. With `ensure`, the first message creates it, so the two are never written apart:
+
+```yaml
+Message:
+  writes:
+    Deliver:
+      create: true
+      requires:
+        Thread:
+          key: { userId: userId, threadId: threadId }
+          ensure: { subject: "{subject}" }          # given only to a thread this write creates
+          set: { lastMessageAt: "{date}", snippet: "{snippet}", unread: true, mailbox: inbox }
+          add: { messageCount: 1 }
+```
+
+If no thread is at the key, the write creates one with the message's subject, the `set` values and
+a count of 1. If one is there, it is changed as before, and `ensure`'s fields are left alone. When
+two first messages race, one creates the thread and the other finds it: the loser's transaction
+fails its "no thread yet" condition and runs again.
+
+The target is read to find out which case it is, unless the change can be written without reading
+it: then the write tries the change first, and reads only when no target turns out to be there.
 
 ## Predicates
 

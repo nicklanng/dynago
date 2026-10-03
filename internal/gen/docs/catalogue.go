@@ -274,7 +274,7 @@ func checks(w *schema.Write) []string {
 		out = append(out, schema.PredText(w.When, e.Name))
 	}
 	for _, rq := range w.Requires {
-		if rq.Optional && len(rq.When) == 0 {
+		if !rq.CanFail() {
 			continue
 		}
 		out = append(out, requirement(rq, e.Name))
@@ -326,6 +326,8 @@ func requirement(rq *schema.Require, source string) string {
 			parts = append(parts, fmt.Sprintf("%s = %d", p.Value.Name, p.Equals))
 		}
 		return fmt.Sprintf("counter %s has %s", rq.Counter.Name, strings.Join(parts, " and "))
+	case rq.Ensure:
+		return fmt.Sprintf("any %s there is has %s (none is created)", rq.Name, schema.PredText(rq.When, source))
 	case rq.Optional:
 		return fmt.Sprintf("any %s has %s (none is fine)", rq.Name, schema.PredText(rq.When, source))
 	case len(rq.When) > 0:

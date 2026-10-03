@@ -508,6 +508,7 @@ func (a *analyzer) grows(e *schema.Entity, ix *schema.Index, pk []*schema.Field)
 				if rq.Target == e && rq.Consume {
 					return false
 				}
+				created = created || (rq.Target == e && rq.Ensure)
 			}
 		}
 	}

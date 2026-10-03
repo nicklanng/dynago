@@ -163,7 +163,7 @@
         {
           "version": 1,
           "generation": 1,
-          "fingerprint": "82b2e17f53028afa",
+          "fingerprint": "fe8c60c869038a0c",
           "shape": {
             "fields": [
               {
@@ -175,10 +175,33 @@
                 "name": "name",
                 "attr": "name",
                 "type": "string"
+              },
+              {
+                "name": "closed",
+                "attr": "closed",
+                "type": "bool"
+              },
+              {
+                "name": "parcels",
+                "attr": "parcels",
+                "type": "int"
               }
             ],
             "pk": "D#{depotId}",
-            "sk": "DEPOT"
+            "sk": "DEPOT",
+            "counters": [
+              {
+                "name": "DepotTotals",
+                "pk": "DEPOTS",
+                "sk": "TOTALS",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "depots"
+                  }
+                ]
+              }
+            ]
           }
         }
       ]

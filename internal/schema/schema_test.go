@@ -171,7 +171,7 @@ func TestValidationErrors(t *testing.T) {
 		{"requires adds nothing", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, add: { count: 0 } } } }\n", "a whole number other than 0"},
 		{"requires adds a field of another type", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, add: { count: \"{name}\" } } } }\n", "Thing.name is a string, but Thing.count is a int"},
 		{"requires patches a constant", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, patch: { name: x } } } }\n", "A constant goes in set"},
-		{"requires changes a field twice", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, set: { count: 1 }, add: { count: 1 } } } }\n", "count is changed more than once"},
+		{"requires changes a field twice", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, set: { count: 1 }, add: { count: 1 } } } }\n", "count is given more than once"},
 		{"requires adds to a key field", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, patch: { thingId: \"{name}\" } } } }\n", "part of Thing's primary key"},
 		{"requires adds and consumes", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, add: { count: 1 }, consume: true } } }\n", "exclusive with consume"},
 		{"batch on a query", "    access:\n      L: { query: key, batch: 5 }\n", "batch applies to get: key"},
@@ -188,6 +188,13 @@ func TestValidationErrors(t *testing.T) {
 		{"partition read of an entity twice", "    access:\n      P: { query: partition, of: [Thing, Thing] }\n", "Thing is listed twice"},
 		{"partition read with a range", "    access:\n      P: { query: partition, of: [Thing], range: name }\n", "a partition read returns several kinds whole"},
 		{"partition read of another partition", "    access:\n      P: { query: partition, of: [Thing, Other] }\n  Other:\n    fields: { tenantId: string, otherId: string }\n    key: { pk: \"O#{tenantId}\", sk: \"OTHER#{otherId}\" }\n", "so one Query can't read both"},
+		{"ensure and optional", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, ensure: {}, optional: true } } }\n", "choose one"},
+		{"ensure and consume", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, ensure: {}, consume: true } } }\n", "choose one"},
+		{"ensure gives a key field", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, ensure: { thingId: x } } } }\n", "part of Thing's primary key"},
+		{"ensure and set give one field", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, set: { count: 1 }, ensure: { count: 2 } } } }\n", "count is given more than once"},
+		{"ensure of the wrong type", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, ensure: { count: many } } } }\n", "does not match field type"},
+		{"ensure without a required field", "      must: { type: string, required: true }\n    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, ensure: { count: 2 } } } }\n", "Thing.must is required, so a Thing this write creates needs it"},
+		{"ensure of a counter", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, ensure: {}, when: { n: 0 } } } }\n", "can only be checked with when"},
 		{"requires unknown counter value", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, when: { m: 0 } } } }\n", "m is not a value of counter C"},
 	}
 	for _, c := range cases {

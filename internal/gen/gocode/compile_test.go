@@ -73,6 +73,16 @@ var awkwardEntities = []struct {
 		"      Drop: { delete: true, requires: { Box: { key: { tenantId: tenantId, boxId: boxId }, add: { parts: -1 }, when: { note: kept } } } }\n", ""},
 	{"partition read of an expiring entity and a singleton", "  Summary:\n    fields:\n      tenantId: string\n      until: time\n    ttl: until\n    key: { pk: \"T#{tenantId}\", sk: \"SUMMARY\" }\n" +
 		"    access:\n      Whole: { query: partition, of: [Thing, Summary], order: desc, page: 10, max_page: 20 }\n      Mine: { query: partition, of: [Summary] }\n", ""},
+	{"requires that create their target", "  Crate:\n    fields:\n      tenantId: string\n      crateId: string\n      label: { type: string, required: true }\n      emails: string_set\n      parts: int\n      until: time\n      mood: { type: enum, values: [calm, cross] }\n" +
+		"    ttl: until\n    key: { pk: \"T#{tenantId}\", sk: \"CRATE#{crateId}\" }\n" +
+		"    indexes:\n      ByLabel: { strategy: copy, pk: \"L#{tenantId}\", sk: \"L#{label}#{crateId}\", project: [parts] }\n" +
+		"    unique:\n      Label: { fields: [tenantId, label] }\n" +
+		"    counters:\n      Crates: { pk: \"T#{tenantId}\", sk: \"CRATES\", values: { n: count, calm: { count: true, where: { mood: calm } } } }\n" +
+		"  Part:\n    fields:\n      tenantId: string\n      crateId: string\n      partId: string\n      label: string\n      seen: time\n" +
+		"    key: { pk: \"T#{tenantId}\", sk: \"PART#{crateId}#{partId}\" }\n    writes:\n" +
+		"      Add: { create: true, requires: { Crate: { key: { tenantId: tenantId, crateId: crateId }, ensure: { label: \"{label}\", mood: calm }, add: { parts: 1 }, patch: { until: \"{seen}\" }, when: { mood: { not: cross } } } } }\n" +
+		"      Move: { update: [label], requires: { Crate: { key: { tenantId: tenantId, crateId: crateId }, ensure: { label: unlabelled } } } }\n" +
+		"      Drop: { delete: true, requires: { Crate: { key: { tenantId: tenantId, crateId: crateId }, ensure: { label: \"{label}\" }, set: { mood: cross } } } }\n", ""},
 	{"entity named like another's store", "  ThingStore:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},
 	{"entities differing in initialism case", "  THING:\n    fields: { id: string }\n    key: { pk: \"U#{id}\", sk: \"U\" }\n", "collides"},
 	{"entity named Store", "  Store:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},

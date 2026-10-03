@@ -399,3 +399,78 @@ func TestPartitionRead(t *testing.T) {
 		t.Fatalf("no depot id: %v", err)
 	}
 }
+
+// A requirement with ensure creates its item when there is none, in the write's transaction, with
+// everything a create of that entity writes; one that is there is checked and changed as without
+// it. A parcel arriving at an unopened depot opens it, whoever gets there first.
+func TestRequiresEnsureCreatesItsTarget(t *testing.T) {
+	db, n := testdb.CountingDB(t)
+	st := fixture.New(db, testdb.Table(t, db, fixture.TableSpec))
+	arrive := func(depot, id string) error {
+		return st.Parcels.Arrive(ctx, &fixture.Parcel{DepotID: depot, ParcelID: id})
+	}
+	depot := func(id string) *fixture.Depot {
+		t.Helper()
+		d, err := st.Depots.Get(ctx, fixture.DepotKey{DepotID: id})
+		must(t, err)
+		return d
+	}
+	depots := func() int64 {
+		t.Helper()
+		c, err := st.Depots.Totals(ctx, fixture.DepotTotalsKey{})
+		must(t, err)
+		return c.Depots
+	}
+
+	// The first parcel creates the depot, with the fields ensure gives and the requirement's own
+	// change applied, and counts it.
+	must(t, arrive("dx", "p1"))
+	if d := depot("dx"); d.Name != "unnamed" || d.Parcels != 1 || d.Version() == "" || d.Timestamps().Created.IsZero() {
+		t.Fatalf("the depot the first parcel created: %+v", d)
+	}
+	if got := depots(); got != 1 {
+		t.Fatalf("%d depots counted, want 1", got)
+	}
+	// The second finds it: the change alone, without reading it.
+	reads := n.Reads()
+	must(t, arrive("dx", "p2"))
+	if r := n.Reads() - reads; r != 0 {
+		t.Fatalf("arriving at an open depot made %d reads, want none", r)
+	}
+	if d := depot("dx"); d.Name != "unnamed" || d.Parcels != 2 || depots() != 1 {
+		t.Fatalf("after a second parcel: %+v, %d depots", d, depots())
+	}
+
+	// when still applies to a depot that is there: a closed one refuses, and nothing is written.
+	must(t, st.Depots.Open(ctx, &fixture.Depot{DepotID: "dy", Name: "Yard"}))
+	must(t, st.Depots.Close(ctx, fixture.DepotKey{DepotID: "dy"}))
+	wantErr(t, arrive("dy", "p1"), fixture.ErrParcelArriveRequiresDepot)
+	if _, err := st.Parcels.Get(ctx, fixture.ParcelKey{DepotID: "dy", ParcelID: "p1"}); !errors.Is(err, fixture.ErrParcelNotFound) {
+		t.Fatalf("a refused arrival left a parcel: %v", err)
+	}
+	if d := depot("dy"); d.Name != "Yard" || d.Parcels != 0 {
+		t.Fatalf("a refused arrival changed the depot: %+v", d)
+	}
+
+	// ensure alone: created if absent, otherwise left as it is.
+	must(t, st.Parcels.Leave(ctx, &fixture.Parcel{DepotID: "dz", ParcelID: "p1"}))
+	must(t, st.Parcels.Leave(ctx, &fixture.Parcel{DepotID: "dz", ParcelID: "p2"}))
+	must(t, st.Parcels.Leave(ctx, &fixture.Parcel{DepotID: "dy", ParcelID: "p9"})) // closed, but nothing is required of it
+	if d := depot("dz"); d.Name != "" || d.Parcels != 0 || depots() != 3 {
+		t.Fatalf("after parcels left two depots: %+v, %d depots", d, depots())
+	}
+
+	// Many parcels arriving at once at a depot nobody has opened: one of them creates it, the
+	// others find it, and every one is counted.
+	const each = 8
+	errs := make(chan error, each)
+	for i := range each {
+		go func() { errs <- arrive("dc", fmt.Sprint("p", i)) }()
+	}
+	for range each {
+		must(t, <-errs)
+	}
+	if d := depot("dc"); d.Parcels != each || depots() != 4 {
+		t.Fatalf("after %d parcels arrived at once: %d counted on the depot, %d depots; want %d and 4", each, d.Parcels, depots(), each)
+	}
+}
