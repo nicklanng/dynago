@@ -836,7 +836,10 @@ type Write struct {
 	Kind   WriteKind
 	Args   []*Field
 	// Patch fields are optional arguments: nil leaves the field unchanged.
-	Patch       []*Field
+	Patch []*Field
+	// Elems are changes to string_set fields by element: elements added to, or removed from,
+	// whatever the set holds.
+	Elems       []SetElems
 	Sets        []SetConst
 	When        []*Pred
 	Requires    []*Require
@@ -932,12 +935,43 @@ type RequireKey struct {
 	Source *Field
 }
 
+// SetElems is a change to a string_set field by element (add_to, remove_from): the elements are
+// added to, or removed from, whatever the set holds.
+type SetElems struct {
+	Field *Field
+	// Remove removes the elements; otherwise they are added.
+	Remove bool
+	// Arg is true when the caller gives the elements; otherwise Elem is the one constant element.
+	Arg  bool
+	Elem string
+}
+
+// ElemArgs returns the set fields whose elements the caller gives.
+func (w *Write) ElemArgs() []*Field {
+	var out []*Field
+	for _, el := range w.Elems {
+		if el.Arg {
+			out = append(out, el.Field)
+		}
+	}
+	return out
+}
+
+// OnlyElems reports whether the write changes nothing but elements of sets: an item that
+// already has the elements added, and lacks those removed, is left as it is.
+func (w *Write) OnlyElems() bool {
+	return len(w.Elems) > 0 && len(w.Args)+len(w.Patch)+len(w.Sets) == 0
+}
+
 // Changed returns every field the update writes.
 func (w *Write) Changed() []*Field {
 	out := append([]*Field{}, w.Args...)
 	out = append(out, w.Patch...)
 	for _, s := range w.Sets {
 		out = append(out, s.Field)
+	}
+	for _, el := range w.Elems {
+		out = append(out, el.Field)
 	}
 	return out
 }

@@ -208,6 +208,12 @@ func TestValidationErrors(t *testing.T) {
 		{"batch with requires", "    writes:\n      W: { update: [name], batch: 10, requires: { Thing: { key: { tenantId: tenantId, thingId: name } } } }\n", "a batch write can't have requires"},
 		{"batch that requires versions", "    writes:\n      W: { update: [name], batch: 10, versioned: required }\n", "takes keys, not versions"},
 		{"batch that grows a caller's limit", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: { count: true, where: { status: a }, limit: arg } } }\n    writes:\n      W: { set: { status: a }, batch: 10 }\n", "whose limit callers supply for one item at a time"},
+		{"add_to a string", "    writes:\n      W: { add_to: { name: arg } }\n", "elements are added to and removed from string_set fields"},
+		{"add_to on a create", "    writes:\n      W: { create: true, add_to: { tags: arg } }\n", "declare exactly one of create, update or delete"},
+		{"add_to and update of one field", "    writes:\n      W: { update: [tags], add_to: { tags: arg } }\n", "tags is listed more than once"},
+		{"add_to and remove_from of one field", "    writes:\n      W: { add_to: { tags: arg }, remove_from: { tags: arg } }\n", "tags is listed more than once"},
+		{"remove_from a required set", "      must: { type: string_set, required: true }\n    writes:\n      W: { remove_from: { must: arg } }\n", "could leave it empty"},
+		{"add_to an unknown field", "    writes:\n      W: { add_to: { nope: arg } }\n", "nope is not a field"},
 		{"requires unknown counter value", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, when: { m: 0 } } } }\n", "m is not a value of counter C"},
 	}
 	for _, c := range cases {

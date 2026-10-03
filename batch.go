@@ -2,6 +2,7 @@ package dynago
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -45,7 +46,8 @@ func (e *BatchError) Unwrap() []error {
 // Each transaction reads its items with one consistent BatchGetItem and calls build for each one
 // found, which returns the item's own write, guarded by the revision read, and its derived items
 // before and after. An item that is absent fails with notFound, and one build returns an error
-// for fails with that error; the rest of the transaction goes ahead without them. If an item
+// for fails with that error (except ErrNoChange, for an item that needs no write: it is left as
+// it is); the rest of the transaction goes ahead without them. If an item
 // changed between the read and the write, the transaction is built again from a fresh read, under
 // the retry policy. A transaction that fails for any other reason (a claim taken, a limit reached,
 // too many items) is split in two and each half tried on its own, down to single items, so one
@@ -94,6 +96,9 @@ func BatchWrite(ctx context.Context, db *dynamo.DB, t dynamo.Table, keys []Key, 
 					continue
 				}
 				op, change, err := build(keys[i], raw)
+				if errors.Is(err, ErrNoChange) {
+					continue // already as the write would leave it
+				}
 				if err != nil {
 					skipped[i] = err
 					continue

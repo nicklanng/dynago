@@ -1378,6 +1378,11 @@ func patchFastPath(w *schema.Write) []*schema.Field {
 			return nil
 		}
 	}
+	for _, el := range w.Elems {
+		if inputs[el.Field.Name] {
+			return nil
+		}
+	}
 	var slow []*schema.Field
 	for _, f := range w.Patch {
 		if inputs[f.Name] {
@@ -1397,6 +1402,13 @@ func (g *gen) updateSets(w *schema.Write, skip ...*schema.Field) {
 	}
 	for _, s := range w.Sets {
 		g.p("%s,", constSetLit(e, s.Field, s.Value))
+	}
+	for _, el := range w.Elems {
+		op := "AddElems"
+		if el.Remove {
+			op = "RemoveElems"
+		}
+		g.p("{Attr: %q, Value: %s, %s: true},", el.Field.Attr, elemsExpr(el, false), op)
 	}
 	g.p("}")
 	skipped := map[*schema.Field]bool{}
@@ -1451,6 +1463,37 @@ func (g *gen) applyChanges(w *schema.Write) {
 	for _, s := range w.Sets {
 		g.p("after.%s = %s", s.Field.GoName, literal(e, s.Field, s.Value))
 	}
+	for _, el := range w.Elems {
+		fn := "AddToSet"
+		if el.Remove {
+			fn = "RemoveFromSet"
+		}
+		g.p("after.%s = dynago.%s(after.%s, %s)", el.Field.GoName, fn, el.Field.GoName, elemsExpr(el, true))
+	}
+}
+
+// elemsExpr renders the elements an add_to or remove_from gives: the caller's (spread as
+// arguments, or as a slice) or the one constant.
+func elemsExpr(el schema.SetElems, spread bool) string {
+	switch {
+	case el.Arg && spread:
+		return "v." + el.Field.GoName + "..."
+	case el.Arg:
+		return "dynago.AddToSet(nil, v." + el.Field.GoName + "...)"
+	case spread:
+		return strconv.Quote(el.Elem)
+	}
+	return "[]string{" + strconv.Quote(el.Elem) + "}"
+}
+
+// unchangedElems is the condition that a write of nothing but set elements left after as before
+// was: adding only appends and removing only drops, so equal lengths mean equal sets.
+func unchangedElems(w *schema.Write, before string) string {
+	var conds []string
+	for _, el := range w.Elems {
+		conds = append(conds, fmt.Sprintf("len(after.%s) == len(%s.%s)", el.Field.GoName, before, el.Field.GoName))
+	}
+	return strings.Join(conds, " && ")
 }
 
 // updateBatch emits an update of several items: read together and written several to a
@@ -1521,6 +1564,11 @@ func (g *gen) updateBatch(w *schema.Write, argType string, hasV bool) {
 	}
 	g.p("after := before.clone()")
 	g.applyChanges(w)
+	if w.OnlyElems() {
+		g.p("if %s {", unchangedElems(w, "before"))
+		g.p("return dynago.Op{}, dynago.Change{}, dynago.ErrNoChange // the set is already as asked")
+		g.p("}")
+	}
 	g.p("// Keep attributes this code doesn't know: a newer compatible version may have written them.")
 	g.p("item, err := dynago.KeepUnknown(it.raw, %sKnown, %sToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))", lo, lo)
 	g.p("if err != nil {")
@@ -1544,7 +1592,7 @@ func (g *gen) update(w *schema.Write) {
 	e := w.Entity
 	lo := lowerFirst(e.GoName)
 	argType := e.GoName + w.GoName
-	hasV := len(w.Args)+len(w.Patch) > 0
+	hasV := len(w.Args)+len(w.Patch)+len(w.ElemArgs()) > 0
 	if hasV {
 		g.p("// %s holds the new values for %s.%s.", argType, e.Name, w.Name)
 		if len(w.Patch) > 0 {
@@ -1556,6 +1604,17 @@ func (g *gen) update(w *schema.Write) {
 		}
 		for _, f := range w.Patch {
 			g.p("%s *%s", f.GoName, goType(e, f))
+		}
+		for _, el := range w.Elems {
+			if !el.Arg {
+				continue
+			}
+			if el.Remove {
+				g.p("// %s are the elements to remove from %s; the rest of the set stays.", el.Field.GoName, el.Field.Name)
+			} else {
+				g.p("// %s are the elements to add to %s, beside what the set already holds.", el.Field.GoName, el.Field.Name)
+			}
+			g.p("%s []string", el.Field.GoName)
 		}
 		g.p("}")
 		g.p("")
@@ -1622,7 +1681,7 @@ func (g *gen) update(w *schema.Write) {
 		}
 	}
 	g.p("o := dynago.ApplyOptions(opts)")
-	if len(w.Args)+len(w.Sets) == 0 {
+	if len(w.Args)+len(w.Sets)+len(w.Elems) == 0 {
 		var nils []string
 		for _, f := range w.Patch {
 			nils = append(nils, "v."+f.GoName+" == nil")
@@ -1692,6 +1751,12 @@ func (g *gen) update(w *schema.Write) {
 	}
 	g.p("after := before.clone()")
 	g.applyChanges(w)
+	if w.OnlyElems() {
+		g.p("if %s {", unchangedElems(w, "before"))
+		g.p("o.Written(it.Rev) // the set is already as asked: nothing to write")
+		g.p("return nil")
+		g.p("}")
+	}
 	g.changedKeyPartChecks(w)
 	g.p("// Keep attributes this code doesn't know: a newer compatible version may have written them.")
 	g.p("item, err := dynago.KeepUnknown(it.raw, %sKnown, %sToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))", lo, lo)
@@ -2032,6 +2097,12 @@ func (g *gen) changedKeyPartChecks(w *schema.Write, skip ...*schema.Field) {
 		vals[s.Field] = literal(e, s.Field, s.Value)
 	}
 	g.keyPartChecks(sets, func(f *schema.Field) string { return vals[f] }, "return err")
+	for _, el := range w.Elems {
+		// What is taken out needs no check: it was accepted going in.
+		if !el.Remove {
+			g.keyPartChecks([]*schema.Field{el.Field}, func(*schema.Field) string { return elemsExpr(el, false) }, "return err")
+		}
+	}
 	for _, f := range w.Patch {
 		if seps[f] == "" || slices.Contains(skip, f) {
 			continue

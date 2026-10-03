@@ -882,6 +882,30 @@
               "$ref": "#/$defs/predicates",
               "description": "Fields set to constants. On a create, they override what the caller passed (a new loan is always active)."
             },
+            "add_to": {
+              "type": "object",
+              "description": "Adds elements to string_set fields, leaving the rest of each set as it is: field → arg (the caller passes the elements) or one element.",
+              "minProperties": 1,
+              "propertyNames": {
+                "$ref": "#/$defs/camelName"
+              },
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "remove_from": {
+              "type": "object",
+              "description": "Removes elements from string_set fields, leaving the rest of each set as it is: field → arg (the caller passes the elements) or one element.",
+              "minProperties": 1,
+              "propertyNames": {
+                "$ref": "#/$defs/camelName"
+              },
+              "additionalProperties": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
             "when": {
               "$ref": "#/$defs/conditions",
               "description": "Preconditions that must hold for the update."
@@ -1013,6 +1037,16 @@
                 {
                   "required": [
                     "set"
+                  ]
+                },
+                {
+                  "required": [
+                    "add_to"
+                  ]
+                },
+                {
+                  "required": [
+                    "remove_from"
                   ]
                 }
               ],

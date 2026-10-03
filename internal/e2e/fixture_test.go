@@ -755,3 +755,120 @@ func TestConsumeACounterItem(t *testing.T) {
 		t.Fatalf("counters after tagging again: %s", got)
 	}
 }
+
+// A set changes by element: add_to and remove_from say which elements, and leave the rest of the
+// set as it is. Where nothing is keyed by the set, that is one UpdateItem with no read, and
+// concurrent additions all land. Where copies and counters are keyed by its elements, the item is
+// read and only the elements that change are written, for one item or a batch of them.
+func TestAddToAndRemoveFromASet(t *testing.T) {
+	t.Parallel()
+	db, n := testdb.CountingDB(t)
+	st := fixture.New(db, testdb.Table(t, db, fixture.TableSpec))
+
+	// Nothing derived: an atomic ADD and DELETE on the set attribute.
+	dk := fixture.DepotKey{DepotID: "d1"}
+	must(t, st.Depots.Open(ctx, &fixture.Depot{DepotID: "d1", Name: "Yard"}))
+	zones := func() string {
+		t.Helper()
+		d, err := st.Depots.Get(ctx, dk)
+		must(t, err)
+		z := append([]string(nil), d.Zones...)
+		sort.Strings(z)
+		return fmt.Sprint(z)
+	}
+	reads := n.Reads()
+	must(t, st.Depots.AddZones(ctx, dk, fixture.DepotAddZones{Zones: []string{"a", "b"}}))
+	must(t, st.Depots.AddZones(ctx, dk, fixture.DepotAddZones{Zones: []string{"b", "c", ""}}))
+	must(t, st.Depots.AddZones(ctx, dk, fixture.DepotAddZones{}))
+	must(t, st.Depots.DropZones(ctx, dk, fixture.DepotDropZones{Zones: []string{"a", "never there"}}))
+	if r := n.Reads() - reads; r != 0 {
+		t.Fatalf("changing zones made %d reads, want none", r)
+	}
+	if got := zones(); got != "[b c]" {
+		t.Fatalf("zones: %s", got)
+	}
+	errs := make(chan error, 8)
+	for i := range 8 {
+		go func() {
+			errs <- st.Depots.AddZones(ctx, dk, fixture.DepotAddZones{Zones: []string{fmt.Sprint("z", i)}})
+		}()
+	}
+	for range 8 {
+		must(t, <-errs)
+	}
+	if got := zones(); got != "[b c z0 z1 z2 z3 z4 z5 z6 z7]" {
+		t.Fatalf("zones after eight concurrent additions: %s", got)
+	}
+	must(t, st.Depots.DropZones(ctx, dk, fixture.DepotDropZones{Zones: []string{"b", "c", "z0", "z1", "z2", "z3", "z4", "z5", "z6", "z7"}}))
+	if got := zones(); got != "[]" {
+		t.Fatalf("zones after dropping them all: %s", got)
+	}
+	must(t, st.Depots.Close(ctx, dk))
+	wantErr(t, st.Depots.DropZones(ctx, dk, fixture.DepotDropZones{Zones: []string{"b"}}), fixture.ErrDepotDropZonesPrecondition)
+
+	// Keyed by its elements: the parcel's copy and count under the one tag, and no others.
+	key := func(id string) fixture.ParcelKey { return fixture.ParcelKey{DepotID: "d1", ParcelID: id} }
+	var keys []fixture.ParcelKey
+	for i := range 15 {
+		id := fmt.Sprintf("p%02d", i)
+		var tags []string
+		if i < 3 {
+			tags = []string{"cold"}
+		}
+		must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d1", ParcelID: id, Tags: tags}))
+		keys = append(keys, key(id))
+	}
+	count := func(tag string) int64 {
+		t.Helper()
+		c, err := st.Parcels.TagCount(ctx, fixture.TagCountsKey{DepotID: "d1", TagsElem: tag})
+		must(t, err)
+		return c.Parcels
+	}
+	tagged := func(tag string) int {
+		t.Helper()
+		list, _, err := st.Parcels.Tagged(ctx, fixture.ParcelTaggedQuery{DepotID: "d1", TagsElem: tag}, dynago.Page{})
+		must(t, err)
+		return len(list)
+	}
+	must(t, st.Parcels.Tag(ctx, key("p00"), fixture.ParcelTag{Tags: []string{"fragile"}}))
+	if p, err := st.Parcels.Get(ctx, key("p00")); err != nil || fmt.Sprint(p.Tags) != "[cold fragile]" || count("fragile") != 1 || count("cold") != 3 || tagged("fragile") != 1 {
+		t.Fatalf("after tagging p00 fragile: %+v, %v", p, err)
+	}
+	// Adding what is there writes nothing.
+	writes := n.Writes()
+	var version string
+	must(t, st.Parcels.Tag(ctx, key("p00"), fixture.ParcelTag{Tags: []string{"fragile"}}, dynago.ReturnVersion(&version)))
+	if w := n.Writes() - writes; w != 0 || version == "" {
+		t.Fatalf("tagging p00 fragile again made %d writes (version %q), want none and its current version", w, version)
+	}
+	must(t, st.Parcels.Untag(ctx, key("p00"), fixture.ParcelUntag{Tags: []string{"fragile", "nope"}}))
+	if count("fragile") != 0 || tagged("fragile") != 0 || count("cold") != 3 {
+		t.Fatalf("after untagging p00: fragile %d counted, %d listed; cold %d", count("fragile"), tagged("fragile"), count("cold"))
+	}
+
+	// A batch: fifteen parcels, three of which already have the tag and are left alone.
+	gets, txs := n.BatchGetItem.Load(), n.TransactWriteItems.Load()
+	must(t, st.Parcels.TagSeveral(ctx, keys, fixture.ParcelTagSeveral{Tags: []string{"cold"}}))
+	if count("cold") != 15 || tagged("cold") != 15 {
+		t.Fatalf("after tagging all fifteen cold: %d counted, %d listed", count("cold"), tagged("cold"))
+	}
+	if g, x := n.BatchGetItem.Load()-gets, n.TransactWriteItems.Load()-txs; g != 3 || x < 2 || x > 3 {
+		t.Fatalf("TagSeveral made %d BatchGetItem and %d transactions for 15 parcels, 7 to a transaction; want 3 and at most 3", g, x)
+	}
+	writes = n.Writes()
+	must(t, st.Parcels.TagSeveral(ctx, keys, fixture.ParcelTagSeveral{Tags: []string{"cold"}}))
+	if w := n.Writes() - writes; w != 0 {
+		t.Fatalf("tagging them cold again made %d writes, want none", w)
+	}
+
+	// A constant element beside another change, under a precondition.
+	must(t, st.Parcels.Lose(ctx, key("p14")))
+	err := st.Parcels.FlagSeveral(ctx, keys[10:])
+	var be *dynago.BatchError
+	if !errors.As(err, &be) || len(be.Failed) != 1 || be.Failed[0].Index != 4 || !errors.Is(err, fixture.ErrParcelFlagSeveralPrecondition) {
+		t.Fatalf("FlagSeveral = %v, want only the lost parcel refused", err)
+	}
+	if p, err := st.Parcels.Get(ctx, key("p10")); err != nil || fmt.Sprint(p.Tags) != "[cold flagged]" || p.Note != "flagged" || count("flagged") != 4 {
+		t.Fatalf("after flagging: %+v, %v; %d flagged", p, err, count("flagged"))
+	}
+}

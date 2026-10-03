@@ -535,6 +535,8 @@ type Depot struct {
 	Name    string `dynamo:"name,omitempty"`
 	Closed  bool   `dynamo:"closed,omitempty"`
 	Parcels int64  `dynamo:"parcels,omitempty"`
+	// Floor zones. Nothing is keyed by them, so they change by element on one update, unread.
+	Zones []string `dynamo:"zones,set,omitempty"`
 
 	loaded *depotLoaded // set when the store returns the entity
 	stamps dynago.Timestamps
@@ -568,6 +570,7 @@ func (e *Depot) Timestamps() dynago.Timestamps { return e.stamps }
 func (e *Depot) clone() Depot {
 	c := *e
 	c.loaded = nil
+	c.Zones = append([]string(nil), e.Zones...)
 	return c
 }
 
@@ -601,8 +604,9 @@ func (k DepotKey) dynamoKey() (dynago.Key, error) {
 
 // Errors returned by DepotStore. Each wraps the matching dynago sentinel.
 var (
-	ErrDepotNotFound = fmt.Errorf("%w: Depot", dynago.ErrNotFound)
-	ErrDepotExists   = fmt.Errorf("%w: Depot", dynago.ErrExists)
+	ErrDepotNotFound              = fmt.Errorf("%w: Depot", dynago.ErrNotFound)
+	ErrDepotExists                = fmt.Errorf("%w: Depot", dynago.ErrExists)
+	ErrDepotDropZonesPrecondition = fmt.Errorf("%w: Depot.DropZones requires closed = false", dynago.ErrPrecondition)
 )
 
 const depotVersion = 1
@@ -621,7 +625,7 @@ type depotItem struct {
 }
 
 // depotKnown is every attribute this code writes on Depot items.
-var depotKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "depotId": true, "name": true, "closed": true, "parcels": true}
+var depotKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "depotId": true, "name": true, "closed": true, "parcels": true, "zones": true}
 
 // depotToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
 // unknown).
@@ -917,6 +921,65 @@ func (s *DepotStore) Close(ctx context.Context, k DepotKey, opts ...dynago.Write
 	})
 }
 
+// DepotAddZones holds the new values for Depot.AddZones.
+type DepotAddZones struct {
+	// Zones are the elements to add to zones, beside what the set already holds.
+	Zones []string
+}
+
+// AddZones updates zones of a Depot with a single conditional UpdateItem.
+func (s *DepotStore) AddZones(ctx context.Context, k DepotKey, v DepotAddZones, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	sets := []dynago.Set{
+		{Attr: "zones", Value: dynago.AddToSet(nil, v.Zones...), AddElems: true},
+	}
+	guard, err := s.guard(key, o, false)
+	if err != nil {
+		return err
+	}
+	return dynago.Retry(ctx, func() error {
+		rev, err := dynago.UpdateFields(ctx, s.t, key, sets, nil, guard, nil)
+		if err == nil {
+			o.Written(rev)
+		}
+		return dynago.StaleAs(guard.ExpectRev != 0, err)
+	})
+}
+
+// DepotDropZones holds the new values for Depot.DropZones.
+type DepotDropZones struct {
+	// Zones are the elements to remove from zones; the rest of the set stays.
+	Zones []string
+}
+
+// DropZones updates zones of a Depot when closed = false (else ErrDepotDropZonesPrecondition) with
+// a single conditional UpdateItem.
+func (s *DepotStore) DropZones(ctx context.Context, k DepotKey, v DepotDropZones, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	sets := []dynago.Set{
+		{Attr: "zones", Value: dynago.AddToSet(nil, v.Zones...), RemoveElems: true},
+	}
+	guard, err := s.guard(key, o, false)
+	if err != nil {
+		return err
+	}
+	return dynago.Retry(ctx, func() error {
+		rev, err := dynago.UpdateFields(ctx, s.t, key, sets, []dynago.Cond{{Attr: "closed", Value: false, Zero: true}}, guard, ErrDepotDropZonesPrecondition)
+		if err == nil {
+			o.Written(rev)
+		}
+		return dynago.StaleAs(guard.ExpectRev != 0, err)
+	})
+}
+
 // ---- Parcel ----
 
 // ParcelState is the set of values of Parcel.state.
@@ -1025,6 +1088,7 @@ var (
 	ErrParcelLosePrecondition          = fmt.Errorf("%w: Parcel.Lose requires state != \"lost\"", dynago.ErrPrecondition)
 	ErrParcelAnnotatePrecondition      = fmt.Errorf("%w: Parcel.Annotate requires state != \"lost\"", dynago.ErrPrecondition)
 	ErrParcelShelveSeveralPrecondition = fmt.Errorf("%w: Parcel.ShelveSeveral requires state = \"received\"", dynago.ErrPrecondition)
+	ErrParcelFlagSeveralPrecondition   = fmt.Errorf("%w: Parcel.FlagSeveral requires state != \"lost\"", dynago.ErrPrecondition)
 	ErrParcelArriveRequiresDepot       = fmt.Errorf("%w: Parcel.Arrive requires any Depot there is to have closed = false", dynago.ErrPrecondition)
 )
 
@@ -1893,6 +1957,184 @@ func (s *ParcelStore) ShelveSeveral(ctx context.Context, keys []ParcelKey) error
 		}
 		after := before.clone()
 		after.State = ParcelStateShelved
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		return dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), dynago.Change{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}, nil
+	})
+}
+
+// ParcelTag holds the new values for Parcel.Tag.
+type ParcelTag struct {
+	// Tags are the elements to add to tags, beside what the set already holds.
+	Tags []string
+}
+
+// Tag updates tags of a Parcel. It reads the item consistently first (not with dynago.From) because
+// the change affects the ByTag index entry, counter TagCounts, then writes everything in one
+// transaction guarded by the item's revision. In the same transaction it maintains counter
+// DepotParcels, counter TagCounts, counter StateCounts, copy index OnSite, copy index ByTag.
+func (s *ParcelStore) Tag(ctx context.Context, k ParcelKey, v ParcelTag, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	return dynago.Retry(ctx, func() error {
+		it, versioned, err := s.start(ctx, key, o, false)
+		if err != nil {
+			return err
+		}
+		before := &it.Parcel
+		after := before.clone()
+		after.Tags = dynago.AddToSet(after.Tags, v.Tags...)
+		if len(after.Tags) == len(before.Tags) {
+			o.Written(it.Rev) // the set is already as asked: nothing to write
+			return nil
+		}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return dynago.StaleAs(versioned, err)
+		}
+		o.Written(it.Rev + 1)
+		return nil
+	})
+}
+
+// ParcelUntag holds the new values for Parcel.Untag.
+type ParcelUntag struct {
+	// Tags are the elements to remove from tags; the rest of the set stays.
+	Tags []string
+}
+
+// Untag updates tags of a Parcel. It reads the item consistently first (not with dynago.From)
+// because the change affects the ByTag index entry, counter TagCounts, then writes everything in
+// one transaction guarded by the item's revision. In the same transaction it maintains counter
+// DepotParcels, counter TagCounts, counter StateCounts, copy index OnSite, copy index ByTag.
+func (s *ParcelStore) Untag(ctx context.Context, k ParcelKey, v ParcelUntag, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	return dynago.Retry(ctx, func() error {
+		it, versioned, err := s.start(ctx, key, o, false)
+		if err != nil {
+			return err
+		}
+		before := &it.Parcel
+		after := before.clone()
+		after.Tags = dynago.RemoveFromSet(after.Tags, v.Tags...)
+		if len(after.Tags) == len(before.Tags) {
+			o.Written(it.Rev) // the set is already as asked: nothing to write
+			return nil
+		}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return dynago.StaleAs(versioned, err)
+		}
+		o.Written(it.Rev + 1)
+		return nil
+	})
+}
+
+// ParcelTagSeveral holds the new values for Parcel.TagSeveral.
+type ParcelTagSeveral struct {
+	// Tags are the elements to add to tags, beside what the set already holds.
+	Tags []string
+}
+
+// TagSeveral updates tags of several Parcels, the same way. The items are read with one consistent
+// BatchGetItem and written up to 7 to a transaction, each guarded by its revision; a counter item
+// several of them change is updated once per transaction. In the same transaction it maintains
+// counter DepotParcels, counter TagCounts, counter StateCounts, copy index OnSite, copy index
+// ByTag. Each transaction is atomic; the batch is not. It returns nil if every item was written,
+// and otherwise a *dynago.BatchError naming those that were not, by their place in keys, each with
+// its error (ErrParcelNotFound, or what refused its transaction): the others were written. A key
+// given twice is written once.
+func (s *ParcelStore) TagSeveral(ctx context.Context, keys []ParcelKey, v ParcelTagSeveral) error {
+	ks := make([]dynago.Key, len(keys))
+	for i, k := range keys {
+		key, err := k.dynamoKey()
+		if err != nil {
+			return err
+		}
+		ks[i] = key
+	}
+	return dynago.BatchWrite(ctx, s.db, s.t, ks, 7, ErrParcelNotFound, func(key dynago.Key, raw dynamo.Item) (dynago.Op, dynago.Change, error) {
+		it, err := parcelDecode(raw)
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		before := &it.Parcel
+		after := before.clone()
+		after.Tags = dynago.AddToSet(after.Tags, v.Tags...)
+		if len(after.Tags) == len(before.Tags) {
+			return dynago.Op{}, dynago.Change{}, dynago.ErrNoChange // the set is already as asked
+		}
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		return dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), dynago.Change{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}, nil
+	})
+}
+
+// FlagSeveral updates note and tags of several Parcels, the same way, each when state != "lost".
+// The items are read with one consistent BatchGetItem and written up to 7 to a transaction, each
+// guarded by its revision; a counter item several of them change is updated once per transaction.
+// In the same transaction it maintains counter DepotParcels, counter TagCounts, counter
+// StateCounts, copy index OnSite, copy index ByTag. Each transaction is atomic; the batch is not.
+// It returns nil if every item was written, and otherwise a *dynago.BatchError naming those that
+// were not, by their place in keys, each with its error (ErrParcelNotFound,
+// ErrParcelFlagSeveralPrecondition, or what refused its transaction): the others were written. A
+// key given twice is written once.
+func (s *ParcelStore) FlagSeveral(ctx context.Context, keys []ParcelKey) error {
+	ks := make([]dynago.Key, len(keys))
+	for i, k := range keys {
+		key, err := k.dynamoKey()
+		if err != nil {
+			return err
+		}
+		ks[i] = key
+	}
+	return dynago.BatchWrite(ctx, s.db, s.t, ks, 7, ErrParcelNotFound, func(key dynago.Key, raw dynamo.Item) (dynago.Op, dynago.Change, error) {
+		it, err := parcelDecode(raw)
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		before := &it.Parcel
+		if before.State == ParcelStateLost {
+			return dynago.Op{}, dynago.Change{}, ErrParcelFlagSeveralPrecondition
+		}
+		after := before.clone()
+		after.Note = "flagged"
+		after.Tags = dynago.AddToSet(after.Tags, "flagged")
 		// Keep attributes this code doesn't know: a newer compatible version may have written them.
 		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
 		if err != nil {

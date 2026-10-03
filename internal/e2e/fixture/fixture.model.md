@@ -12,7 +12,7 @@ Table generation **1**: `fixture-g1`.
 |---|---|
 | Entities | 5: Account, Depot, Parcel, Tag, Damage |
 | Reads | 20: 6 by key, 5 queries, 8 counters, 1 scan |
-| Writes | 20: 17 in a transaction, 9 reading the item first |
+| Writes | 26: 21 in a transaction, 13 reading the item first |
 | Indexes | 1 GSI, 2 copy indexes (Known, Parcel.OnSite, Parcel.ByTag) |
 | Uniqueness claims, counters | 0, 7 |
 | Workload | No peak factor declared (peaks taken as the averages); volumes declared for 0 of 5 entities |
@@ -147,6 +147,8 @@ Every write the code can make, and everything each changes. Each is atomic: all 
 | `Account.HandOver` | Sets `successorId`, sets `status` = "closed", sets the Account's status to "active" | the Account exists; status = "active"; the Account exists with status = "pending" | Account<br>counter TenantCounts<br>counter RegionCounts<br>Account (sets its status to "active")<br>Account's counter TenantCounts<br>Account's counter RegionCounts | yes | transaction, 6 items | 12 | — |
 | `Depot.Open` | Creates a Depot | no Depot at the key | Depot<br>counter DepotTotals | no | transaction, 2 items | 4 | — |
 | `Depot.Close` | Sets `closed` = true | the Depot exists | Depot | no | single item | 1 | — |
+| `Depot.AddZones` | Adds elements to `zones` | the Depot exists | Depot | no | single item | 1 | — |
+| `Depot.DropZones` | Removes elements from `zones` | the Depot exists; closed = false | Depot | no | single item | 1 | — |
 | `Parcel.Receive` | Creates a Parcel, sets `state` = "received" | no Parcel at the key | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>GSI Known entry<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts | no | transaction, 10 items | 13 / 21 | — |
 | `Parcel.Arrive` | Creates a Parcel, sets `state` = "received", creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels | no Parcel at the key; any Depot there is has closed = false (none is created) | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>GSI Known entry<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts<br>Depot (creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels)<br>Depot's counter DepotTotals | no | transaction, 12 items | 17 / 25 | — |
 | `Parcel.Leave` | Creates a Parcel, sets `state` = "out", creates the Depot if there is none | no Parcel at the key | Parcel<br>copy ByTag (one per tags element)<br>GSI Known entry<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts<br>Depot (creates the Depot if there is none)<br>Depot's counter DepotTotals | no | transaction, 11 items | 15 / 23 | — |
@@ -156,6 +158,10 @@ Every write the code can make, and everything each changes. Each is atomic: all 
 | `Parcel.Annotate` | Sets `note` | the Parcel exists; state != "lost" | Parcel | no | single item | 1 | — |
 | `Parcel.Retag` | Sets `tags` | the Parcel exists | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes | transaction, 13 items | 10 / 26 | — |
 | `Parcel.ShelveSeveral` | For each of several Parcels (20 a call): sets `state` = "shelved" | the Parcel exists; state = "received" | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts (moved: two counter items) | yes, together | each transaction, not the batch: up to 9 Parcels to one | 280 / 440 | — |
+| `Parcel.Tag` | Adds elements to `tags` | the Parcel exists | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes | transaction, 13 items | 10 / 26 | — |
+| `Parcel.Untag` | Removes elements from `tags` | the Parcel exists | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes | transaction, 13 items | 10 / 26 | — |
+| `Parcel.TagSeveral` | For each of several Parcels (20 a call): adds elements to `tags` | the Parcel exists | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes, together | each transaction, not the batch: up to 7 Parcels to one | 200 / 520 | — |
+| `Parcel.FlagSeveral` | For each of several Parcels (10 a call): sets `note` = "flagged", adds "flagged" to `tags` | the Parcel exists; state != "lost" | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes, together | each transaction, not the batch: up to 7 Parcels to one | 100 / 260 | — |
 | `Parcel.AnnotateSeveral` | For each of several Parcels (10 a call): sets `note` | the Parcel exists | Parcel | yes, together | each transaction, not the batch: up to 100 Parcels to one | 20 | — |
 | `Tag.Define` | Creates a Tag | no Tag at the key | Tag | no | single item | 1 | — |
 | `Tag.Describe` | Sets `about` | the Tag exists; counter TagCounts has onSite = 0 | Tag<br>check counter TagCounts | no (read-free) | transaction, 2 items | 4 | — |
@@ -268,7 +274,7 @@ Unknown counts: nothing declares how many items share a value of `tenantId` in `
 | Entity | Expected items | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
 |---|---|---|---|---|---|
 | Account | not declared | 277 B / 543 B | 0.00 GB | $0.00 | $0.00 |
-| Depot | not declared | 198 B / 335 B | 0.00 GB | $0.00 | $0.00 |
+| Depot | not declared | 263 B / 740 B | 0.00 GB | $0.00 | $0.00 |
 | Parcel | not declared | 396 B / 796 B | 0.00 GB | $0.00 | $0.00 |
 | Tag | not declared | 220 B / 442 B | 0.00 GB | $0.00 | $0.00 |
 | Damage | not declared | 286 B / 596 B | 0.00 GB | $0.00 | $0.00 |
@@ -384,6 +390,10 @@ flowchart LR
   w_Open --> item_Depot & counter_DepotTotals
   w_Close(["Close"])
   w_Close --> item_Depot
+  w_AddZones(["AddZones"])
+  w_AddZones --> item_Depot
+  w_DropZones(["DropZones"])
+  w_DropZones --> item_Depot
   r_Get{{"Get"}}
   item_Depot --> r_Get
   r_Totals{{"Totals"}}
@@ -404,6 +414,7 @@ Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB
 | `name` | string | `name` | 20 / 64 B |  |
 | `closed` | bool | `closed` | 1 / 1 B |  |
 | `parcels` | int | `parcels` | 8 / 11 B |  |
+| `zones` | string_set | `zones` | 60 / 400 B | Floor zones. Nothing is keyed by them, so they change by element on one update, unread. |
 
 #### Stored items
 
@@ -411,7 +422,7 @@ Every item that exists because of a Depot, and what keeps it up to date.
 
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
-| **Depot** | `D#{depotId}` | `DEPOT` | `D#{depotId}`<br>`DEPOT` | 198 B / 335 B | the writes below |
+| **Depot** | `D#{depotId}` | `DEPOT` | `D#{depotId}`<br>`DEPOT` | 263 B / 740 B | the writes below |
 | Counter `DepotTotals` | `DEPOTS` | `TOTALS` | `DEPOTS`<br>`TOTALS` | ~119 B | the writes below, with atomic ADDs in the same transaction. |
 
 #### Counters
@@ -434,6 +445,8 @@ Every item that exists because of a Depot, and what keeps it up to date.
 |---|---|---|---|---|---|---|---|
 | `Open` | create (fails if it exists) | Depot<br>counter DepotTotals | no | transaction (2 items) | — | 4 | `ErrDepotExists` |
 | `Close` | set `closed` = true | Depot | no | single item | optional | 1 | `ErrDepotNotFound`<br>`dynago.ErrVersionMismatch` (with a version) |
+| `AddZones` | add elements to `zones` | Depot | no | single item | optional | 1 | `ErrDepotNotFound`<br>`dynago.ErrVersionMismatch` (with a version) |
+| `DropZones` | remove elements from `zones` when `closed = false` | Depot | no | single item | optional | 1 | `ErrDepotNotFound`<br>`ErrDepotDropZonesPrecondition`<br>`dynago.ErrVersionMismatch` (with a version) |
 
 ### Parcel
 
@@ -471,6 +484,14 @@ flowchart LR
   w_Retag --> item_Parcel & ix_ByTag & counter_TagCounts
   w_ShelveSeveral(["ShelveSeveral"])
   w_ShelveSeveral --> item_Parcel & ix_OnSite & ix_ByTag & counter_DepotParcels & counter_TagCounts & counter_StateCounts
+  w_Tag(["Tag"])
+  w_Tag --> item_Parcel & ix_ByTag & counter_TagCounts
+  w_Untag(["Untag"])
+  w_Untag --> item_Parcel & ix_ByTag & counter_TagCounts
+  w_TagSeveral(["TagSeveral"])
+  w_TagSeveral --> item_Parcel & ix_ByTag & counter_TagCounts
+  w_FlagSeveral(["FlagSeveral"])
+  w_FlagSeveral --> item_Parcel & ix_ByTag & counter_TagCounts
   w_AnnotateSeveral(["AnnotateSeveral"])
   w_AnnotateSeveral --> item_Parcel
   r_Get{{"Get"}}
@@ -567,6 +588,10 @@ Every item that exists because of a Parcel, and what keeps it up to date.
 | `Annotate` | set `note` when `state != "lost"` | Parcel | no | single item | optional | 1 | `ErrParcelNotFound`<br>`ErrParcelAnnotatePrecondition`<br>`dynago.ErrVersionMismatch` (with a version) |
 | `Retag` | set `tags` | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes (1 consistent read; none with `dynago.From`) | transaction (13 items) | optional | 10 / 26 | `ErrParcelNotFound`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 | `ShelveSeveral` | of each of several items: set `state` = "shelved" when `state = "received"` | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts (moved: two counter items) | yes (one consistent BatchGetItem per transaction) | each transaction, not the batch: up to 9 Parcels to one | — | 280 / 440 for 20 Parcels | `*dynago.BatchError`, holding for each item not written:<br>`ErrParcelNotFound`<br>`ErrParcelShelveSeveralPrecondition`<br>`dynago.ErrConflict` (after retries) |
+| `Tag` | add elements to `tags` | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes (1 consistent read; none with `dynago.From`) | transaction (13 items) | optional | 10 / 26 | `ErrParcelNotFound`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `Untag` | remove elements from `tags` | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes (1 consistent read; none with `dynago.From`) | transaction (13 items) | optional | 10 / 26 | `ErrParcelNotFound`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `TagSeveral` | of each of several items: add elements to `tags` | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes (one consistent BatchGetItem per transaction) | each transaction, not the batch: up to 7 Parcels to one | — | 200 / 520 for 20 Parcels | `*dynago.BatchError`, holding for each item not written:<br>`ErrParcelNotFound`<br>`dynago.ErrConflict` (after retries) |
+| `FlagSeveral` | of each of several items: set `note` = "flagged", add "flagged" to `tags` when `state != "lost"` | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes (one consistent BatchGetItem per transaction) | each transaction, not the batch: up to 7 Parcels to one | — | 100 / 260 for 10 Parcels | `*dynago.BatchError`, holding for each item not written:<br>`ErrParcelNotFound`<br>`ErrParcelFlagSeveralPrecondition`<br>`dynago.ErrConflict` (after retries) |
 | `AnnotateSeveral` | of each of several items: set `note` | Parcel | yes (one consistent BatchGetItem per transaction) | each transaction, not the batch: up to 100 Parcels to one | — | 20 for 10 Parcels | `*dynago.BatchError`, holding for each item not written:<br>`ErrParcelNotFound`<br>`dynago.ErrConflict` (after retries) |
 
 ### Tag

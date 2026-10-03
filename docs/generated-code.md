@@ -250,7 +250,9 @@ func (s *LoanStore) Return(ctx context.Context, k LoanKey, v LoanReturn, opts ..
 func (s *MemberStore) UpdateProfile(ctx context.Context, k MemberKey, v MemberUpdateProfile, opts ...dynago.WriteOption) error
 ```
 
-`v` is present if the update has `update:` or `patch:` fields; `patch` fields are pointers, and
+`v` is present if the update has `update:` or `patch:` fields, or takes elements for `add_to` or
+`remove_from` (a `[]string` named after the set: the elements to add or remove, not the new set);
+`patch` fields are pointers, and
 `nil` leaves a field unchanged (`dynago.Ptr` makes pointers). An update whose patch fields are all
 `nil` and that has no other changes writes nothing. `limits` is present if the update can grow a
 `limit: arg` value. `opts` takes `dynago.From(entity)`, `dynago.IfVersion(version)` and

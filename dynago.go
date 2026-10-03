@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -71,6 +72,9 @@ var (
 	// ErrContention is returned when DynamoDB cancels a transaction because another transaction
 	// touched the same item. Generated writes retry on it.
 	ErrContention = errors.New("dynago: transaction conflict")
+	// ErrNoChange is returned internally by a batch write's item that is already as the write
+	// would leave it (the element it adds is there): the item is left alone, and isn't a failure.
+	ErrNoChange = errors.New("dynago: nothing to change")
 )
 
 // Attribute names written on every item.
@@ -141,6 +145,29 @@ func RequireLimit(name string, l Limit) error {
 		return fmt.Errorf("%w: %s (use dynago.Max(n), or dynago.Unlimited() on purpose)", ErrLimitRequired, name)
 	}
 	return nil
+}
+
+// AddToSet returns set with the elements it doesn't already hold added, in order. Empty elements
+// are left out: a string set can't hold one.
+func AddToSet(set []string, elems ...string) []string {
+	out := append([]string(nil), set...)
+	for _, el := range elems {
+		if el != "" && !slices.Contains(out, el) {
+			out = append(out, el)
+		}
+	}
+	return out
+}
+
+// RemoveFromSet returns set without the elements.
+func RemoveFromSet(set []string, elems ...string) []string {
+	var out []string
+	for _, el := range set {
+		if !slices.Contains(elems, el) {
+			out = append(out, el)
+		}
+	}
+	return out
 }
 
 // Ptr returns a pointer to v, for optional (patch) update fields: dynago.Ptr("new title").

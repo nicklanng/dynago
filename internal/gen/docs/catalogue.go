@@ -257,6 +257,10 @@ func does(w *schema.Write) string {
 	for _, s := range w.Sets {
 		parts = append(parts, fmt.Sprintf("sets `%s` = %s", s.Field.Name, value(s.Value)))
 	}
+	for _, el := range w.Elems {
+		t := elemsText(el)
+		parts = append(parts, strings.Replace(strings.Replace(t, "add ", "adds ", 1), "remove ", "removes ", 1))
+	}
 	for _, rq := range w.Requires {
 		if eff := rq.Effect(w.Entity.Name); eff != "" {
 			parts = append(parts, strings.Replace(eff, "sets its ", "sets the "+rq.Name+"'s ", 1))

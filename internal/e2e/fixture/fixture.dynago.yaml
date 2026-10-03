@@ -60,6 +60,7 @@ entities:
       name: string
       closed: bool
       parcels: int
+      zones: { type: string_set, doc: "Floor zones. Nothing is keyed by them, so they change by element on one update, unread." }
     key:
       pk: "D#{depotId}"
       sk: "DEPOT"
@@ -77,6 +78,8 @@ entities:
     writes:
       Open: create
       Close: { set: { closed: true } }
+      AddZones: { add_to: { zones: arg } }
+      DropZones: { remove_from: { zones: arg }, when: { closed: false } }
 
   # A parcel moves through a depot's states. Its index, counter values and preconditions exclude a
   # state (not) or list several (in), rather than naming one.
@@ -166,6 +169,12 @@ entities:
       # Batch writes: the same change to several parcels, several to a transaction, with the
       # depot's counter items updated once per transaction.
       ShelveSeveral: { set: { state: shelved }, when: { state: received }, batch: 20 }
+      # One element of a set that keys copies and counters: added or removed without replacing
+      # the set, to one parcel or to several.
+      Tag: { add_to: { tags: arg } }
+      Untag: { remove_from: { tags: arg } }
+      TagSeveral: { add_to: { tags: arg }, batch: 20 }
+      FlagSeveral: { add_to: { tags: flagged }, set: { note: flagged }, when: { state: { not: lost } }, batch: 10 }
       AnnotateSeveral: { update: [note], batch: 10 }
 
   # A tag a depot defines for its parcels. Retiring one needs no parcel to carry it, and takes its

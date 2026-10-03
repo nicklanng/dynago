@@ -1141,7 +1141,7 @@ func (r *resolver) write(e *Entity, name string, raw RawWrite) *Write {
 			r.errorf("%s %s: %s is part of the primary key and cannot be updated", where, list, fn)
 			return nil
 		case seen[fn]:
-			r.errorf("%s: %s is listed more than once across update, patch and set", where, fn)
+			r.errorf("%s: %s is listed more than once across update, patch, set, add_to and remove_from", where, fn)
 		}
 		seen[fn] = true
 		return f
@@ -1171,8 +1171,34 @@ func (r *resolver) write(e *Entity, name string, raw RawWrite) *Write {
 		}
 		w.Sets = append(w.Sets, SetConst{Field: f, Value: v})
 	}
+	for _, list := range []struct {
+		name   string
+		raw    Ordered[string]
+		remove bool
+	}{{"add_to", raw.AddTo, false}, {"remove_from", raw.RemoveFrom, true}} {
+		for _, en := range list.raw {
+			f := argField(list.name, en.Key)
+			switch {
+			case f == nil:
+				continue
+			case f.Type != TypeStringSet:
+				r.errorf("%s %s: %s is a %s; elements are added to and removed from string_set fields", where, list.name, f.Name, f.Type)
+				continue
+			case w.Kind != WriteUpdate:
+				r.errorf("%s: %s applies to updates", where, list.name)
+				continue
+			case en.Value == "":
+				r.errorf("%s %s: %s: give arg (the caller passes the elements) or one element", where, list.name, f.Name)
+				continue
+			case list.remove && f.Required:
+				r.errorf("%s remove_from: %s is required, and removing its elements could leave it empty; replace it whole (update: [%s])", where, f.Name, f.Name)
+				continue
+			}
+			w.Elems = append(w.Elems, SetElems{Field: f, Remove: list.remove, Arg: en.Value == "arg", Elem: en.Value})
+		}
+	}
 	if w.Kind == WriteUpdate {
-		if len(w.Args)+len(w.Patch)+len(w.Sets) == 0 {
+		if len(w.Args)+len(w.Patch)+len(w.Sets)+len(w.Elems) == 0 {
 			r.errorf("%s: an update must change at least one field", where)
 		}
 		w.When = r.preds(e, where+" when", raw.When)
@@ -1181,7 +1207,7 @@ func (r *resolver) write(e *Entity, name string, raw RawWrite) *Write {
 				r.errorf("%s when: %s is a primary key field; the key already selects the item", where, p.Field.Name)
 			}
 		}
-		if len(w.Args)+len(w.Patch) > 0 {
+		if len(w.Args)+len(w.Patch)+len(w.ElemArgs()) > 0 {
 			r.claimType(e.GoName+w.GoName, where)
 		}
 	}
@@ -2048,6 +2074,12 @@ func transitionable(e *Entity, w *Write, changed map[string]bool) bool {
 	inputs := e.DerivedInputs()
 	for _, f := range w.Patch {
 		if inputs[f.Name] {
+			return false
+		}
+	}
+	for _, el := range w.Elems {
+		// What the set holds after depends on what it held before.
+		if inputs[el.Field.Name] {
 			return false
 		}
 	}

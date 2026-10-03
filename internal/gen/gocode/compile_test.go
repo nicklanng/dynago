@@ -104,6 +104,15 @@ var awkwardEntities = []struct {
 		"      Make: { create: true, requires: { PerLabel: { key: { tenantId: tenantId, labels: name }, when: { n: 0 } } } }\n" +
 		"      Drop: { delete: true, requires: { PerLabel: { key: { tenantId: tenantId, labels: name }, consume: true }, Whole: { key: { tenantId: tenantId }, when: { n: 0 }, consume: true } } }\n" +
 		"      Touch: { update: [until], requires: { PerLabel: { key: { tenantId: tenantId, labels: name }, when: { ranks: 0 }, consume: true } } }\n", ""},
+	{"set elements added and removed", "  Shelf:\n    fields:\n      tenantId: string\n      shelfId: string\n      name: string\n      note: string\n      labels: string_set\n      marks: string_set\n      flags: string_set\n      until: time\n" +
+		"    ttl: until\n    key: { pk: \"T#{tenantId}\", sk: \"SHELF#{shelfId}\" }\n" +
+		"    indexes:\n      ByLabel: { pk: \"L#{tenantId}#{labels}#X\", sk: \"S#{shelfId}\", project: [name] }\n" +
+		"    counters:\n      Marks: { pk: \"T#{tenantId}\", sk: \"MARK#{marks}\", values: { n: count } }\n" +
+		"    writes:\n      Make: create\n" +
+		"      Both: { add_to: { labels: arg, marks: \"50% off\" }, remove_from: { flags: arg }, update: [name], patch: [note], when: { note: { not: locked } } }\n" +
+		"      Only: { remove_from: { labels: gone }, add_to: { marks: arg } }\n" +
+		"      Plain: { add_to: { flags: arg } }\n      Fixed: { remove_from: { flags: old } }\n" +
+		"      Many: { add_to: { labels: arg }, remove_from: { marks: old, flags: arg }, batch: 12 }\n", ""},
 	{"entity named like another's store", "  ThingStore:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},
 	{"entities differing in initialism case", "  THING:\n    fields: { id: string }\n    key: { pk: \"U#{id}\", sk: \"U\" }\n", "collides"},
 	{"entity named Store", "  Store:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},

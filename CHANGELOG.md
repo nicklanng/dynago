@@ -59,6 +59,13 @@ format, the generated code and the runtime API; the changelog says how to move.
   yet: delete the lock file and generate again. The schema-changes guide and getting-started say
   when that is right.
 
+- Sets change by element: `AddLabel: { add_to: { labelIds: arg } }` and
+  `RemoveLabel: { remove_from: { labelIds: arg } }` add and remove elements without replacing the
+  set, so the caller no longer reads, edits and writes back under a version. Where nothing is
+  keyed by the set it is one atomic UpdateItem with no read; where copies and counters are keyed
+  by its elements, only those of the elements that change are written. Both work with `batch`,
+  which leaves alone an item already as asked. `dynago.Set` gained `AddElems` and `RemoveElems`,
+  and the runtime `AddToSet`, `RemoveFromSet` and `ErrNoChange`.
 - A `requires` on a counter can delete the counter item: `consume: true` removes it in the write's
   transaction, provided every value reads zero. Deleting a label takes its counter item with it,
   and is refused while anything is still counted under it. A requirement can also name a counter
