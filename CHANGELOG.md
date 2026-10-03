@@ -20,6 +20,12 @@ format, the generated code and the runtime API; the changelog says how to move.
   regenerating, rename the uses of the affected names in your code; the compiler finds them.
   Stored attribute names don't change.
 
+- Conditions can exclude a value or list several: `where: { mailbox: { not: trash } }`,
+  `when: { mailbox: { in: [inbox, archived] } }`. They work wherever a condition does: an index's
+  and a counter value's `where`, a write's `when`, and a require's `when` (where `not` may also
+  name a field of the writing entity). A `when` using one doesn't pin the state the write starts
+  from, so a write that moves a counter or an index entry on that field reads the item first.
+  The runtime's `dynago.Cond` gained `Not` and `In` for them.
 - An `accept` on an entity also covers the rule's findings about what the entity declares: its
   fields, indexes, constraints, counters, reads and writes. An entity whose fields are all copies,
   for one reason, states the reason once, and the model document lists it once. An acceptance on

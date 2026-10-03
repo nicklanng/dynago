@@ -212,7 +212,7 @@ Add a field `dueAt: time` and run `generate`:
 ```
 tasks.dynago.yaml: entity Task: its storage shape changed but its version is still 1. Set `version: 2` so stored
 items record which shape wrote them. Changes: field dueAt added
-Or, if no table has been created from this schema yet, delete tasks.dynago.lock and generate again: there are
+or, if no table has been created from this schema yet, delete tasks.dynago.lock and generate again: there are
 no stored items to keep track of, and the design is recorded afresh as version 1
 ```
 

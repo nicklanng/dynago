@@ -108,14 +108,26 @@ func (g *gen) requirementFields(rq *schema.Require, recv string) string {
 	return b.String()
 }
 
-// condLit renders a dynago.Cond for a predicate on another entity's field, whose value is a
-// constant or a field of the writing entity read from recv.
+// condLit renders a dynago.Cond for a predicate on a field of te, whose value is a constant or a
+// field of the writing entity read from recv.
 func condLit(te *schema.Entity, p *schema.Pred, recv string) string {
-	if p.Source != nil {
-		x := recv + "." + p.Source.GoName
-		return fmt.Sprintf("{Attr: %q, Value: %s, Zero: %s}", p.Field.Attr, x, zeroCond(p.Source, x))
+	not := ""
+	if p.Not {
+		not = ", Not: true"
 	}
-	return fmt.Sprintf("{Attr: %q, Value: %s, Zero: %t}", p.Field.Attr, literal(te, p.Field, p.Value), isZeroValue(p.Value))
+	switch {
+	case p.Source != nil:
+		x := recv + "." + p.Source.GoName
+		return fmt.Sprintf("{Attr: %q, Value: %s, Zero: %s%s}", p.Field.Attr, x, zeroCond(p.Source, x), not)
+	case p.In != nil:
+		vals, zero := make([]string, len(p.In)), false
+		for i, v := range p.In {
+			vals[i] = literal(te, p.Field, v)
+			zero = zero || isZeroValue(v)
+		}
+		return fmt.Sprintf("{Attr: %q, In: []any{%s}, Zero: %t}", p.Field.Attr, strings.Join(vals, ", "), zero)
+	}
+	return fmt.Sprintf("{Attr: %q, Value: %s, Zero: %t%s}", p.Field.Attr, literal(te, p.Field, p.Value), isZeroValue(p.Value), not)
 }
 
 // sourceValue renders the value a requirement gives field tf of te: a constant, or the writing
@@ -192,7 +204,9 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 				known = append(known, fmt.Sprintf("%s: k.%s", f.GoName, f.GoName))
 			}
 			for _, p := range rq.When {
-				known = append(known, fmt.Sprintf("%s: %s", p.Field.GoName, sourceValue(e, te, p.Field, p.Source, p.Value, "e")))
+				if p.Pins() {
+					known = append(known, fmt.Sprintf("%s: %s", p.Field.GoName, sourceValue(e, te, p.Field, p.Source, p.Value, "e")))
+				}
 			}
 			g.p("before := %s{%s}", te.GoName, strings.Join(known, ", "))
 			g.p("after := before.clone()")
@@ -227,11 +241,9 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		g.p("before := &it.%s", te.GoName)
 	}
 	if len(rq.When) > 0 {
-		var conds []string
-		for _, p := range rq.When {
-			conds = append(conds, fmt.Sprintf("before.%s == %s", p.Field.GoName, sourceValue(e, te, p.Field, p.Source, p.Value, "e")))
-		}
-		g.p("if %s {", negate(strings.Join(conds, " && ")))
+		g.p("if %s {", predsExpr(rq.When, true, func(p *schema.Pred) (string, func(any) string) {
+			return "before." + p.Field.GoName, func(v any) string { return sourceValue(e, te, p.Field, p.Source, v, "e") }
+		}))
 		g.p("return nil, dynago.Change{}, %s", rq.ErrName)
 		g.p("}")
 	}

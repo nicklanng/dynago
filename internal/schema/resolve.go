@@ -469,14 +469,77 @@ func (r *resolver) preds(e *Entity, where string, raw Ordered[any]) []*Pred {
 			r.errorf("%s: %s is not a field of %s", where, p.Key, e.Name)
 			continue
 		}
-		v, err := coerce(f, p.Value)
+		pr, err := pred(f, p.Value)
 		if err != nil {
 			r.errorf("%s: %s: %v", where, p.Key, err)
 			continue
 		}
-		out = append(out, &Pred{Field: f, Value: v})
+		out = append(out, pr)
 	}
 	return out
+}
+
+// pred resolves one predicate on field f: a constant (equal to it), `{ not: <constant> }` or
+// `{ in: [<constant>, ...] }`.
+func pred(f *Field, raw any) (*Pred, error) {
+	form, ok := raw.(map[string]any)
+	if !ok {
+		v, err := coerce(f, raw)
+		if err != nil {
+			return nil, err
+		}
+		return &Pred{Field: f, Value: v}, nil
+	}
+	if len(form) != 1 {
+		return nil, fmt.Errorf("want a value, { not: <value> } or { in: [<value>, ...] }")
+	}
+	for op, arg := range form {
+		switch op {
+		case "not":
+			v, err := coerce(f, arg)
+			if err != nil {
+				return nil, fmt.Errorf("not: %v", err)
+			}
+			return &Pred{Field: f, Value: v, Not: true}, nil
+		case "in":
+			list, ok := arg.([]any)
+			if !ok || len(list) == 0 {
+				return nil, fmt.Errorf("in: want a list of values")
+			}
+			pr := &Pred{Field: f, In: []any{}}
+			for _, x := range list {
+				v, err := coerce(f, x)
+				if err != nil {
+					return nil, fmt.Errorf("in: %v", err)
+				}
+				if pr.Matches(v) {
+					return nil, fmt.Errorf("in: %v is listed twice", x)
+				}
+				pr.In = append(pr.In, v)
+			}
+			if len(pr.In) == 1 {
+				return nil, fmt.Errorf("in: one value is an equality; write %s: %v", f.Name, list[0])
+			}
+			if allowed, listable := pr.Allowed(); listable && len(allowed) == len(domainOf(f)) {
+				return nil, fmt.Errorf("in: every value of %s is listed, so the condition always holds; remove it", f.Name)
+			}
+			return pr, nil
+		default:
+			return nil, fmt.Errorf("unknown form %q: want a value, { not: <value> } or { in: [<value>, ...] }", op)
+		}
+	}
+	return nil, nil
+}
+
+// domainOf lists every value an enum or bool field can hold.
+func domainOf(f *Field) []string {
+	switch f.Type {
+	case TypeEnum:
+		return f.Enum
+	case TypeBool:
+		return []string{"false", "true"}
+	}
+	return nil
 }
 
 // coerce checks a YAML scalar against a field type and returns it in canonical Go form.
@@ -1175,18 +1238,27 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 			r.errorf("%s when: %s is not a field of %s", where, p.Key, te.Name)
 			continue
 		}
-		if ref, ok := fieldRef(p.Value); ok {
+		// A reference to the writing entity's field: "{memberId}", or { not: "{memberId}" }.
+		raw, not := p.Value, false
+		if form, ok := raw.(map[string]any); ok && len(form) == 1 {
+			if arg, ok := form["not"]; ok {
+				if _, isRef := fieldRef(arg); isRef {
+					raw, not = arg, true
+				}
+			}
+		}
+		if ref, ok := fieldRef(raw); ok {
 			if sf := r.source(e, where+" when "+p.Key, ref, te, f); sf != nil {
-				req.When = append(req.When, &Pred{Field: f, Source: sf})
+				req.When = append(req.When, &Pred{Field: f, Source: sf, Not: not})
 			}
 			continue
 		}
-		v, err := coerce(f, p.Value)
+		pr, err := pred(f, p.Value)
 		if err != nil {
 			r.errorf("%s when: %s: %v", where, p.Key, err)
 			continue
 		}
-		req.When = append(req.When, &Pred{Field: f, Value: v})
+		req.When = append(req.When, pr)
 	}
 	for _, sc := range raw.Set {
 		f := te.Field(sc.Key)
@@ -1570,7 +1642,9 @@ func requiresKnown(w *Write) bool {
 		known[f] = true
 	}
 	for _, p := range w.When {
-		known[p.Field] = true
+		if p.Pins() {
+			known[p.Field] = true
+		}
 	}
 	for _, f := range w.Args {
 		known[f] = true
@@ -1599,7 +1673,10 @@ func transitionable(e *Entity, w *Write, changed map[string]bool) bool {
 		known[f] = true
 	}
 	for _, p := range w.When {
-		known[p.Field] = true
+		// `not` and `in` leave several values possible: the field isn't known.
+		if p.Pins() {
+			known[p.Field] = true
+		}
 	}
 	touches := func(fs ...*Field) bool {
 		for _, f := range fs {
@@ -1683,7 +1760,7 @@ func transitionable(e *Entity, w *Write, changed map[string]bool) bool {
 func CanGrow(w *Write, v *CounterValue, anyChange bool) bool {
 	for _, p := range v.Where {
 		for _, s := range w.Sets {
-			if s.Field == p.Field && fmt.Sprint(s.Value) != fmt.Sprint(p.Value) {
+			if s.Field == p.Field && !p.Matches(s.Value) {
 				return false // the result never matches, so never contributes
 			}
 		}

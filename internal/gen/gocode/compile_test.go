@@ -28,6 +28,12 @@ var awkward = []struct {
 	{"unique fields named like locals", "      claim: string\n      it: string\n      fmt: string\n    unique:\n      U: { fields: [claim, it, fmt] }\n    access:\n      ByU: { get: { unique: U } }\n", ""},
 	{"unique set, lowered and not last in its key", "      emails: string_set\n    unique:\n      Email: { fields: [tenantId, emails], pk: \"E#{emails|lower}#T#{tenantId}\" }\n    access:\n      ByEmail: { get: { unique: Email } }\n", ""},
 	{"scans, one of an expiring entity", "      until: time\n    ttl: until\n    access:\n      All: { scan: true, reason: nightly export, consistent: true }\n      Page: { scan: true, page: 10, max_page: 20, reason: backfill }\n", ""},
+	{"not and in on every type", "      open: bool\n      rank: int\n      mood: { type: enum, values: [calm, cross, glad] }\n" +
+		"    indexes:\n      Live: { pk: \"L#{tenantId}\", sk: \"T#{thingId}\", project: keys, where: { open: { not: false }, rank: { in: [1, 2] }, note: { not: \"\" }, mood: { not: cross } } }\n" +
+		"      Kept: { strategy: copy, pk: \"K#{tenantId}\", sk: \"T#{thingId}\", project: [name], where: { name: { in: [\"a && b\", \"c || d\"] } } }\n" +
+		"    counters:\n      Moods: { pk: \"M#{tenantId}\", sk: \"MOODS\", values: { happy: { count: true, where: { mood: { in: [calm, glad] }, rank: { not: 0 } } } } }\n" +
+		"    access:\n      Get: get\n      Live: { query: Live }\n      Kept: { query: Kept }\n", ""},
+	{"not and in as preconditions", "      W: { update: [name], when: { name: { not: \"x && y\" }, note: { in: [\"\", \"50% || 60%\"] } } }\n", ""},
 	{"range query key field named from", "      from: string\n    indexes:\n      ByFrom: { pk: \"F#{from}\", sk: \"AT#{at}\", project: keys }\n    access:\n      L: { query: ByFrom, range: at }\n", "collides with the range bound"},
 }
 
@@ -52,6 +58,10 @@ entities:
 var awkwardEntities = []struct {
 	name, extra, refused string
 }{
+	{"requires with not and in", "  Part:\n    fields:\n      tenantId: string\n      thingId: string\n      partId: string\n      label: string\n" +
+		"    key: { pk: \"T#{tenantId}\", sk: \"PART#{thingId}#{partId}\" }\n    writes:\n" +
+		"      Add: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, when: { name: { not: \"{label}\" }, note: { in: [a, b] } } } } }\n" +
+		"      Mark: { update: [label], requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, when: { note: { not: gone } }, set: { name: \"{label}\" } } } }\n", ""},
 	{"entity named like another's store", "  ThingStore:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},
 	{"entities differing in initialism case", "  THING:\n    fields: { id: string }\n    key: { pk: \"U#{id}\", sk: \"U\" }\n", "collides"},
 	{"entity named Store", "  Store:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},

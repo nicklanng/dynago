@@ -74,13 +74,59 @@
     },
     "predicates": {
       "type": "object",
-      "description": "Equality conditions, all of which must hold: {field: value}.",
+      "description": "Constants by field: {field: value}.",
       "minProperties": 1,
       "propertyNames": {
         "$ref": "#/$defs/camelName"
       },
       "additionalProperties": {
         "$ref": "#/$defs/scalar"
+      }
+    },
+    "conditions": {
+      "type": "object",
+      "description": "Conditions on fields, all of which must hold: {field: value} (equal to it), {field: {not: value}} (any other value) or {field: {in: [value, ...]}} (one of them).",
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/camelName"
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/scalar"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "not": {
+                "$ref": "#/$defs/scalar",
+                "description": "The field holds any value but this one."
+              }
+            },
+            "required": [
+              "not"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "in": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/scalar"
+                },
+                "minItems": 2,
+                "uniqueItems": true,
+                "description": "The field holds one of these values."
+              }
+            },
+            "required": [
+              "in"
+            ],
+            "additionalProperties": false
+          }
+        ]
       }
     },
     "fieldList": {
@@ -507,7 +553,7 @@
           "$ref": "#/$defs/projection"
         },
         "where": {
-          "$ref": "#/$defs/predicates"
+          "$ref": "#/$defs/conditions"
         },
         "doc": {
           "$ref": "#/$defs/doc"
@@ -627,7 +673,7 @@
               "description": "An int field to sum."
             },
             "where": {
-              "$ref": "#/$defs/predicates"
+              "$ref": "#/$defs/conditions"
             },
             "limit": {
               "oneOf": [
@@ -812,7 +858,7 @@
               "description": "Fields set to constants. On a create, they override what the caller passed (a new loan is always active)."
             },
             "when": {
-              "$ref": "#/$defs/predicates",
+              "$ref": "#/$defs/conditions",
               "description": "Preconditions that must hold for the update."
             },
             "versioned": {
@@ -978,7 +1024,7 @@
           }
         },
         "when": {
-          "$ref": "#/$defs/predicates",
+          "$ref": "#/$defs/conditions",
           "description": "Values the required item must have. For an entity, a value \"{field}\" means this entity's field. For a counter, integers, where a missing value counts as 0."
         },
         "set": {

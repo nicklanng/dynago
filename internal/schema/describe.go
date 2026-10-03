@@ -6,18 +6,34 @@ import (
 	"strings"
 )
 
-// PredText renders predicates for people: `status = "active" and memberId = Loan.memberId`.
-// source names the entity whose fields references point at.
+// PredText renders predicates for people: `status = "active" and memberId = Loan.memberId`,
+// `mailbox != "trash"`, `mailbox in ["inbox", "archived"]`. source names the entity whose fields
+// references point at.
 func PredText(ps []*Pred, source string) string {
 	var parts []string
 	for _, p := range ps {
-		v := ValueText(p.Value)
-		if p.Source != nil {
-			v = source + "." + p.Source.Name
-		}
-		parts = append(parts, p.Field.Name+" = "+v)
+		parts = append(parts, p.Text(source))
 	}
 	return strings.Join(parts, " and ")
+}
+
+// Text renders one predicate for people.
+func (p *Pred) Text(source string) string {
+	if p.In != nil {
+		vs := make([]string, len(p.In))
+		for i, v := range p.In {
+			vs[i] = ValueText(v)
+		}
+		return p.Field.Name + " in [" + strings.Join(vs, ", ") + "]"
+	}
+	v := ValueText(p.Value)
+	if p.Source != nil {
+		v = source + "." + p.Source.Name
+	}
+	if p.Not {
+		return p.Field.Name + " != " + v
+	}
+	return p.Field.Name + " = " + v
 }
 
 // SetText renders field assignments for people: `status to "onLoan"`.

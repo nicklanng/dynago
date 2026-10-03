@@ -280,13 +280,71 @@ type Template struct {
 	Fields []*Field
 }
 
-// Pred is an equality predicate on a field: equal to a constant Value, or, in a write's
-// `requires`, to the writing entity's Source field ("{memberId}").
+// Pred is a predicate on a field: equal to a constant Value, or, in a write's `requires`, to the
+// writing entity's Source field ("{memberId}"). With Not it holds when the field differs from
+// that value; with In, when the field equals one of several constants.
 type Pred struct {
 	Field  *Field
 	Value  any
 	Source *Field
+	// Not inverts the comparison with Value (or Source): `{ not: trash }`.
+	Not bool
+	// In lists the constants the field may equal: `{ in: [inbox, archived] }`. Value is unused.
+	In []any
 }
+
+// Pins reports whether the predicate fixes the field to one value: when it holds, the field's
+// value is known without reading the item.
+func (p *Pred) Pins() bool { return !p.Not && p.In == nil }
+
+// Matches reports whether a field holding the constant v satisfies the predicate. A predicate
+// that compares with another entity's field (Source) can't be judged, and reports false.
+func (p *Pred) Matches(v any) bool {
+	if p.Source != nil {
+		return false
+	}
+	if p.In != nil {
+		for _, x := range p.In {
+			if sameValue(x, v) {
+				return true
+			}
+		}
+		return false
+	}
+	return sameValue(p.Value, v) != p.Not
+}
+
+// Allowed returns the values of an enum or bool field that satisfy the predicate, as the schema
+// writes them ("trash", "true"), and whether they can be listed: a predicate on any other type,
+// or one comparing with another entity's field, admits values that can't be enumerated.
+func (p *Pred) Allowed() ([]string, bool) {
+	if p.Source != nil {
+		return nil, false
+	}
+	var domain []any
+	switch p.Field.Type {
+	case TypeEnum:
+		for _, v := range p.Field.Enum {
+			domain = append(domain, v)
+		}
+	case TypeBool:
+		domain = []any{false, true}
+	default:
+		if p.Pins() {
+			return []string{fmt.Sprint(p.Value)}, true
+		}
+		return nil, false
+	}
+	var out []string
+	for _, v := range domain {
+		if p.Matches(v) {
+			out = append(out, fmt.Sprint(v))
+		}
+	}
+	return out, true
+}
+
+func sameValue(a, b any) bool { return fmt.Sprint(a) == fmt.Sprint(b) }
 
 // Entity is a domain type stored as items in the table.
 type Entity struct {

@@ -50,3 +50,73 @@ entities:
             key: { tenantId: tenantId, accountId: successorId }
             when: { status: pending }
             set: { status: active }
+
+  # A parcel moves through a depot's states. Its index, counter values and preconditions exclude a
+  # state (not) or list several (in), rather than naming one.
+  Parcel:
+    fields:
+      depotId: string
+      parcelId: string
+      state: { type: enum, values: [received, shelved, out, returned, lost] }
+      note: string
+    key:
+      pk: "D#{depotId}"
+      sk: "PARCEL#{parcelId}"
+    indexes:
+      OnSite:
+        doc: The parcels physically in the depot.
+        pk: "D#{depotId}#ONSITE"
+        sk: "P#{parcelId}"
+        where: { state: { in: [received, shelved, returned] } }
+        project: [state]
+      Known:
+        doc: Every parcel that isn't lost.
+        pk: "KNOWN#{depotId}"
+        sk: "P#{parcelId}"
+        where: { state: { not: lost } }
+        project: keys
+    counters:
+      DepotParcels:
+        pk: "D#{depotId}"
+        sk: "COUNTS"
+        values:
+          onSite: { count: true, where: { state: { in: [received, shelved, returned] } } }
+          known: { count: true, where: { state: { not: lost } } }
+    access:
+      Get: get
+      OnSite: { query: OnSite, freshness: immediate }
+      Known: { query: Known }
+      Counts: { counter: DepotParcels }
+    writes:
+      Receive: { create: true, set: { state: received } }
+      Shelve: { set: { state: shelved }, when: { state: received } }
+      SendOut: { set: { state: out }, when: { state: { in: [received, shelved] } } }
+      Lose: { set: { state: lost }, when: { state: { not: lost } } }
+      Annotate: { update: [note], when: { state: { not: lost } } }
+
+  # A damage report can only be filed against a parcel that is still on site.
+  Damage:
+    fields:
+      depotId: string
+      parcelId: string
+      damageId: string
+      detail: string
+    key:
+      pk: "D#{depotId}"
+      sk: "DAMAGE#{parcelId}#{damageId}"
+    access:
+      Get: get
+    writes:
+      File:
+        create: true
+        requires:
+          Parcel:
+            key: { depotId: depotId, parcelId: parcelId }
+            when: { state: { in: [received, shelved, returned] } }
+      Dispute:
+        update: [detail]
+        requires:
+          Parcel:
+            key: { depotId: depotId, parcelId: parcelId }
+            when: { state: { not: lost } }
+            set: { note: disputed }

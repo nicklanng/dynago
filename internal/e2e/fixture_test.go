@@ -1,6 +1,7 @@
 package e2e_test
 
 import (
+	"fmt"
 	"sort"
 	"testing"
 
@@ -91,5 +92,88 @@ func TestScanReturnsOnlyTheEntity(t *testing.T) {
 	// A cursor from another read is refused.
 	if _, _, err := st.Accounts.Export(ctx, dynago.Page{Cursor: "bm9wZQ"}); err == nil {
 		t.Fatal("a forged cursor was accepted")
+	}
+}
+
+// A parcel's index, counter values and preconditions exclude a state (not) or list several (in).
+// Each holds for exactly the states it says: in the copies and counts every write maintains, in
+// the conditions a single UpdateItem carries, and in what another entity's write requires.
+func TestPredicatesNotAndIn(t *testing.T) {
+	t.Parallel()
+	db, n := testdb.CountingDB(t)
+	st := fixture.New(db, testdb.Table(t, db, fixture.TableSpec))
+	key := func(id string) fixture.ParcelKey { return fixture.ParcelKey{DepotID: "d1", ParcelID: id} }
+	for _, id := range []string{"p1", "p2", "p3", "p4", "p5"} {
+		must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d1", ParcelID: id}))
+	}
+	check := func(when string, onSite, known int64, ids ...string) {
+		t.Helper()
+		c, err := st.Parcels.Counts(ctx, fixture.DepotParcelsKey{DepotID: "d1"})
+		must(t, err)
+		if c != (fixture.DepotParcels{OnSite: onSite, Known: known}) {
+			t.Fatalf("%s: counts %+v, want %d on site and %d known", when, c, onSite, known)
+		}
+		list, _, err := st.Parcels.OnSite(ctx, fixture.ParcelOnSiteQuery{DepotID: "d1"}, dynago.Page{})
+		must(t, err)
+		var got []string
+		for _, p := range list {
+			got = append(got, p.ParcelID)
+		}
+		if fmt.Sprint(got) != fmt.Sprint(ids) {
+			t.Fatalf("%s: on site %v, want %v", when, got, ids)
+		}
+	}
+	check("received", 5, 5, "p1", "p2", "p3", "p4", "p5")
+
+	// in: sending out takes a received or shelved parcel, and no other.
+	must(t, st.Parcels.SendOut(ctx, key("p1")))
+	wantErr(t, st.Parcels.SendOut(ctx, key("p1")), fixture.ErrParcelSendOutPrecondition)
+	must(t, st.Parcels.Shelve(ctx, key("p2")))
+	must(t, st.Parcels.SendOut(ctx, key("p2")))
+	check("two sent out", 3, 5, "p3", "p4", "p5")
+
+	// not: anything but a lost parcel can be lost, once.
+	must(t, st.Parcels.Lose(ctx, key("p1")))
+	must(t, st.Parcels.Lose(ctx, key("p3")))
+	wantErr(t, st.Parcels.Lose(ctx, key("p3")), fixture.ErrParcelLosePrecondition)
+	check("two lost", 2, 3, "p4", "p5")
+	testdb.Eventually(t, "the index of parcels not lost", func() error {
+		list, _, err := st.Parcels.Known(ctx, fixture.ParcelKnownQuery{DepotID: "d1"}, dynago.Page{})
+		if err != nil {
+			return err
+		}
+		var got []string
+		for _, p := range list {
+			got = append(got, p.ParcelID)
+		}
+		return testdb.Check(fmt.Sprint(got) == "[p2 p4 p5]", "known parcels %v, want p2, p4 and p5", got)
+	})
+
+	// The same condition on a single UpdateItem, with no read.
+	reads := n.Reads()
+	must(t, st.Parcels.Annotate(ctx, key("p4"), fixture.ParcelAnnotate{Note: "fragile"}))
+	if r := n.Reads() - reads; r != 0 {
+		t.Fatalf("Annotate made %d reads, want none", r)
+	}
+	wantErr(t, st.Parcels.Annotate(ctx, key("p3"), fixture.ParcelAnnotate{Note: "found?"}), fixture.ErrParcelAnnotatePrecondition)
+
+	// Another entity's write requires the parcel to be in one of several states, or not in one.
+	file := func(parcel string) error {
+		return st.Damages.File(ctx, &fixture.Damage{DepotID: "d1", ParcelID: parcel, DamageID: "dmg1", Detail: "dented"})
+	}
+	wantErr(t, file("p2"), fixture.ErrDamageFileRequiresParcel) // out
+	must(t, file("p4"))
+	must(t, file("p5"))
+	dispute := func(parcel string) error {
+		return st.Damages.Dispute(ctx, fixture.DamageKey{DepotID: "d1", ParcelID: parcel, DamageID: "dmg1"}, fixture.DamageDispute{Detail: "was dented on arrival"})
+	}
+	must(t, dispute("p4"))
+	if p, err := st.Parcels.Get(ctx, key("p4")); err != nil || p.Note != "disputed" {
+		t.Fatalf("a dispute should mark its parcel: %+v, %v", p, err)
+	}
+	must(t, st.Parcels.Lose(ctx, key("p5")))
+	wantErr(t, dispute("p5"), fixture.ErrDamageDisputeRequiresParcel)
+	if d, err := st.Damages.Get(ctx, fixture.DamageKey{DepotID: "d1", ParcelID: "p5", DamageID: "dmg1"}); err != nil || d.Detail != "dented" {
+		t.Fatalf("a refused dispute changed the report: %+v, %v", d, err)
 	}
 }

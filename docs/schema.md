@@ -481,7 +481,7 @@ The model document shows which writes read first and why, and what each changes.
 ## Predicates
 
 `where`, `when`, `set` and a require's `when` and `set` take a mapping of field to constant (a
-require's may also name a field of the writing entity, `"{field}"`):
+require's may also name a field of the writing entity, `"{field}"`), which the field must equal:
 
 ```yaml
 where: { status: active, role: steward }
@@ -491,6 +491,26 @@ All conditions must hold (AND). Values must match the field's type: `true`/`fals
 integer for `int`, a number for `float`, a string for `string`, one of the declared values for
 `enum`. Fields of other types cannot be compared. A condition on a zero value (`false`, `0`, `""`)
 also matches an absent attribute, since zero values are not stored.
+
+A condition (`where`, `when`, and a require's `when`; not `set`) can also exclude a value, or list
+several:
+
+```yaml
+where: { hasSent: true, mailbox: { not: trash } }      # every mailbox but the trash
+when:  { mailbox: { in: [inbox, archived, sent] } }     # one of these
+```
+
+| Form | Holds when |
+|---|---|
+| `field: value` | the field equals the value |
+| `field: { not: value }` | the field holds anything else. An empty field counts as holding its zero value, so `{ not: trash }` holds for an item with no mailbox, and `{ not: "" }` holds only for one that has a value. In a require's `when`, the value may be `"{field}"` of the writing entity. |
+| `field: { in: [a, b] }` | the field equals one of the values (two or more, and not every value of an enum) |
+
+A `when` that names one value tells dynago the state the write starts from, which is what lets a
+write that moves a counter run [read-free](#writes). `not` and `in` leave several states possible,
+so a write whose `when` uses one for a field that feeds a counter, an index or a claim reads the
+item first. Where nothing derived depends on the field, the condition goes on the single
+UpdateItem as any other does.
 
 ## Volume
 

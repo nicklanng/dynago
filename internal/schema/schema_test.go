@@ -158,6 +158,13 @@ func TestValidationErrors(t *testing.T) {
 		{"volume with nothing to count per", "    volume: { typical: 5 }\n", "doesn't nest in another entity's"},
 		{"ref to unknown entity", "      owner: { type: string, ref: Nope }\n", "ref: Nope is not an entity"},
 		{"ref that can't key", "      owner: { type: int, ref: Thing }\n", "Thing's key needs"},
+		{"in with one value", "    writes:\n      W: { update: [name], when: { status: { in: [a] } } }\n", "one value is an equality"},
+		{"in with every value", "    writes:\n      W: { update: [name], when: { status: { in: [a, b] } } }\n", "the condition always holds"},
+		{"in with a value twice", "    writes:\n      W: { update: [count], when: { name: { in: [x, y, x] } } }\n", "x is listed twice"},
+		{"in without a list", "    writes:\n      W: { update: [count], when: { name: { in: x } } }\n", "want a list of values"},
+		{"not of a value the enum lacks", "    indexes:\n      ByName: { pk: \"N#{name}\", project: keys, where: { status: { not: c } } }\n", `"c" is not one of`},
+		{"unknown condition form", "    writes:\n      W: { update: [name], when: { status: { neq: a } } }\n", `unknown form "neq"`},
+		{"two condition forms", "    writes:\n      W: { update: [name], when: { name: { not: x, in: [y, z] } } }\n", "want a value, { not: <value> } or { in: [<value>, ...] }"},
 		{"requires unknown counter value", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, when: { m: 0 } } } }\n", "m is not a value of counter C"},
 	}
 	for _, c := range cases {
@@ -177,6 +184,64 @@ func TestValidationErrors(t *testing.T) {
 	}
 	if _, err := Parse([]byte(base)); err != nil {
 		t.Fatalf("base schema should be valid: %v", err)
+	}
+}
+
+// `not` and `in` are conditions like any other, but they leave several values possible: a write
+// whose when uses one can't know the state it starts from, so it reads the item if anything
+// derived depends on the field.
+func TestNotAndInConditions(t *testing.T) {
+	m, err := Parse([]byte(strings.Replace(base, "values: [a, b]", "values: [a, b, c]", 1) + `    indexes:
+      Open: { pk: "OPEN#{tenantId}", sk: "T#{thingId}", project: keys, where: { status: { not: c }, name: { in: [x, y] } } }
+    counters:
+      Counts:
+        pk: "T#{tenantId}"
+        sk: "COUNTS"
+        values:
+          live: { count: true, where: { status: { in: [a, b] } } }
+    writes:
+      Close: { set: { status: c }, when: { status: { not: c } } }
+      Reopen: { set: { status: a }, when: { status: c } }
+      Rename: { update: [at], when: { status: { in: [a, b] } } }
+      Other:
+        create: true
+        requires:
+          Thing:
+            key: { tenantId: tenantId, thingId: name }
+            when: { status: { not: c }, name: { not: "{name}" } }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := m.Entity("Thing")
+	where := e.Indexes[0].Where
+	if got := PredText(where, ""); got != `status != "c" and name in ["x", "y"]` {
+		t.Errorf("where reads %q", got)
+	}
+	if !where[0].Matches("a") || where[0].Matches("c") || !where[1].Matches("y") || where[1].Matches("z") {
+		t.Errorf("Matches is wrong for %s", PredText(where, ""))
+	}
+	if vs, ok := where[0].Allowed(); !ok || fmt.Sprint(vs) != "[a b]" {
+		t.Errorf("status != c allows %v, %v", vs, ok)
+	}
+	if _, ok := where[1].Allowed(); ok {
+		t.Errorf("a string field's values can't be listed")
+	}
+	writes := map[string]*Write{}
+	for _, w := range e.Writes {
+		writes[w.Name] = w
+	}
+	// Closing moves the index entry and the count, from a state the when doesn't pin: it reads.
+	if w := writes["Close"]; !w.ReadFirst || w.Transition {
+		t.Errorf("Close: ReadFirst %v, Transition %v; want a read", w.ReadFirst, w.Transition)
+	}
+	// Nothing derived depends on at: one conditional UpdateItem, whatever the when.
+	if w := writes["Rename"]; w.ReadFirst {
+		t.Errorf("Rename reads first")
+	}
+	rq := writes["Other"].Requires[0]
+	if got := rq.Condition("Thing"); got != `the Thing to exist with status != "c" and name != Thing.name` {
+		t.Errorf("the requirement reads %q", got)
 	}
 }
 

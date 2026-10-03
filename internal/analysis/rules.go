@@ -197,11 +197,20 @@ func templateFields(ix *schema.Index) []*schema.Field {
 // doesn't have: the index is sparse on purpose.
 func pinned(ws []*schema.Pred, f *schema.Field) bool {
 	for _, p := range ws {
-		if p.Field == f {
+		// `not` holds for an empty field too, unless the value it excludes is the empty one.
+		if p.Field == f && !p.Matches(zeroOf(f)) {
 			return true
 		}
 	}
 	return false
+}
+
+// zeroOf is the value an empty sparse field holds.
+func zeroOf(f *schema.Field) any {
+	if f.Type == schema.TypeBool {
+		return false
+	}
+	return ""
 }
 
 func (a *analyzer) fieldRules(e *schema.Entity) {

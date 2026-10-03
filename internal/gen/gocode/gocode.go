@@ -1254,7 +1254,7 @@ func (g *gen) update(w *schema.Write) {
 	}
 	var conds []string
 	for _, p := range w.When {
-		conds = append(conds, fmt.Sprintf("{Attr: %q, Value: %s, Zero: %t}", p.Field.Attr, literal(e, p.Field, p.Value), isZeroValue(p.Value)))
+		conds = append(conds, condLit(e, p, ""))
 	}
 	when := "nil"
 	if len(conds) > 0 {
@@ -1303,7 +1303,7 @@ func (g *gen) update(w *schema.Write) {
 	g.p("}")
 	g.p("before := &it.%s", e.GoName)
 	if len(w.When) > 0 {
-		g.p("if %s {", negate(whereExpr(e, w.When, "before")))
+		g.p("if %s {", notWhereExpr(e, w.When, "before"))
 		g.p("return %s", precond)
 		g.p("}")
 	}
@@ -1386,7 +1386,10 @@ func (g *gen) transition(w *schema.Write, when, beforeConv, conv string) {
 		known = append(known, fmt.Sprintf("%s: k.%s", f.GoName, f.GoName))
 	}
 	for _, p := range w.When {
-		known = append(known, fmt.Sprintf("%s: %s", p.Field.GoName, literal(e, p.Field, p.Value)))
+		// `not` and `in` pin nothing: nothing derived from the field changes (see transitionable).
+		if p.Pins() {
+			known = append(known, fmt.Sprintf("%s: %s", p.Field.GoName, literal(e, p.Field, p.Value)))
+		}
 	}
 	g.p("// The derived changes depend only on the key and the state `when` pins, so try without")
 	g.p("// reading. ReturnVersion and dynago.From need the read path.")
@@ -1951,20 +1954,7 @@ func counterValueText(v *schema.CounterValue) string {
 	return b.String()
 }
 
-func predText(ps []*schema.Pred) string {
-	var parts []string
-	for _, p := range ps {
-		parts = append(parts, fmt.Sprintf("%s = %v", p.Field.Name, fmtValue(p.Value)))
-	}
-	return strings.Join(parts, " and ")
-}
-
-func fmtValue(v any) string {
-	if s, ok := v.(string); ok {
-		return strconv.Quote(s)
-	}
-	return fmt.Sprint(v)
-}
+func predText(ps []*schema.Pred) string { return schema.PredText(ps, "") }
 
 func goType(e *schema.Entity, f *schema.Field) string {
 	switch f.Type {
@@ -2108,7 +2098,7 @@ func negate(cond string) string {
 			return strings.Join(terms, " || ")
 		}
 	}
-	if !strings.Contains(cond, "&&") {
+	if !strings.Contains(cond, "&&") && !strings.Contains(cond, "||") {
 		switch {
 		case strings.HasPrefix(cond, "!") && !strings.HasPrefix(cond, "!("):
 			return strings.TrimPrefix(cond, "!")
@@ -2131,20 +2121,58 @@ func orTrue(conds []string) string {
 }
 
 func whereExpr(e *schema.Entity, ps []*schema.Pred, recv string) string {
-	var conds []string
-	for _, p := range ps {
-		x := recv + "." + p.Field.GoName
-		if b, ok := p.Value.(bool); ok {
-			if b {
-				conds = append(conds, x)
-			} else {
-				conds = append(conds, "!"+x)
-			}
-			continue
-		}
-		conds = append(conds, fmt.Sprintf("%s == %s", x, literal(e, p.Field, p.Value)))
+	return predsExpr(ps, false, func(p *schema.Pred) (string, func(any) string) {
+		return recv + "." + p.Field.GoName, func(v any) string { return literal(e, p.Field, v) }
+	})
+}
+
+// notWhereExpr is the condition that some predicate fails.
+func notWhereExpr(e *schema.Entity, ps []*schema.Pred, recv string) string {
+	return predsExpr(ps, true, func(p *schema.Pred) (string, func(any) string) {
+		return recv + "." + p.Field.GoName, func(v any) string { return literal(e, p.Field, v) }
+	})
+}
+
+// predsExpr renders predicates as one Go condition: that all hold, or (negated) that one fails.
+// operand gives the expression each predicate tests and how to render a constant of its type.
+func predsExpr(ps []*schema.Pred, negated bool, operand func(*schema.Pred) (string, func(any) string)) string {
+	conds := make([]string, len(ps))
+	for i, p := range ps {
+		x, lit := operand(p)
+		conds[i] = predExpr(p, x, lit, negated, len(ps) > 1)
+	}
+	if negated {
+		return strings.Join(conds, " || ")
 	}
 	return strings.Join(conds, " && ")
+}
+
+// predExpr renders a predicate as a Go condition on the expression x, or its negation; lit renders
+// a constant of the field's type. A list is parenthesised when it is one term among others.
+func predExpr(p *schema.Pred, x string, lit func(v any) string, negated, among bool) string {
+	switch {
+	case p.In != nil:
+		op, join := "==", " || "
+		if negated {
+			op, join = "!=", " && "
+		}
+		alts := make([]string, len(p.In))
+		for i, v := range p.In {
+			alts[i] = fmt.Sprintf("%s %s %s", x, op, lit(v))
+		}
+		if among {
+			return "(" + strings.Join(alts, join) + ")"
+		}
+		return strings.Join(alts, join)
+	case p.Source == nil && p.Field.Type == schema.TypeBool:
+		if (p.Value.(bool) != p.Not) != negated {
+			return x
+		}
+		return "!" + x
+	case p.Not != negated:
+		return fmt.Sprintf("%s != %s", x, lit(p.Value))
+	}
+	return fmt.Sprintf("%s == %s", x, lit(p.Value))
 }
 
 // literal renders a constant of a field's type.

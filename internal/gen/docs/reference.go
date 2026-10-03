@@ -565,7 +565,7 @@ func projText(ix *schema.Index) string {
 func predText(ps []*schema.Pred) string {
 	var parts []string
 	for _, p := range ps {
-		parts = append(parts, fmt.Sprintf("`%s = %s`", p.Field.Name, value(p.Value)))
+		parts = append(parts, "`"+p.Text("")+"`")
 	}
 	return strings.Join(parts, " and ")
 }

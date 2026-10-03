@@ -489,7 +489,7 @@ func (a *analyzer) grows(e *schema.Entity, ix *schema.Index, pk []*schema.Field)
 	if ix != nil && len(ix.Where) > 0 {
 		for _, s := range a.setsOn(e) {
 			for _, p := range ix.Where {
-				if s.Field == p.Field && (s.Source != nil || fmt.Sprint(s.Value) != fmt.Sprint(p.Value)) {
+				if s.Field == p.Field && (s.Source != nil || !p.Matches(s.Value)) {
 					return false
 				}
 			}

@@ -288,7 +288,7 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 	}
 	if unversioned && firstDraft(prev) {
 		// Nothing in the lock says a table was ever changed: it may never have been created.
-		errs = append(errs, fmt.Errorf("Or, if no table has been created from this schema yet, delete %s and generate again: there are no stored items to keep track of, and the design is recorded afresh as version 1", m.Output.Lock))
+		errs = append(errs, fmt.Errorf("or, if no table has been created from this schema yet, delete %s and generate again: there are no stored items to keep track of, and the design is recorded afresh as version 1", m.Output.Lock))
 	}
 	if newGen && len(errs) == 0 {
 		job := "Run the migration job"
@@ -417,7 +417,14 @@ func ShapeOf(e *schema.Entity, ttlAttr string) Shape {
 func preds(ps []*schema.Pred) []string {
 	var out []string
 	for _, p := range ps {
-		out = append(out, fmt.Sprintf("%s=%v", p.Field.Name, p.Value))
+		switch {
+		case p.In != nil:
+			out = append(out, fmt.Sprintf("%s in %v", p.Field.Name, p.In))
+		case p.Not:
+			out = append(out, fmt.Sprintf("%s!=%v", p.Field.Name, p.Value))
+		default:
+			out = append(out, fmt.Sprintf("%s=%v", p.Field.Name, p.Value))
+		}
 	}
 	return out
 }

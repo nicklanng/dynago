@@ -5,7 +5,22 @@
   "tables": [
     {
       "generation": 1,
-      "spec": {}
+      "spec": {
+        "gsis": [
+          {
+            "name": "Known",
+            "pk": "KnownPK",
+            "sk": "KnownSK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "depotId",
+              "parcelId"
+            ]
+          }
+        ]
+      }
     }
   ],
   "entities": {
@@ -81,6 +96,130 @@
                     "name": "active",
                     "where": [
                       "status=active"
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "Damage": {
+      "versions": [
+        {
+          "version": 1,
+          "generation": 1,
+          "fingerprint": "ff5aca6f2bae45fc",
+          "shape": {
+            "fields": [
+              {
+                "name": "depotId",
+                "attr": "depotId",
+                "type": "string"
+              },
+              {
+                "name": "parcelId",
+                "attr": "parcelId",
+                "type": "string"
+              },
+              {
+                "name": "damageId",
+                "attr": "damageId",
+                "type": "string"
+              },
+              {
+                "name": "detail",
+                "attr": "detail",
+                "type": "string"
+              }
+            ],
+            "pk": "D#{depotId}",
+            "sk": "DAMAGE#{parcelId}#{damageId}"
+          }
+        }
+      ]
+    },
+    "Parcel": {
+      "versions": [
+        {
+          "version": 1,
+          "generation": 1,
+          "fingerprint": "89d4f150dc5c9732",
+          "shape": {
+            "fields": [
+              {
+                "name": "depotId",
+                "attr": "depotId",
+                "type": "string"
+              },
+              {
+                "name": "parcelId",
+                "attr": "parcelId",
+                "type": "string"
+              },
+              {
+                "name": "state",
+                "attr": "state",
+                "type": "enum",
+                "values": [
+                  "received",
+                  "shelved",
+                  "out",
+                  "returned",
+                  "lost"
+                ]
+              },
+              {
+                "name": "note",
+                "attr": "note",
+                "type": "string"
+              }
+            ],
+            "pk": "D#{depotId}",
+            "sk": "PARCEL#{parcelId}",
+            "indexes": [
+              {
+                "name": "OnSite",
+                "strategy": "copy",
+                "pk": "D#{depotId}#ONSITE",
+                "sk": "P#{parcelId}",
+                "projection": "include",
+                "project": [
+                  "state"
+                ],
+                "where": [
+                  "state in [received shelved returned]"
+                ]
+              },
+              {
+                "name": "Known",
+                "strategy": "gsi",
+                "pk": "KNOWN#{depotId}",
+                "sk": "P#{parcelId}",
+                "projection": "keys",
+                "where": [
+                  "state!=lost"
+                ]
+              }
+            ],
+            "counters": [
+              {
+                "name": "DepotParcels",
+                "pk": "D#{depotId}",
+                "sk": "COUNTS",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "onSite",
+                    "where": [
+                      "state in [received shelved returned]"
+                    ]
+                  },
+                  {
+                    "name": "known",
+                    "where": [
+                      "state!=lost"
                     ]
                   }
                 ]
