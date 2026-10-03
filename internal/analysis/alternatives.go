@@ -142,7 +142,7 @@ func (a *analyzer) alternative(e *schema.Entity, ix *schema.Index) *Alternative 
 		}
 		variant := *ac
 		variant.Consistent = alt.Strategy == schema.StrategyCopy && ac.Freshness != schema.FreshnessEventual
-		alt.Reads = append(alt.Reads, AltRead{Access: ac, Now: er.Reads[i], Then: cost.ReadCostOf(&variant, sizes)})
+		alt.Reads = append(alt.Reads, AltRead{Access: ac, Now: er.Reads[i], Then: cost.ReadCostOf(a.m, &variant, sizes)})
 	}
 	return alt
 }

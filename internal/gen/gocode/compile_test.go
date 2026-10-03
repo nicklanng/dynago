@@ -71,6 +71,8 @@ var awkwardEntities = []struct {
 		"    key: { pk: \"T#{tenantId}\", sk: \"PART#{boxId}#{partId}\" }\n    writes:\n" +
 		"      Add: { create: true, requires: { Box: { key: { tenantId: tenantId, boxId: boxId }, add: { parts: 1, weight: \"{weight}\" }, patch: { name: \"{label}\", at: \"{seen}\" } } } }\n" +
 		"      Drop: { delete: true, requires: { Box: { key: { tenantId: tenantId, boxId: boxId }, add: { parts: -1 }, when: { note: kept } } } }\n", ""},
+	{"partition read of an expiring entity and a singleton", "  Summary:\n    fields:\n      tenantId: string\n      until: time\n    ttl: until\n    key: { pk: \"T#{tenantId}\", sk: \"SUMMARY\" }\n" +
+		"    access:\n      Whole: { query: partition, of: [Thing, Summary], order: desc, page: 10, max_page: 20 }\n      Mine: { query: partition, of: [Summary] }\n", ""},
 	{"entity named like another's store", "  ThingStore:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},
 	{"entities differing in initialism case", "  THING:\n    fields: { id: string }\n    key: { pk: \"U#{id}\", sk: \"U\" }\n", "collides"},
 	{"entity named Store", "  Store:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},

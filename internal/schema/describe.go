@@ -117,3 +117,14 @@ func (rq *Require) Effect(source string) string {
 func (rq *Require) CanFail() bool {
 	return rq.Counter != nil || !rq.Optional || len(rq.When) > 0
 }
+
+// JoinAnd joins names for people: "A", "A and B", "A, B and C".
+func JoinAnd(names []string) string {
+	switch len(names) {
+	case 0:
+		return ""
+	case 1:
+		return names[0]
+	}
+	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
+}

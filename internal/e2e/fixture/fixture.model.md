@@ -10,12 +10,12 @@ Table generation **1**: `fixture-g1`.
 
 | | |
 |---|---|
-| Entities | 3: Account, Parcel, Damage |
-| Reads | 12: 4 by key, 2 queries, 5 counters, 1 scan |
-| Writes | 10: 9 in a transaction, 5 reading the item first |
+| Entities | 4: Account, Depot, Parcel, Damage |
+| Reads | 15: 5 by key, 4 queries, 5 counters, 1 scan |
+| Writes | 11: 9 in a transaction, 5 reading the item first |
 | Indexes | 1 GSI, 1 copy index (Known, Parcel.OnSite) |
 | Uniqueness claims, counters | 0, 5 |
-| Workload | No peak factor declared (peaks taken as the averages); volumes declared for 0 of 3 entities |
+| Workload | No peak factor declared (peaks taken as the averages); volumes declared for 0 of 4 entities |
 | Cost | $0.00/month at the declared volumes and rates |
 | Findings | 0 errors, 0 warnings, 1 note open; 0 accepted |
 
@@ -26,6 +26,7 @@ Table generation **1**: `fixture-g1`.
 | Entity | What it is | Identified by | Volume | Expected items |
 |---|---|---|---|---|
 | [Account](#account) |  | `tenantId`, `accountId` | not declared | — |
+| [Depot](#depot) |  | `depotId` | not declared | — |
 | [Parcel](#parcel) |  | `depotId`, `parcelId` | not declared | — |
 | [Damage](#damage) |  | `depotId`, `parcelId`, `damageId` | not declared | — |
 
@@ -33,11 +34,13 @@ Table generation **1**: `fixture-g1`.
 
 ```mermaid
 erDiagram
+  Depot ||--o{ Parcel : "contains"
   Parcel ||--o{ Damage : "contains"
 ```
 
 | Entity | Related to | How |
 |---|---|---|
+| Parcel | Depot | Lives in (or under) its Depot's partition, and holds its Depot's key in `depotId`. |
 | Damage | Parcel | Lives in (or under) its Parcel's partition, and holds its Parcel's key in `depotId`, `parcelId`; File, Dispute require it. |
 
 ### Guarantees
@@ -102,6 +105,9 @@ Every read the code can make. A read that isn't listed has no method, so a new w
 | `Account.Tenant` | The TenantCounts counts for a tenantId. | counter TenantCounts (GetItem) | eventual (not stated) | the counts | 0.5 | — |
 | `Account.Region` | The RegionCounts counts for a region. | counter RegionCounts (GetItem) | eventual (not stated) | the counts | 0.5 | — |
 | `Account.Export` | Every Account in the table. | Scan of the whole table, one page per call | eventual (not stated) | pages of 2, a page at a time (volume not declared) | 0.5 | — |
+| `Depot.Get` | One Depot, by depotId. | GetItem | eventual (not stated) | one | 0.5 | — |
+| `Depot.Everything` | The Depot, Parcels, Damages under one depotId, each kind on its own. | Query of the whole partition, keeping these kinds | immediate | pages of 4, a page at a time (volume not declared) | 1 | — |
+| `Depot.Newest` | Damages, Parcels under one depotId, each kind on its own. | Query of the whole partition, keeping these kinds | eventual | pages of 50, a page at a time (volume not declared) | 2.5 / 4.5 | — |
 | `Parcel.Get` | One Parcel, by depotId and parcelId. | GetItem | eventual (not stated) | one | 0.5 | — |
 | `Parcel.GetSeveral` | Several Parcels, each by depotId and parcelId. | BatchGetItem (one per 100 keys) | immediate | the ones that exist: 10 keys a call typically | 10 | — |
 | `Parcel.States` | Every StateCounts count of a depotId: one for each state. | Query of counter StateCounts's items | immediate | pages of 50 counter items, a page at a time | 2 / 3 | — |
@@ -122,6 +128,7 @@ Every write the code can make, and everything each changes. Each is atomic: all 
 | `Account.Open` | Creates a Account | no Account at the key | Account<br>counter TenantCounts<br>counter RegionCounts | no | transaction, 3 items | 6 | — |
 | `Account.Activate` | Sets `status` = "active" | the Account exists; status = "pending" | Account<br>counter TenantCounts<br>counter RegionCounts | yes | transaction, 3 items | 6 | — |
 | `Account.HandOver` | Sets `successorId`, sets `status` = "closed", sets the Account's status to "active" | the Account exists; status = "active"; the Account exists with status = "pending" | Account<br>counter TenantCounts<br>counter RegionCounts<br>Account (sets its status to "active")<br>Account's counter TenantCounts<br>Account's counter RegionCounts | yes | transaction, 6 items | 12 | — |
+| `Depot.Open` | Creates a Depot | no Depot at the key | Depot | no | single item | 1 | — |
 | `Parcel.Receive` | Creates a Parcel, sets `state` = "received" | no Parcel at the key | Parcel<br>copy OnSite<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts | no | transaction, 4 items | 9 | — |
 | `Parcel.Shelve` | Sets `state` = "shelved" | the Parcel exists; state = "received" | Parcel<br>copy OnSite<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes | transaction, 5 items | 10 | — |
 | `Parcel.SendOut` | Sets `state` = "out" | the Parcel exists; state in ["received", "shelved"] | Parcel<br>copy OnSite (removed)<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes | transaction, 5 items | 10 | — |
@@ -163,11 +170,12 @@ flowchart LR
     p1m0["counter RegionCounts"]
   end
   subgraph p2["D#35;{depotId}"]
-    p2m0["Parcel"]
-    p2m1["counter DepotParcels"]
-    p2m2["counter StateCounts"]
-    p2m3["Damage"]
-    p2m4["counter ParcelDamages"]
+    p2m0["Depot"]
+    p2m1["Parcel"]
+    p2m2["counter DepotParcels"]
+    p2m3["counter StateCounts"]
+    p2m4["Damage"]
+    p2m5["counter ParcelDamages"]
   end
   subgraph p3["D#35;{depotId}#35;ONSITE"]
     p3m0["Parcel OnSite copy"]
@@ -178,6 +186,9 @@ flowchart LR
   r_Account_Get{{"Account.Get"}} --> p0
   r_Account_Tenant{{"Account.Tenant"}} --> p0
   r_Account_Region{{"Account.Region"}} --> p1
+  r_Depot_Get{{"Depot.Get"}} --> p2
+  r_Depot_Everything{{"Depot.Everything"}} --> p2
+  r_Depot_Newest{{"Depot.Newest"}} --> p2
   r_Parcel_Get{{"Parcel.Get"}} --> p2
   r_Parcel_GetSeveral{{"Parcel.GetSeveral"}} --> p2
   r_Parcel_States{{"Parcel.States"}} --> p2
@@ -198,11 +209,11 @@ Each row is every partition key value one key pattern renders: *Keys* is how man
 |---|---|---|---|---|---|---|---|
 | `T#{tenantId}` | base table | unknown | Account: unknown<br>counter TenantCounts: 1 | unknown / unknown | yes: Account never removed | no rates declared | — |
 | `R#{region}` | base table | unknown | counter RegionCounts: 1 | 136 B / 136 B | no | no rates declared | — |
-| `D#{depotId}` | base table | unknown | Parcel: unknown<br>counter DepotParcels: 1<br>counter StateCounts: unknown<br>Damage: unknown<br>counter ParcelDamages: unknown | unknown / unknown | yes: Parcel, Damage never removed | no rates declared | — |
+| `D#{depotId}` | base table | unknown | Depot: 1<br>Parcel: unknown<br>counter DepotParcels: 1<br>counter StateCounts: unknown<br>Damage: unknown<br>counter ParcelDamages: unknown | unknown / unknown | yes: Parcel, Damage never removed | no rates declared | — |
 | `D#{depotId}#ONSITE` | base table | unknown | Parcel OnSite copy: unknown | unknown / unknown | no | no rates declared | — |
 | `KNOWN#{depotId}` | GSI Known | unknown | Parcel Known entry: unknown | unknown / unknown | no | no rates declared | — |
 
-Unknown counts: nothing declares how many items share a value of `tenantId` in `T#{tenantId}`, `region` in `R#{region}`, `depotId` in `D#{depotId}`, `depotId` in `D#{depotId}#ONSITE`, `depotId` in `KNOWN#{depotId}`. For a field that identifies another entity, name it (`ref:`, or a matching field name) and give the spread (`volume.by`).
+Unknown counts: nothing declares how many items share a value of `tenantId` in `T#{tenantId}`, `region` in `R#{region}`. For a field that identifies another entity, name it (`ref:`, or a matching field name) and give the spread (`volume.by`).
 
 ## Risks and costs
 
@@ -215,6 +226,7 @@ Unknown counts: nothing declares how many items share a value of `tenantId` in `
 | Entity | Expected items | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
 |---|---|---|---|---|---|
 | Account | not declared | 277 B / 543 B | 0.00 GB | $0.00 | $0.00 |
+| Depot | not declared | 176 B / 310 B | 0.00 GB | $0.00 | $0.00 |
 | Parcel | not declared | 372 B / 732 B | 0.00 GB | $0.00 | $0.00 |
 | Damage | not declared | 286 B / 596 B | 0.00 GB | $0.00 | $0.00 |
 
@@ -315,6 +327,54 @@ Every item that exists because of an Account, and what keeps it up to date.
 | `Open` | create (fails if it exists) | Account<br>counter TenantCounts<br>counter RegionCounts | no | transaction (3 items) | — | 6 | `ErrAccountExists` |
 | `Activate` | set `status` = "active" when `status = "pending"` | Account<br>counter TenantCounts<br>counter RegionCounts | yes (1 consistent read; none with `dynago.From`) | transaction (3 items) | optional | 6 | `ErrAccountNotFound`<br>`ErrAccountActivatePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 | `HandOver` | set `successorId`, set `status` = "closed" when `status = "active"`; requires the Account to exist with status = "pending" and sets its status to "active" | Account<br>counter TenantCounts<br>counter RegionCounts<br>Account (sets its status to "active")<br>Account's counter TenantCounts<br>Account's counter RegionCounts | yes (1 consistent read; none with `dynago.From`) | transaction (6 items) | optional | 12 | `ErrAccountNotFound`<br>`ErrAccountHandOverPrecondition`<br>`ErrAccountHandOverRequiresAccount`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+
+### Depot
+
+Schema version **1**. Go type `Depot`, store `Store.Depots`.
+
+```mermaid
+flowchart LR
+  item_Depot["Depot item<br/>D#35;{depotId}<br/>DEPOT"]
+  w_Open(["Open"])
+  w_Open --> item_Depot
+  r_Get{{"Get"}}
+  item_Depot --> r_Get
+  r_Everything{{"Everything"}}
+  item_Depot --> r_Everything
+  r_Newest{{"Newest"}}
+  item_Depot --> r_Newest
+```
+
+Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB; solid arrows are written by the generated code.
+
+#### Fields
+
+| Field | Type | Attribute | Size p50/p99 | Notes |
+|---|---|---|---|---|
+| `depotId` | string | `depotId` | 20 / 64 B | key |
+| `name` | string | `name` | 20 / 64 B |  |
+
+#### Stored items
+
+Every item that exists because of a Depot, and what keeps it up to date.
+
+| Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
+|---|---|---|---|---|---|
+| **Depot** | `D#{depotId}` | `DEPOT` | `D#{depotId}`<br>`DEPOT` | 176 B / 310 B | the writes below |
+
+#### Access patterns
+
+| Method | Reads | Key condition | Consistency | Requests | RRU per call p50/p99 |
+|---|---|---|---|---|---|
+| `Get` | item by key | `PK = D#{depotId}`, `SK = DEPOT` | eventual | GetItem | 0.5 |
+| `Everything` | the whole partition, keeping `Depot`, `Parcel`, `Damage`, page 4 (max 100) | `PK = D#{depotId}`, filtered by `_t`, ascending | strong | Query | 1 |
+| `Newest` | the whole partition, keeping `Damage`, `Parcel`, page 50 (max 100) | `PK = D#{depotId}`, filtered by `_t`, descending | eventual | Query | 2.5 / 4.5 |
+
+#### Writes
+
+| Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
+|---|---|---|---|---|---|---|---|
+| `Open` | create (fails if it exists) | Depot | no | single item | — | 1 | `ErrDepotExists` |
 
 ### Parcel
 

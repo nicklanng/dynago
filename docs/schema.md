@@ -348,6 +348,7 @@ access:
   ActiveLoans: { counter: MemberLoans }
   Export: { scan: true, reason: "The nightly warehouse export reads every loan." }
   GetSeveral: { get: key, batch: 40 }             # several loans by key, one BatchGetItem
+  Open: { query: partition, of: [Thread, Message, Draft] }   # entities that share a partition, one Query
   LabelCounts: { counter: LabelCounts, all: true } # every item of a counter in a partition, one Query
 ```
 
@@ -359,14 +360,15 @@ PascalCase and must be unique across `access` and `writes`. Declare exactly one 
 |---|---|---|---|
 | `get` | | | `key`: one GetItem by primary key (short form: `Name: get`). `{ unique: Name }`: find the entity holding a unique value — a consistent read of the claim, then of the item. |
 | `batch` | `get: key` | | Makes the read take several keys: `GetSeveral: { get: key, batch: 40 }` returns the items that exist, in the order of the keys, with one BatchGetItem per 100 keys. The number is how many keys a call typically passes, which the cost estimate and the partition analysis use; a call may pass any number. Each item is billed as a GetItem of it would be. |
-| `query` | | | `key`: query the entity's own partition (items matched by its sort key prefix). An index name: query that index. Exactly one Query request per page. |
+| `query` | | | `key`: query the entity's own partition (items matched by its sort key prefix). An index name: query that index. `partition`: read several entities' items under one partition key, listed in `of`. Exactly one Query request per page. |
+| `of` | `query: partition` | | The entities whose items the read returns: `Open: { query: partition, of: [Thread, Message, Draft] }`. Every one must have the same partition key template as this entity, which is what puts their items side by side. The method takes the partition key fields and returns a generated `<Entity><Access>` value with a field per entity: a slice of each kind, or a pointer for an entity with at most one item per partition (a sort key with no field of its own). One Query reads the partition in sort key order and keeps these kinds, so the items the partition holds of other kinds (other entities, counters, copies, claims) are read and billed too, a page can hold few items and still have a next cursor, and one kind's items can span pages. Takes `order`, `page` and `max_page`. |
 | `counter` | | | Read a counter: one GetItem, or a BatchGetItem over its shards. The counter may belong to any entity of the table, so a library can offer its member counts. |
 | `all` | `counter` | `false` | Read every item of the counter in one partition, with one Query a page: `AllCounts: { counter: LabelCounts, all: true }` returns each label's counts for a user, where the counter's sort key is `COUNTS#LABEL#{labelId}`. The method takes the counter's partition key fields and returns `<Counter>Entry` values: the counts, and the key each item's sort key holds. The sort key's own fields must be `string` or `enum`, untransformed and separated by literal text, so they can be read back; the counter can't be sharded. Takes `page` and `max_page`. |
 | `scan` | | | `true`: read every item of the entity, one page of the **whole table** per call (a Scan filtered to the entity's items, so a page can hold few or none and still have a next cursor). A declared exception for exports and backfills, never for a request path: `dynago check` notes its full-pass cost, and a policy can forbid it. Needs `reason`. |
 | `reason` | scan | | Why a scan is needed. Shown in the model document and on the method. |
 | `freshness` | all | | What the reader needs. `immediate`: it must see writes that just happened (read-your-writes), so the read is strongly consistent, and an index it reads without a declared `strategy` becomes a copy; through a GSI it's an error. `eventual`: a moment's lag is fine, and the read is eventually consistent (half the cost). Left out, the read is as `consistent` says, and the model document marks it "not stated". |
 | `order` | query | `asc` | `asc` or `desc`, by sort key. |
-| `page` | query, scan, counter with `all` | `50` | Default page size (items evaluated per request). |
+| `page` | query, scan, counter with `all` | `50` | Default page size (items evaluated per request). For a partition read, size it for the whole partition if one call should return it all. |
 | `max_page` | query, scan, counter with `all` | `max(100, page)` | Largest page a caller may ask for (≤ 1000). |
 | `range` | query | | A field that directly follows the sort key's literal prefix. Adds optional inclusive `From` / `To` bounds to the query. |
 | `consistent` | get, query, counter, scan | `false`; `true` for a query through a `copy` index | Strongly consistent read (twice the cost). Not allowed on a `gsi` index. A copy index is read consistently unless it says `consistent: false` or `freshness: eventual`: read-your-writes is why it's a copy. Prefer `freshness`, which states the need rather than the mechanism; the two may not contradict each other. |

@@ -128,6 +128,10 @@ type QuerySpec struct {
 	// TTLAttr, if set, leaves out items whose TTL has passed but that DynamoDB has not yet deleted.
 	// Such a page may hold fewer items than its size and still have a next cursor.
 	TTLAttr string
+	// Types, if set, keeps only items of these types (_t): a read of a whole partition returns
+	// some of the kinds it holds. A page evaluates up to its size of the partition's items, of
+	// every kind, so it may hold fewer and still have a next cursor.
+	Types []string
 	// Project, if set, reads only these attributes. It saves bandwidth and keeps other attributes
 	// from callers; DynamoDB still charges for the whole item.
 	Project []string
@@ -160,6 +164,13 @@ func Query(ctx context.Context, t dynamo.Table, spec QuerySpec, page Page, out a
 	}
 	if spec.TTLAttr != "" {
 		q.Filter("attribute_not_exists($) OR $ > ?", spec.TTLAttr, spec.TTLAttr, Now())
+	}
+	if len(spec.Types) > 0 {
+		args := []any{AttrType}
+		for _, t := range spec.Types {
+			args = append(args, t)
+		}
+		q.Filter("$ IN (?"+strings.Repeat(", ?", len(spec.Types)-1)+")", args...)
 	}
 	if len(spec.Project) > 0 {
 		paths := make([]string, len(spec.Project))

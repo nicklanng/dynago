@@ -311,6 +311,8 @@ func counterValue(v *schema.CounterValue) string {
 
 func servedBy(a *schema.Access) string {
 	switch {
+	case a.Of != nil:
+		return "Query of the whole partition"
 	case a.Batch > 0:
 		return "BatchGetItem"
 	case a.All:

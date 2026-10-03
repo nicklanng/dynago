@@ -46,6 +46,8 @@ func answers(a *schema.Access) string {
 	}
 	e := a.Entity
 	switch {
+	case a.Of != nil:
+		return fmt.Sprintf("%s under one %s, each kind on its own.", strings.Join(ofNames(a), ", "), join(names(e.PK.Fields)))
 	case a.Batch > 0:
 		return fmt.Sprintf("Several %s, each by %s.", schema.Plural(e.Name), join(names(e.KeyFields())))
 	case a.All:
@@ -81,8 +83,26 @@ func answers(a *schema.Access) string {
 	return fmt.Sprintf("%s with a given %s, by %s (%s).", schema.Plural(e.Name), join(names(pk.Fields)), by, order)
 }
 
+// ofNames names the kinds a partition read returns: "the Thread", "its Messages".
+func ofNames(a *schema.Access) []string {
+	var out []string
+	for i, oe := range a.Of {
+		n := schema.Plural(oe.Name)
+		if oe.Singleton() {
+			n = "the " + oe.Name
+		}
+		if i == 0 {
+			n = strings.ToUpper(n[:1]) + n[1:]
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
 func servedBy(a *schema.Access) string {
 	switch {
+	case a.Of != nil:
+		return "Query of the whole partition, keeping these kinds"
 	case a.Batch > 0:
 		return "BatchGetItem (one per 100 keys)"
 	case a.All:

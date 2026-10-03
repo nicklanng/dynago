@@ -182,6 +182,12 @@ func TestValidationErrors(t *testing.T) {
 		{"all of a counter keyed by a time", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{at}\", values: { n: count } }\n    access:\n      A: { counter: C, all: true }\n", "needs string or enum fields"},
 		{"all of a counter keyed by a lowered name", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{name|lower}\", values: { n: count } }\n    access:\n      A: { counter: C, all: true }\n", "can't be read back"},
 		{"all with a range", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{name}\", values: { n: count } }\n    access:\n      A: { counter: C, all: true, order: desc }\n", "takes page and max_page"},
+		{"partition read without of", "    access:\n      P: { query: partition }\n", "list the entities it returns"},
+		{"of without a partition read", "    access:\n      P: { query: key, of: [Thing] }\n", "it goes with query: partition"},
+		{"partition read of an unknown entity", "    access:\n      P: { query: partition, of: [Thing, Nope] }\n", "of: Nope is not an entity"},
+		{"partition read of an entity twice", "    access:\n      P: { query: partition, of: [Thing, Thing] }\n", "Thing is listed twice"},
+		{"partition read with a range", "    access:\n      P: { query: partition, of: [Thing], range: name }\n", "a partition read returns several kinds whole"},
+		{"partition read of another partition", "    access:\n      P: { query: partition, of: [Thing, Other] }\n  Other:\n    fields: { tenantId: string, otherId: string }\n    key: { pk: \"O#{tenantId}\", sk: \"OTHER#{otherId}\" }\n", "so one Query can't read both"},
 		{"requires unknown counter value", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, when: { m: 0 } } } }\n", "m is not a value of counter C"},
 	}
 	for _, c := range cases {

@@ -292,7 +292,7 @@ func CounterSize(c *schema.Counter) Size {
 func analyzeEntity(r *Report, m *schema.Model, e *schema.Entity) *EntityReport {
 	er := EntitySizes(m, e)
 	for _, a := range e.Access {
-		rc := ReadCostOf(a, er)
+		rc := ReadCostOf(m, a, er)
 		if a.Rate > 0 {
 			rc.Monthly = (rc.RRU.P50 * a.Rate * secondsPerMonth / 1e6) * r.Prices.RRUPerMillion
 		}
@@ -341,7 +341,7 @@ func readFactor(a *schema.Access) float64 {
 }
 
 // ReadCostOf estimates one call of an access pattern.
-func ReadCostOf(a *schema.Access, er *EntityReport) ReadCost {
+func ReadCostOf(m *schema.Model, a *schema.Access, er *EntityReport) ReadCost {
 	rc := ReadCost{Access: a, RoundTrips: 1}
 	factor := readFactor(a)
 	e := a.Entity
@@ -362,6 +362,20 @@ func ReadCostOf(a *schema.Access, er *EntityReport) ReadCost {
 		rc.RRU = Units{1 + rru(er.Item.P50, 1), 1 + rru(er.Item.P99, 1)}
 		rc.Reads = []Target{{Kind: TargetClaim, Entity: e, Unique: a.Unique}, {Kind: TargetItem, Entity: e}}
 	case schema.AccessQuery:
+		if a.Of != nil {
+			// A page of several kinds: sized as an even mix of them at the median, and as a page
+			// of the largest at worst. Items of other kinds the partition holds are read too.
+			var mix, worst int
+			for _, oe := range a.Of {
+				s := ItemSize(m, oe)
+				mix += s.P50
+				worst = max(worst, s.P99)
+				rc.Reads = append(rc.Reads, Target{Kind: TargetItem, Entity: oe})
+			}
+			rc.Requests = "Query"
+			rc.RRU = Units{rru(mix*a.Page/max(1, len(a.Of)), factor), rru(worst*a.Page, factor)}
+			break
+		}
 		entry := er.Item
 		t := Target{Kind: TargetItem, Entity: e}
 		if a.Index != nil {

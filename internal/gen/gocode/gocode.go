@@ -923,7 +923,104 @@ func queryShape(a *schema.Access) string {
 	return hex.EncodeToString(sum[:4])
 }
 
+// partitionField names the field of a partition read's result that holds an entity's items.
+func partitionField(oe *schema.Entity) string {
+	if oe.Singleton() {
+		return oe.GoName
+	}
+	return schema.Plural(oe.GoName)
+}
+
+// partitionRead emits a read of several entities' items under one partition key: one Query of the
+// whole partition, its items sorted by kind.
+func (g *gen) partitionRead(a *schema.Access) {
+	e := a.Entity
+	rt, qt := e.GoName+a.GoName, e.GoName+a.GoName+"Query"
+	var names, types []string
+	ttl := false
+	for _, oe := range a.Of {
+		names = append(names, oe.Name)
+		types = append(types, strconv.Quote(oe.Name))
+		ttl = ttl || oe.TTL != nil
+	}
+	g.p("// %s is one page of what %s.%s reads: the page's items of each kind.", rt, e.Name, a.Name)
+	g.p("type %s struct {", rt)
+	for _, oe := range a.Of {
+		if oe.Singleton() {
+			g.p("// %s is the partition's one %s, or nil if this page doesn't hold it.", oe.GoName, oe.Name)
+			g.p("%s *%s", oe.GoName, oe.GoName)
+			continue
+		}
+		g.p("%s []%s", partitionField(oe), oe.GoName)
+	}
+	g.p("}")
+	g.p("")
+	g.p("// %s selects the partition for %s.%s.", qt, e.Name, a.Name)
+	g.p("type %s struct {", qt)
+	for _, f := range e.PK.Fields {
+		g.p("%s %s", f.GoName, goType(e, f))
+	}
+	g.p("}")
+	g.p("")
+	order := "ascending"
+	if a.Desc {
+		order = "descending"
+	}
+	g.docComment(a.GoName, a.Doc, fmt.Sprintf("returns one page of a partition's %s items, each kind in its own field, with exactly one %s Query (default %d, max %d items evaluated). The partition's items are read in %s sort key order, every kind of them, and these kinds kept: a page can hold few items, or none, and still have a next cursor, and a kind's items can span pages. Keep going until the cursor is \"\" for all of them.",
+		schema.JoinAnd(names), consistency(a.Consistent), a.Page, a.MaxPage, order))
+	g.p("func (s *%sStore) %s(ctx context.Context, q %s, page dynago.Page) (%s, string, error) {", e.GoName, a.GoName, qt, rt)
+	g.presenceGuard(e.PK.Fields, "q", fmt.Sprintf("return %s{}, \"\", fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", rt, a.Name, fieldList(e.PK.Fields)))
+	g.keyPartChecks(e.PK.Fields, func(f *schema.Field) string { return "q." + f.GoName }, fmt.Sprintf("return %s{}, \"\", err", rt))
+	g.p("pk := %s", tmplExpr(e, e.PK, "q"))
+	sum := sha256.Sum256([]byte(strings.Join(append([]string{e.PK.Raw, strconv.FormatBool(a.Desc)}, names...), "\x00")))
+	spec := []string{
+		fmt.Sprintf("Scope: %q + pk", fmt.Sprintf("%s.%s#%s\x00", e.Name, a.Name, hex.EncodeToString(sum[:4]))),
+		"PK: pk", `PKAttr: "PK"`, `SKAttr: "SK"`,
+		fmt.Sprintf("PageSize: %d", a.Page),
+		fmt.Sprintf("MaxPage: %d", a.MaxPage),
+		fmt.Sprintf("Types: []string{%s}", strings.Join(types, ", ")),
+	}
+	if a.Desc {
+		spec = append(spec, "Desc: true")
+	}
+	if a.Consistent {
+		spec = append(spec, "Consistent: true")
+	}
+	if ttl {
+		spec = append(spec, fmt.Sprintf("TTLAttr: %q", g.m.Table.TTLAttr))
+	}
+	g.p("var raws []dynamo.Item")
+	g.p("next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{%s}, page, &raws)", strings.Join(spec, ", "))
+	g.p("if err != nil {")
+	g.p("return %s{}, \"\", err", rt)
+	g.p("}")
+	g.p("var out %s", rt)
+	g.p("for _, raw := range raws {")
+	g.p("switch dynago.ItemType(raw) {")
+	for _, oe := range a.Of {
+		g.p("case %q:", oe.Name)
+		g.p("it, err := %sDecode(raw)", lowerFirst(oe.GoName))
+		g.p("if err != nil {")
+		g.p("return %s{}, \"\", err", rt)
+		g.p("}")
+		if oe.Singleton() {
+			g.p("out.%s = &it.%s", oe.GoName, oe.GoName)
+		} else {
+			g.p("out.%s = append(out.%s, it.%s)", partitionField(oe), partitionField(oe), oe.GoName)
+		}
+	}
+	g.p("}")
+	g.p("}")
+	g.p("return out, next, nil")
+	g.p("}")
+	g.p("")
+}
+
 func (g *gen) query(a *schema.Access) {
+	if a.Of != nil {
+		g.partitionRead(a)
+		return
+	}
 	e := a.Entity
 	qt := e.GoName + a.GoName + "Query"
 	pk := a.QueryPK()

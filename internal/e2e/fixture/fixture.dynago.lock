@@ -158,6 +158,31 @@
         }
       ]
     },
+    "Depot": {
+      "versions": [
+        {
+          "version": 1,
+          "generation": 1,
+          "fingerprint": "82b2e17f53028afa",
+          "shape": {
+            "fields": [
+              {
+                "name": "depotId",
+                "attr": "depotId",
+                "type": "string"
+              },
+              {
+                "name": "name",
+                "attr": "name",
+                "type": "string"
+              }
+            ],
+            "pk": "D#{depotId}",
+            "sk": "DEPOT"
+          }
+        }
+      ]
+    },
     "Parcel": {
       "versions": [
         {

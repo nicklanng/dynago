@@ -20,6 +20,10 @@ format, the generated code and the runtime API; the changelog says how to move.
   regenerating, rename the uses of the affected names in your code; the compiler finds them.
   Stored attribute names don't change.
 
+- A read of several entities that share a partition, in one Query:
+  `Open: { query: partition, of: [Thread, Message, Attachment, Draft] }` returns a page of the
+  partition with each kind in its own field (`ThreadOpen{Thread, Messages, Attachments, Drafts}`).
+  The entities must have the same partition key template. `dynago.QuerySpec` gained `Types`.
 - Reads of several items at once. `GetSeveral: { get: key, batch: 40 }` takes a slice of keys and
   returns the items that exist, in the order asked, with one BatchGetItem per 100 keys.
   `AllCounts: { counter: LabelCounts, all: true }` returns every item of a counter in one

@@ -331,3 +331,71 @@ func TestBatchGetAndAllCounters(t *testing.T) {
 		t.Fatalf("damaged parcels %v, want p1 with 2 reports and p2 with 1", seen)
 	}
 }
+
+// A depot, its parcels and their damage reports share a partition, and one Query reads them
+// together: each page's items sorted by kind, the counters that live there too left out, and the
+// partition's one depot wherever its sort key falls.
+func TestPartitionRead(t *testing.T) {
+	t.Parallel()
+	db, n := testdb.CountingDB(t)
+	st := fixture.New(db, testdb.Table(t, db, fixture.TableSpec))
+	for _, depot := range []string{"d1", "d2"} {
+		must(t, st.Depots.Open(ctx, &fixture.Depot{DepotID: depot, Name: "Depot " + depot}))
+		for _, id := range []string{"p1", "p2", "p3", "p4", "p5"} {
+			must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: depot, ParcelID: id}))
+		}
+		for _, id := range []string{"p1", "p2", "p2"} {
+			must(t, st.Damages.File(ctx, &fixture.Damage{DepotID: depot, ParcelID: id, DamageID: testdb.UniqueName(t, "dmg"), Detail: "dented"}))
+		}
+	}
+
+	var depots, parcels, damages []string
+	queries := n.Query.Load()
+	page := dynago.Page{}
+	for calls := 0; ; calls++ {
+		if calls > 20 {
+			t.Fatal("the partition never ended")
+		}
+		got, next, err := st.Depots.Everything(ctx, fixture.DepotEverythingQuery{DepotID: "d1"}, page)
+		must(t, err)
+		if n := len(got.Parcels) + len(got.Damages); n > 4 {
+			t.Fatalf("a page of %d items, over its size", n)
+		}
+		if got.Depot != nil {
+			depots = append(depots, got.Depot.DepotID+" "+got.Depot.Name)
+		}
+		for _, p := range got.Parcels {
+			parcels = append(parcels, p.DepotID+"/"+p.ParcelID)
+		}
+		for _, d := range got.Damages {
+			damages = append(damages, d.DepotID+"/"+d.ParcelID)
+		}
+		if next == "" {
+			break
+		}
+		page.Cursor = next
+	}
+	if fmt.Sprint(depots) != "[d1 Depot d1]" || fmt.Sprint(parcels) != "[d1/p1 d1/p2 d1/p3 d1/p4 d1/p5]" || fmt.Sprint(damages) != "[d1/p1 d1/p2 d1/p2]" {
+		t.Fatalf("read depots %v, parcels %v, damages %v", depots, parcels, damages)
+	}
+	// 9 items of these kinds and the partition's counter items, 4 evaluated to a page.
+	if q := n.Query.Load() - queries; q < 3 {
+		t.Fatalf("Everything took %d queries; pages of 4 can't hold the partition in fewer than 3", q)
+	}
+
+	// Another read of the same partition returns other kinds, newest sort key first, in one page.
+	got, next, err := st.Depots.Newest(ctx, fixture.DepotNewestQuery{DepotID: "d2"}, dynago.Page{})
+	must(t, err)
+	var ids []string
+	for _, p := range got.Parcels {
+		ids = append(ids, p.ParcelID)
+	}
+	if next != "" || fmt.Sprint(ids) != "[p5 p4 p3 p2 p1]" || len(got.Damages) != 3 {
+		t.Fatalf("Newest read parcels %v and %d damages (next %q)", ids, len(got.Damages), next)
+	}
+	// What it returns can be written back like any entity read from the store.
+	must(t, st.Parcels.Shelve(ctx, fixture.ParcelKey{DepotID: "d2", ParcelID: "p5"}, dynago.From(&got.Parcels[0])))
+	if _, _, err := st.Depots.Everything(ctx, fixture.DepotEverythingQuery{}, dynago.Page{}); !errors.Is(err, dynago.ErrInvalidKey) {
+		t.Fatalf("no depot id: %v", err)
+	}
+}

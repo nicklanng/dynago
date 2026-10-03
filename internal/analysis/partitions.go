@@ -635,6 +635,9 @@ func (a *analyzer) traffic() {
 					units = math.Max(0, units-1)
 				case t.Kind == cost.TargetCounter && t.Counter.Shards > 1:
 					units /= float64(t.Counter.Shards)
+				case ac.Of != nil:
+					// One Query of one partition, counted once across the kinds it returns.
+					units /= float64(len(rc.Reads))
 				}
 				p := mb.Partition
 				p.Rated = true
@@ -703,6 +706,16 @@ func (a *analyzer) readStats() {
 					st.Items, st.Partition = mb.Count, mb.Partition
 				}
 				st.Filtered = ac.Index != nil && ac.Index.Unsized()
+				if ac.Of != nil && st.Partition != nil {
+					// A partition read evaluates every item under the key, of every kind.
+					st.Items = Estimate{Known: true, MaxKnown: true}
+					for _, mb := range st.Partition.Members {
+						st.Items.Typical += mb.Count.Typical
+						st.Items.Max += mb.Count.Max
+						st.Items.Known = st.Items.Known && mb.Count.Known
+						st.Items.MaxKnown = st.Items.MaxKnown && mb.Count.MaxKnown
+					}
+				}
 			}
 			pages := func(n float64) float64 { return math.Max(1, math.Ceil(n/float64(ac.Page))) }
 			read := st.Items

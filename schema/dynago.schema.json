@@ -752,7 +752,16 @@
             },
             "query": {
               "type": "string",
-              "description": "key (the entity's own partition) or an index name."
+              "description": "key (the entity's own items in its partition), an index name, or partition (every entity listed in of, under this entity's partition key)."
+            },
+            "of": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/pascalName"
+              },
+              "minItems": 1,
+              "uniqueItems": true,
+              "description": "With query: partition, the entities whose items the read returns, each kind in its own field of the result. Every one must have the same partition key template as this entity."
             },
             "counter": {
               "$ref": "#/$defs/pascalName"

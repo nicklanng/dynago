@@ -374,6 +374,21 @@ type Entity struct {
 // Field returns the named field, or nil.
 func (e *Entity) Field(name string) *Field { return e.fieldsByName[name] }
 
+// Singleton reports whether a partition key value holds at most one item of the entity: its sort
+// key has no field the partition key doesn't.
+func (e *Entity) Singleton() bool {
+	in := map[*Field]bool{}
+	for _, f := range e.PK.Fields {
+		in[f] = true
+	}
+	for _, f := range e.SK.Fields {
+		if !in[f] {
+			return false
+		}
+	}
+	return true
+}
+
 // KeyFields returns the fields of the primary key in template order.
 func (e *Entity) KeyFields() []*Field {
 	return mergeFields(e.PK.Fields, e.SK.Fields)
@@ -722,6 +737,11 @@ type Access struct {
 	Unique  *Unique
 	Index   *Index // nil for a query on the entity's own partition
 	Counter *Counter
+	// Of, on a query of the entity's partition (query: partition), lists the entities whose items
+	// the read returns, each kind on its own: every one keys its items under the same partition
+	// key. nil for any other read.
+	Of    []*Entity
+	ofRaw []string
 	// Batch, on a get by key, makes the read take several keys in one BatchGetItem: the typical
 	// number of keys per call, which the estimates use. 0 for a read of one key.
 	Batch int

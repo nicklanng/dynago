@@ -46,6 +46,7 @@ For an entity `Loan`:
 | `LoanHistoryItem` | a `query: key` access `History` with `project` | What the projected query returns. |
 | `MemberLoans`, `MemberLoansKey` | a counter `MemberLoans` | The counter's values (`int64` fields) and the fields that address it. |
 | `MemberLoansEntry` | a `counter` access with `all` | One counter item of a partition: its values, and its `Key`. |
+| `Depot<Access>` | a `query: partition` access | One page of the partition: a field per entity in `of`. |
 | `Loan<Access>Query` | a `query` access pattern, or a `counter` access with `all` | Its partition key fields, plus `From, To *T` when it has a `range`. |
 | `Loan<Write>` | an update with `update:` or `patch:` fields | The values the caller supplies; `patch` fields are pointers. |
 | `Loan<Write>Limits` | a write that can grow a `limit: arg` counter value | One `dynago.Limit` per value, named `<Counter><Value>`. |
@@ -187,6 +188,24 @@ One GetItem, or a BatchGetItem over all shards of a sharded counter, summed (Dyn
 some keys unprocessed, which are fetched again). A counter that
 nothing has written reads as zero. The method can live on any entity's store (here the library
 reads the member counts).
+
+### `query: partition`
+
+```go
+type DepotEverything struct {
+    Depot   *Depot      // at most one per partition: nil if this page doesn't hold it
+    Parcels []Parcel
+    Damages []Damage
+}
+
+func (s *DepotStore) Everything(ctx context.Context, q DepotEverythingQuery, page dynago.Page) (DepotEverything, string, error)
+```
+
+Exactly one Query of the partition `q` names, in sort key order (so one kind after another, in the
+order of their sort key prefixes), keeping the kinds listed in `of`. A page evaluates up to its
+size of the partition's items, of every kind, so it can hold fewer than its size and still have a
+next cursor, and a kind's items can continue on the next page: append each page's slices until the
+cursor is `""`. Entities carry their versions, as from `Get`. Expired items are left out.
 
 ### `counter` with `all`
 

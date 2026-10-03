@@ -899,7 +899,18 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 		a.counterRaw = raw.Counter
 	default:
 		a.Kind = AccessQuery
-		if raw.Query != "key" {
+		if raw.Query == "partition" {
+			// Resolved in crossRefs: the read returns several entities' items.
+			if len(raw.Of) == 0 {
+				r.errorf("%s: query: partition reads every kind of item the partition holds; list the entities it returns (of: [%s, ...])", where, e.Name)
+				return nil
+			}
+			a.ofRaw = raw.Of
+			if raw.Range != "" || raw.Project.Set {
+				r.errorf("%s: range and project apply to a query of one entity's items; a partition read returns several kinds whole", where)
+			}
+			r.claimType(e.GoName+a.GoName, where)
+		} else if raw.Query != "key" {
 			for _, ix := range e.Indexes {
 				if ix.Name == raw.Query {
 					a.Index = ix
@@ -968,6 +979,9 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 				r.claimType(e.GoName+a.GoName+"Item", where)
 			}
 		}
+	}
+	if len(raw.Of) > 0 && raw.Query != "partition" {
+		r.errorf("%s: of lists the entities a partition read returns; it goes with query: partition", where)
 	}
 	if raw.Batch != nil && a.Kind != AccessGet {
 		r.errorf("%s: batch applies to get: key (a read of several items by their keys)", where)
@@ -1178,6 +1192,9 @@ func (r *resolver) crossRefs(m *Model) {
 			}
 		}
 		for _, a := range e.Access {
+			if a.ofRaw != nil {
+				r.partitionRead(e, a, byName)
+			}
 			if a.Kind != AccessCounter {
 				continue
 			}
@@ -1199,6 +1216,50 @@ func (r *resolver) crossRefs(m *Model) {
 			r.sameItemTwice(w)
 			r.planWrite(w)
 		}
+	}
+}
+
+// partitionRead resolves the entities a partition read returns. Each must key its items under
+// the same partition key as the reading entity, so that one Query of that key finds them.
+func (r *resolver) partitionRead(e *Entity, a *Access, byName map[string]*Entity) {
+	where := fmt.Sprintf("entity %s access %s", e.Name, a.Name)
+	names := map[string]string{}
+	for _, name := range a.ofRaw {
+		oe := byName[name]
+		switch {
+		case oe == nil:
+			r.errorf("%s: of: %s is not an entity of this table", where, name)
+			continue
+		case slices.Contains(a.Of, oe):
+			r.errorf("%s: of: %s is listed twice", where, name)
+			continue
+		case oe.PK.Raw != e.PK.Raw:
+			r.errorf("%s: of: %s's items are under partition key %q, not %s's %q, so one Query can't read both. A partition read returns entities whose partition key templates are the same", where, name, oe.PK.Raw, e.Name, e.PK.Raw)
+			continue
+		}
+		same := true
+		for i, f := range oe.PK.Fields {
+			if f.Type != e.PK.Fields[i].Type {
+				r.errorf("%s: of: %s.%s is a %s, but %s.%s is a %s: the two render different partition keys", where, name, f.Name, f.Type, e.Name, f.Name, e.PK.Fields[i].Type)
+				same = false
+			}
+		}
+		if !same {
+			continue
+		}
+		field := Plural(oe.GoName)
+		if oe.Singleton() {
+			field = oe.GoName
+		}
+		if prev, ok := names[field]; ok {
+			r.errorf("%s: of: %s and %s would both be the field %s of the generated %s%s; rename one of the entities", where, prev, name, field, e.GoName, a.GoName)
+			continue
+		}
+		names[field] = name
+		a.Of = append(a.Of, oe)
+	}
+	if a.Of == nil {
+		a.Of = []*Entity{}
 	}
 }
 

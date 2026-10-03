@@ -350,6 +350,12 @@ func ttlAttr(m *schema.Model) string {
 
 func readsText(a *schema.Access) string {
 	switch {
+	case a.Of != nil:
+		var kinds []string
+		for _, oe := range a.Of {
+			kinds = append(kinds, "`"+oe.Name+"`")
+		}
+		return fmt.Sprintf("the whole partition, keeping %s, page %d (max %d)", strings.Join(kinds, ", "), a.Page, a.MaxPage)
 	case a.Batch > 0:
 		return fmt.Sprintf("items by key, %d a call typically", a.Batch)
 	case a.All:
@@ -401,6 +407,8 @@ func keyCondition(a *schema.Access) string {
 	cond := fmt.Sprintf("`%s = %s`", pkAttr, a.QueryPK().Raw)
 	sk, ok := a.QuerySK()
 	switch {
+	case a.Of != nil:
+		cond += ", filtered by `_t`"
 	case a.Range != nil:
 		cond += fmt.Sprintf(", `%s` between optional bounds on `%s`", skAttr, a.Range.Name)
 	case ok && sk.LiteralPrefix() != "":

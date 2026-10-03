@@ -51,6 +51,21 @@ entities:
             when: { status: pending }
             set: { status: active }
 
+  # A depot, its parcels and their damage reports share a partition, and are read together.
+  Depot:
+    fields:
+      depotId: string
+      name: string
+    key:
+      pk: "D#{depotId}"
+      sk: "DEPOT"
+    access:
+      Get: get
+      Everything: { query: partition, of: [Depot, Parcel, Damage], page: 4, freshness: immediate }
+      Newest: { query: partition, of: [Damage, Parcel], order: desc, freshness: eventual }
+    writes:
+      Open: create
+
   # A parcel moves through a depot's states. Its index, counter values and preconditions exclude a
   # state (not) or list several (in), rather than naming one.
   Parcel:

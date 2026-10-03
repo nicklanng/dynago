@@ -33,6 +33,7 @@ var TableSpec = dynago.TableSpec{
 // Store gives typed access to the fixture table.
 type Store struct {
 	Accounts *AccountStore
+	Depots   *DepotStore
 	Parcels  *ParcelStore
 	Damages  *DamageStore
 }
@@ -42,6 +43,7 @@ func New(db *dynamo.DB, tableName string) *Store {
 	t := db.Table(tableName)
 	return &Store{
 		Accounts: &AccountStore{db: db, t: t},
+		Depots:   &DepotStore{db: db, t: t},
 		Parcels:  &ParcelStore{db: db, t: t},
 		Damages:  &DamageStore{db: db, t: t},
 	}
@@ -521,6 +523,285 @@ func (s *AccountStore) requireHandOverAccount(ctx context.Context, e *Account, r
 		return nil, dynago.Change{}, err
 	}
 	return []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}, dynago.Change{Owner: key, Before: accountDerived(before, key), After: accountDerived(&after, key)}, nil
+}
+
+// ---- Depot ----
+
+// Depot is stored in the fixture table.
+type Depot struct {
+	DepotID string `dynamo:"depotId"`
+	Name    string `dynamo:"name,omitempty"`
+
+	loaded *depotLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
+}
+
+// depotLoaded remembers the stored state an entity was read at, so a write passed the entity
+// with dynago.From can start from it without reading again.
+type depotLoaded struct {
+	rev      int64
+	v        int
+	snapshot Depot
+	raw      dynamo.Item // as stored, including attributes this code doesn't know
+}
+
+// Version identifies the stored state e was read at, for optimistic concurrency: pass it back
+// with dynago.IfVersion (e.g. from an ETag) to make a write fail if anything changed since.
+// It is "" for an entity that was not read from the store.
+func (e *Depot) Version() string {
+	if e.loaded == nil {
+		return ""
+	}
+	return dynago.FormatVersion(e.loaded.rev)
+}
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Depot) Timestamps() dynago.Timestamps { return e.stamps }
+
+// clone copies e, including its slices and maps, without its loaded state.
+func (e *Depot) clone() Depot {
+	c := *e
+	c.loaded = nil
+	return c
+}
+
+// checkKeyParts rejects values containing a character their key templates use as a separator.
+func (e *Depot) checkKeyParts() error {
+	return nil
+}
+
+// DepotKey identifies a Depot.
+type DepotKey struct {
+	DepotID string
+}
+
+// Key returns the primary key of e.
+func (e *Depot) Key() DepotKey {
+	return DepotKey{DepotID: e.DepotID}
+}
+
+func (k DepotKey) dynamoKey() (dynago.Key, error) {
+	if k.DepotID == "" {
+		return dynago.Key{}, fmt.Errorf("%w: Depot needs depotId", dynago.ErrInvalidKey)
+	}
+	return dynago.Key{PK: "D#" + k.DepotID, SK: "DEPOT"}, nil
+}
+
+// Errors returned by DepotStore. Each wraps the matching dynago sentinel.
+var (
+	ErrDepotNotFound = fmt.Errorf("%w: Depot", dynago.ErrNotFound)
+	ErrDepotExists   = fmt.Errorf("%w: Depot", dynago.ErrExists)
+)
+
+const depotVersion = 1
+
+type depotItem struct {
+	Depot
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
+
+	raw dynamo.Item // as read, for writes to keep attributes this code doesn't know
+}
+
+// depotKnown is every attribute this code writes on Depot items.
+var depotKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "depotId": true, "name": true}
+
+// depotToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func depotToItem(e *Depot, key dynago.Key, rev int64, created, updated string) *depotItem {
+	it := &depotItem{Depot: *e, PK: key.PK, SK: key.SK, T: "Depot", V: depotVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
+	return it
+}
+
+// DepotStore reads and writes Depot items. Only the access patterns declared in the schema
+// exist as methods.
+type DepotStore struct {
+	db *dynamo.DB
+	t  dynamo.Table
+}
+
+func (s *DepotStore) load(ctx context.Context, key dynago.Key, consistent bool) (*depotItem, error) {
+	var raw dynamo.Item
+	found, err := dynago.GetOne(ctx, s.t, key, consistent, &raw)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrDepotNotFound
+	}
+	return depotDecode(raw)
+}
+
+// depotDecode decodes a stored item, remembering its state for writes passed dynago.From.
+func depotDecode(raw dynamo.Item) (*depotItem, error) {
+	var it depotItem
+	if err := dynamo.UnmarshalItem(raw, &it); err != nil {
+		return nil, err
+	}
+	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
+	it.loaded = &depotLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
+	return &it, nil
+}
+
+func depotDecodeAll(raws []dynamo.Item) ([]Depot, error) {
+	out := make([]Depot, 0, len(raws))
+	for _, raw := range raws {
+		it, err := depotDecode(raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, it.Depot)
+	}
+	return out, nil
+}
+
+// Get reads a Depot by primary key with one eventually consistent GetItem.
+func (s *DepotStore) Get(ctx context.Context, k DepotKey) (*Depot, error) {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return nil, err
+	}
+	it, err := s.load(ctx, key, false)
+	if err != nil {
+		return nil, err
+	}
+	return &it.Depot, nil
+}
+
+// DepotEverything is one page of what Depot.Everything reads: the page's items of each kind.
+type DepotEverything struct {
+	// Depot is the partition's one Depot, or nil if this page doesn't hold it.
+	Depot   *Depot
+	Parcels []Parcel
+	Damages []Damage
+}
+
+// DepotEverythingQuery selects the partition for Depot.Everything.
+type DepotEverythingQuery struct {
+	DepotID string
+}
+
+// Everything returns one page of a partition's Depot, Parcel and Damage items, each kind in its own
+// field, with exactly one strongly consistent Query (default 4, max 100 items evaluated). The
+// partition's items are read in ascending sort key order, every kind of them, and these kinds kept:
+// a page can hold few items, or none, and still have a next cursor, and a kind's items can span
+// pages. Keep going until the cursor is "" for all of them.
+func (s *DepotStore) Everything(ctx context.Context, q DepotEverythingQuery, page dynago.Page) (DepotEverything, string, error) {
+	if q.DepotID == "" {
+		return DepotEverything{}, "", fmt.Errorf("%w: Everything needs depotId", dynago.ErrInvalidKey)
+	}
+	pk := "D#" + q.DepotID
+	var raws []dynamo.Item
+	next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{Scope: "Depot.Everything#5a1c631a\x00" + pk, PK: pk, PKAttr: "PK", SKAttr: "SK", PageSize: 4, MaxPage: 100, Types: []string{"Depot", "Parcel", "Damage"}, Consistent: true}, page, &raws)
+	if err != nil {
+		return DepotEverything{}, "", err
+	}
+	var out DepotEverything
+	for _, raw := range raws {
+		switch dynago.ItemType(raw) {
+		case "Depot":
+			it, err := depotDecode(raw)
+			if err != nil {
+				return DepotEverything{}, "", err
+			}
+			out.Depot = &it.Depot
+		case "Parcel":
+			it, err := parcelDecode(raw)
+			if err != nil {
+				return DepotEverything{}, "", err
+			}
+			out.Parcels = append(out.Parcels, it.Parcel)
+		case "Damage":
+			it, err := damageDecode(raw)
+			if err != nil {
+				return DepotEverything{}, "", err
+			}
+			out.Damages = append(out.Damages, it.Damage)
+		}
+	}
+	return out, next, nil
+}
+
+// DepotNewest is one page of what Depot.Newest reads: the page's items of each kind.
+type DepotNewest struct {
+	Damages []Damage
+	Parcels []Parcel
+}
+
+// DepotNewestQuery selects the partition for Depot.Newest.
+type DepotNewestQuery struct {
+	DepotID string
+}
+
+// Newest returns one page of a partition's Damage and Parcel items, each kind in its own field,
+// with exactly one eventually consistent Query (default 50, max 100 items evaluated). The
+// partition's items are read in descending sort key order, every kind of them, and these kinds
+// kept: a page can hold few items, or none, and still have a next cursor, and a kind's items can
+// span pages. Keep going until the cursor is "" for all of them.
+func (s *DepotStore) Newest(ctx context.Context, q DepotNewestQuery, page dynago.Page) (DepotNewest, string, error) {
+	if q.DepotID == "" {
+		return DepotNewest{}, "", fmt.Errorf("%w: Newest needs depotId", dynago.ErrInvalidKey)
+	}
+	pk := "D#" + q.DepotID
+	var raws []dynamo.Item
+	next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{Scope: "Depot.Newest#98928f05\x00" + pk, PK: pk, PKAttr: "PK", SKAttr: "SK", PageSize: 50, MaxPage: 100, Types: []string{"Damage", "Parcel"}, Desc: true}, page, &raws)
+	if err != nil {
+		return DepotNewest{}, "", err
+	}
+	var out DepotNewest
+	for _, raw := range raws {
+		switch dynago.ItemType(raw) {
+		case "Damage":
+			it, err := damageDecode(raw)
+			if err != nil {
+				return DepotNewest{}, "", err
+			}
+			out.Damages = append(out.Damages, it.Damage)
+		case "Parcel":
+			it, err := parcelDecode(raw)
+			if err != nil {
+				return DepotNewest{}, "", err
+			}
+			out.Parcels = append(out.Parcels, it.Parcel)
+		}
+	}
+	return out, next, nil
+}
+
+// Open creates a Depot, failing with ErrDepotExists if one already exists. Afterwards e.Version()
+// returns the new item's version.
+func (s *DepotStore) Open(ctx context.Context, e *Depot) error {
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		put := s.t.Put(depotToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+		ops := []dynago.Op{dynago.CreateOp(key, put, ErrDepotExists, rev)}
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return err
+		}
+		e.loaded = &depotLoaded{rev: rev, v: depotVersion, snapshot: e.clone()}
+		return nil
+	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
 }
 
 // ---- Parcel ----

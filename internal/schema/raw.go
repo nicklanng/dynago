@@ -269,9 +269,11 @@ func (v *RawCounterValue) UnmarshalYAML(n *yaml.Node) error {
 type RawAccess struct {
 	Get *RawGet `yaml:"get"`
 	// Batch, with get: key, makes the read take several keys: the typical number per call.
-	Batch   any    `yaml:"batch"`
-	Query   string `yaml:"query"`
-	Counter string `yaml:"counter"`
+	Batch any    `yaml:"batch"`
+	Query string `yaml:"query"`
+	// Of, with query: partition, lists the entities of the partition the read returns.
+	Of      []string `yaml:"of"`
+	Counter string   `yaml:"counter"`
 	// All, with counter, reads every item of the counter in one partition with a Query.
 	All bool `yaml:"all"`
 	// Scan reads every item of the entity, a page at a time: a declared exception, with a reason.
