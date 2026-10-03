@@ -349,6 +349,10 @@ func names(fs []*schema.Field) []string {
 	out := make([]string, len(fs))
 	for i, f := range fs {
 		out[i] = f.Name
+		if f.Type == schema.TypeStringSet {
+			// In a key, a set stands for one of its elements.
+			out[i] = "element of " + f.Name
+		}
 	}
 	return out
 }

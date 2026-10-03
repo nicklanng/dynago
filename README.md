@@ -229,8 +229,7 @@ Local.
   update often will see conflicts.
 - **Migrations read the whole table on every pass.** For very large, old tables, a table copy
   per structural change may stop being practical.
-- **Not supported yet:** LSIs (see the roadmap), custom Go field types, batch writes,
-  multi-valued index keys.
+- **Not supported yet:** LSIs (see the roadmap), custom Go field types, batch writes.
 
 ## License
 

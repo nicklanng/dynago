@@ -180,7 +180,8 @@ key:
 **Key templates** are literal text with `{field}` placeholders. Rules:
 
 - Every placeholder names a field of the entity, of a type allowed in keys (`string`, `enum`,
-  `int`, `time`, `bool`).
+  `int`, `time`, `bool`). An index's, a counter's and a unique constraint's templates may also
+  name one `string_set`, which renders a key for each of its elements; an entity's own key can't.
 - Two placeholders must be separated by literal text (`{a}#{b}`, not `{a}{b}`).
 - A `string` or `enum` placeholder can apply a transform: `{name|lower}` puts the lower-cased value
   in the key while the attribute keeps its case. Use it to sort case-insensitively (`"adam"` before
@@ -249,6 +250,24 @@ Behaviour:
   count in each `INCLUDE` GSI. A field's `attr` can't be a GSI's key attribute (`ByCategoryPK`).
 - **Results.** A query through an index with `project: all` returns entities; otherwise it returns
   a generated `<Entity><Index>` struct holding the projected fields.
+- **Keyed by a set's elements.** A key template may name one `string_set` field: the entity then
+  has an entry for **each element** of the set, so a thread with three labels is in three label
+  lists:
+
+  ```yaml
+  ByLabel:
+    pk: "USER#{userId}#LABEL#{labelIds}"      # labelIds is a string_set
+    sk: "L#{lastMessageAt}#{threadId}"
+    project: [subject, snippet, unread]
+  ```
+
+  Such an index is always a copy (a GSI holds an item under one key), written in the write's
+  transaction like any copy. A write that changes the set adds the copies of new elements and
+  deletes those of dropped ones; a write that changes anything else the copies hold rewrites every
+  one, so its cost and its transaction grow with the set: declare the set's `size`, from which
+  dynago estimates the number of elements, at 20 bytes each. A query through the index takes one
+  element (`LabelIDsElem`) where it would take the field. Elements that render the same key
+  (`{labelIds|lower}`) share one copy.
 
 Limits: 20 GSIs per table (a default quota AWS can raise), and 100 attributes in `INCLUDE`
 projections across a table's indexes (a fixed limit).
@@ -334,6 +353,23 @@ Each value is `count` (short form) or a mapping:
 
 Use exactly one of `count` and `sum`. The counter item is only touched while every `string`, `enum`
 and `time` field in its templates is non-empty (a sparse counter). See [Counters](guides/counters.md).
+
+A counter's key templates may name one `string_set` field, as an index's may: the entity then
+counts towards **one counter item for each element** of the set.
+
+```yaml
+LabelCounts:
+  pk: "USER#{userId}"
+  sk: "COUNTS#LABEL#{labelIds}"                 # one item per label
+  values:
+    total: count
+    unread: { count: true, where: { unread: true } }
+```
+
+A thread with three labels adds to three items, in the write's transaction; changing the set moves
+its contribution from the labels dropped to the labels added. The counter's key type holds one
+element (`LabelCountsKey.LabelIDsElem`), and `{ counter: LabelCounts, all: true }` reads every
+label's item in one Query. A `requires` can't check such a counter.
 
 ## Access
 

@@ -11,10 +11,10 @@ Table generation **1**: `fixture-g1`.
 | | |
 |---|---|
 | Entities | 4: Account, Depot, Parcel, Damage |
-| Reads | 16: 5 by key, 4 queries, 6 counters, 1 scan |
-| Writes | 14: 12 in a transaction, 5 reading the item first |
-| Indexes | 1 GSI, 1 copy index (Known, Parcel.OnSite) |
-| Uniqueness claims, counters | 0, 6 |
+| Reads | 19: 5 by key, 5 queries, 8 counters, 1 scan |
+| Writes | 15: 13 in a transaction, 6 reading the item first |
+| Indexes | 1 GSI, 2 copy indexes (Known, Parcel.OnSite, Parcel.ByTag) |
+| Uniqueness claims, counters | 0, 7 |
 | Workload | No peak factor declared (peaks taken as the averages); volumes declared for 0 of 4 entities |
 | Cost | $0.00/month at the declared volumes and rates |
 | Findings | 0 errors, 0 warnings, 1 note open; 0 accepted |
@@ -112,11 +112,14 @@ Every read the code can make. A read that isn't listed has no method, so a new w
 | `Account.Export` | Every Account in the table. | Scan of the whole table, one page per call | eventual (not stated) | pages of 2, a page at a time (volume not declared) | 0.5 | — |
 | `Depot.Get` | One Depot, by depotId. | GetItem | eventual (not stated) | one | 0.5 | — |
 | `Depot.Totals` | The DepotTotals counts for a . | counter DepotTotals (GetItem) | immediate | the counts | 1 | — |
-| `Depot.Everything` | The Depot, Parcels, Damages under one depotId, each kind on its own. | Query of the whole partition, keeping these kinds | immediate | pages of 4, a page at a time (volume not declared) | 1 | — |
-| `Depot.Newest` | Damages, Parcels under one depotId, each kind on its own. | Query of the whole partition, keeping these kinds | eventual | pages of 50, a page at a time (volume not declared) | 2.5 / 4.5 | — |
+| `Depot.Everything` | The Depot, Parcels, Damages under one depotId, each kind on its own. | Query of the whole partition, keeping these kinds | immediate | pages of 4, a page at a time (volume not declared) | 1 / 2 | — |
+| `Depot.Newest` | Damages, Parcels under one depotId, each kind on its own. | Query of the whole partition, keeping these kinds | eventual | pages of 50, a page at a time (volume not declared) | 2.5 / 7 | — |
 | `Parcel.Get` | One Parcel, by depotId and parcelId. | GetItem | eventual (not stated) | one | 0.5 | — |
 | `Parcel.GetSeveral` | Several Parcels, each by depotId and parcelId. | BatchGetItem (one per 100 keys) | immediate | the ones that exist: 10 keys a call typically | 10 | — |
 | `Parcel.States` | Every StateCounts count of a depotId: one for each state. | Query of counter StateCounts's items | immediate | pages of 50 counter items, a page at a time | 2 / 3 | — |
+| `Parcel.Tagged` | Parcels with a given depotId and element of tags, by parcelId (ascending). | Query of copy ByTag | strong (not stated) | pages of 50, a page at a time (volume not declared) | 4 / 10 | — |
+| `Parcel.TagCount` | The TagCounts counts for a depotId and element of tags. | counter TagCounts (GetItem) | immediate | the counts | 1 | — |
+| `Parcel.Tags` | Every TagCounts count of a depotId: one for each element of tags. | Query of counter TagCounts's items | immediate | pages of 50 counter items, a page at a time | 3 | — |
 | `Parcel.OnSite` | Parcels with a given depotId, by parcelId (ascending). | Query of copy OnSite | immediate | pages of 50, a page at a time (volume not declared) | 3 / 5 | — |
 | `Parcel.Known` | Parcels with a given depotId, by parcelId (ascending). | Query of GSI Known | eventual (not stated) | pages of 50, a page at a time (volume not declared) | 1.5 / 3 | — |
 | `Parcel.Counts` | The DepotParcels counts for a depotId. | counter DepotParcels (GetItem) | eventual (not stated) | the counts | 0.5 | — |
@@ -136,15 +139,16 @@ Every write the code can make, and everything each changes. Each is atomic: all 
 | `Account.HandOver` | Sets `successorId`, sets `status` = "closed", sets the Account's status to "active" | the Account exists; status = "active"; the Account exists with status = "pending" | Account<br>counter TenantCounts<br>counter RegionCounts<br>Account (sets its status to "active")<br>Account's counter TenantCounts<br>Account's counter RegionCounts | yes | transaction, 6 items | 12 | — |
 | `Depot.Open` | Creates a Depot | no Depot at the key | Depot<br>counter DepotTotals | no | transaction, 2 items | 4 | — |
 | `Depot.Close` | Sets `closed` = true | the Depot exists | Depot | no | single item | 1 | — |
-| `Parcel.Receive` | Creates a Parcel, sets `state` = "received" | no Parcel at the key | Parcel<br>copy OnSite<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts | no | transaction, 4 items | 9 | — |
-| `Parcel.Arrive` | Creates a Parcel, sets `state` = "received", creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels | no Parcel at the key; any Depot there is has closed = false (none is created) | Parcel<br>copy OnSite<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts<br>Depot (creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels)<br>Depot's counter DepotTotals | no | transaction, 6 items | 13 | — |
-| `Parcel.Leave` | Creates a Parcel, sets `state` = "out", creates the Depot if there is none | no Parcel at the key | Parcel<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts<br>Depot (creates the Depot if there is none)<br>Depot's counter DepotTotals | no | transaction, 5 items | 11 | — |
-| `Parcel.Shelve` | Sets `state` = "shelved" | the Parcel exists; state = "received" | Parcel<br>copy OnSite<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes | transaction, 5 items | 10 | — |
-| `Parcel.SendOut` | Sets `state` = "out" | the Parcel exists; state in ["received", "shelved"] | Parcel<br>copy OnSite (removed)<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes | transaction, 5 items | 10 | — |
-| `Parcel.Lose` | Sets `state` = "lost" | the Parcel exists; state != "lost" | Parcel<br>copy OnSite (removed)<br>GSI Known entry (removed)<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes | transaction, 5 items | 11 | — |
-| `Parcel.Annotate` | Sets `note` | the Parcel exists; state != "lost" | Parcel | no | single item | 1 | — |
-| `Damage.File` | Creates a Damage, sets the Parcel's fragile to Damage.fragile (if that has a value), and adds 1 to its damages | no Damage at the key; the Parcel exists with state in ["received", "shelved", "returned"] | Damage<br>counter ParcelDamages<br>Parcel (sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages)<br>Parcel's copy OnSite | no | transaction, 4 items | 8 | — |
-| `Damage.Dispute` | Sets `detail`, sets the Parcel's note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes | the Damage exists; the Parcel exists with state != "lost" | Damage<br>Parcel (sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes) | no (read-free) | transaction, 2 items | 4 | — |
+| `Parcel.Receive` | Creates a Parcel, sets `state` = "received" | no Parcel at the key | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>GSI Known entry<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts | no | transaction, 44 items | 21 / 91 | — |
+| `Parcel.Arrive` | Creates a Parcel, sets `state` = "received", creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels | no Parcel at the key; any Depot there is has closed = false (none is created) | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>GSI Known entry<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts<br>Depot (creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels)<br>Depot's counter DepotTotals | no | transaction, 46 items | 25 / 95 | — |
+| `Parcel.Leave` | Creates a Parcel, sets `state` = "out", creates the Depot if there is none | no Parcel at the key | Parcel<br>copy ByTag (one per tags element)<br>GSI Known entry<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts<br>Depot (creates the Depot if there is none)<br>Depot's counter DepotTotals | no | transaction, 45 items | 23 / 93 | — |
+| `Parcel.Shelve` | Sets `state` = "shelved" | the Parcel exists; state = "received" | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts (moved: two counter items) | yes | transaction, 45 items | 22 / 92 | — |
+| `Parcel.SendOut` | Sets `state` = "out" | the Parcel exists; state in ["received", "shelved"] | Parcel<br>copy OnSite (removed)<br>copy ByTag (one per tags element)<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts (moved: two counter items) | yes | transaction, 45 items | 22 / 92 | — |
+| `Parcel.Lose` | Sets `state` = "lost" | the Parcel exists; state != "lost" | Parcel<br>copy OnSite (removed)<br>copy ByTag (one per tags element)<br>GSI Known entry (removed)<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts (moved: two counter items) | yes | transaction, 45 items | 23 / 93 | — |
+| `Parcel.Annotate` | Sets `note` | the Parcel exists; state != "lost" | Parcel | no | single item | 1 / 2 | — |
+| `Parcel.Retag` | Sets `tags` | the Parcel exists | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes | transaction, 81 items | 10 / 164 | — |
+| `Damage.File` | Creates a Damage, sets the Parcel's fragile to Damage.fragile (if that has a value), and adds 1 to its damages | no Damage at the key; the Parcel exists with state in ["received", "shelved", "returned"] | Damage<br>counter ParcelDamages<br>Parcel (sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages)<br>Parcel's copy OnSite | no | transaction, 4 items | 8 / 10 | — |
+| `Damage.Dispute` | Sets `detail`, sets the Parcel's note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes | the Damage exists; the Parcel exists with state != "lost" | Damage<br>Parcel (sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes) | no (read-free) | transaction, 2 items | 4 / 6 | — |
 
 ## Storage and partitions
 
@@ -162,8 +166,9 @@ A GSI is maintained by DynamoDB a moment after each write: writes stay cheap, an
 
 | Index | Kind | Keys | Projection | Read by | Why this kind | The other kind |
 |---|---|---|---|---|---|---|
-| `Parcel.OnSite` | copy | `D#{depotId}#ONSITE` / `P#{parcelId}`; only when `state in ["received", "shelved", "returned"]` | `state`, `damages` plus key fields | OnSite | chosen: OnSite needs immediate freshness | As a GSI: Parcel.Receive 9 → 8 WRU (4 → 3 items); Parcel.Arrive 13 → 12 WRU (6 → 5 items); Parcel.Shelve 10 → 9 WRU (5 → 4 items); Parcel.SendOut 10 → 9 WRU (5 → 4 items); Parcel.Lose 11 → 10 WRU (5 → 4 items); Damage.File 8 → 7 WRU (4 → 3 items); OnSite would lose immediate freshness. |
-| `Parcel.Known` | GSI `Known` | `KNOWN#{depotId}` / `P#{parcelId}`; only when `state != "lost"` | key fields only | Known | chosen: no read through it needs immediate freshness | As a copy: Parcel.Receive 9 → 10 WRU (4 → 5 items); Parcel.Arrive 13 → 14 WRU (6 → 7 items); Parcel.Leave 11 → 12 WRU (5 → 6 items); Parcel.Lose 11 → 12 WRU (5 → 6 items); reads could see writes immediately. |
+| `Parcel.OnSite` | copy | `D#{depotId}#ONSITE` / `P#{parcelId}`; only when `state in ["received", "shelved", "returned"]` | `state`, `damages` plus key fields | OnSite | chosen: OnSite needs immediate freshness | As a GSI: Parcel.Receive 21 → 20 WRU (44 → 43 items); Parcel.Arrive 25 → 24 WRU (46 → 45 items); Parcel.Shelve 22 → 21 WRU (45 → 44 items); Parcel.SendOut 22 → 21 WRU (45 → 44 items); Parcel.Lose 23 → 22 WRU (45 → 44 items); Damage.File 8 → 7 WRU (4 → 3 items); OnSite would lose immediate freshness. |
+| `Parcel.ByTag` | copy | `D#{depotId}#TAG#{tags\|lower}` / `TAGGED#{parcelId}` | `state` plus key fields | Tagged | chosen: it is keyed by each element of tags, and a GSI holds an item under one key | Can't be a GSI: it is keyed by each element of tags, and a GSI holds an item under one key. |
+| `Parcel.Known` | GSI `Known` | `KNOWN#{depotId}` / `P#{parcelId}`; only when `state != "lost"` | key fields only | Known | chosen: no read through it needs immediate freshness | As a copy: Parcel.Receive 21 → 22 WRU (44 → 45 items); Parcel.Arrive 25 → 26 WRU (46 → 47 items); Parcel.Leave 23 → 24 WRU (45 → 46 items); Parcel.Lose 23 → 24 WRU (45 → 46 items); reads could see writes immediately. |
 
 ### Partition map
 
@@ -182,9 +187,10 @@ flowchart LR
     p2m0["Depot"]
     p2m1["Parcel"]
     p2m2["counter DepotParcels"]
-    p2m3["counter StateCounts"]
-    p2m4["Damage"]
-    p2m5["counter ParcelDamages"]
+    p2m3["counter TagCounts"]
+    p2m4["counter StateCounts"]
+    p2m5["Damage"]
+    p2m6["counter ParcelDamages"]
   end
   subgraph p3["DEPOTS"]
     p3m0["counter DepotTotals"]
@@ -192,8 +198,11 @@ flowchart LR
   subgraph p4["D#35;{depotId}#35;ONSITE"]
     p4m0["Parcel OnSite copy"]
   end
-  subgraph p5["GSI Known: KNOWN#35;{depotId}"]
-    p5m0["Parcel Known entry"]
+  subgraph p5["D#35;{depotId}#35;TAG#35;{tags|lower}"]
+    p5m0["Parcel ByTag copy"]
+  end
+  subgraph p6["GSI Known: KNOWN#35;{depotId}"]
+    p6m0["Parcel Known entry"]
   end
   r_Account_Get{{"Account.Get"}} --> p0
   r_Account_Tenant{{"Account.Tenant"}} --> p0
@@ -205,8 +214,11 @@ flowchart LR
   r_Parcel_Get{{"Parcel.Get"}} --> p2
   r_Parcel_GetSeveral{{"Parcel.GetSeveral"}} --> p2
   r_Parcel_States{{"Parcel.States"}} --> p2
+  r_Parcel_Tagged{{"Parcel.Tagged"}} --> p5
+  r_Parcel_TagCount{{"Parcel.TagCount"}} --> p2
+  r_Parcel_Tags{{"Parcel.Tags"}} --> p2
   r_Parcel_OnSite{{"Parcel.OnSite"}} --> p4
-  r_Parcel_Known{{"Parcel.Known"}} --> p5
+  r_Parcel_Known{{"Parcel.Known"}} --> p6
   r_Parcel_Counts{{"Parcel.Counts"}} --> p2
   r_Damage_Get{{"Damage.Get"}} --> p2
   r_Damage_Damaged{{"Damage.Damaged"}} --> p2
@@ -222,12 +234,13 @@ Each row is every partition key value one key pattern renders: *Keys* is how man
 |---|---|---|---|---|---|---|---|
 | `T#{tenantId}` | base table | unknown | Account: unknown<br>counter TenantCounts: 1 | unknown / unknown | yes: Account never removed | no rates declared | — |
 | `R#{region}` | base table | unknown | counter RegionCounts: 1 | 136 B / 136 B | no | no rates declared | — |
-| `D#{depotId}` | base table | unknown | Depot: 1<br>Parcel: unknown<br>counter DepotParcels: 1<br>counter StateCounts: unknown<br>Damage: unknown<br>counter ParcelDamages: unknown | unknown / unknown | yes: Parcel, Damage never removed | no rates declared | — |
+| `D#{depotId}` | base table | unknown | Depot: 1<br>Parcel: unknown<br>counter DepotParcels: 1<br>counter TagCounts: unknown<br>counter StateCounts: unknown<br>Damage: unknown<br>counter ParcelDamages: unknown | unknown / unknown | yes: Parcel, Damage never removed | no rates declared | — |
 | `DEPOTS` | base table | unknown | counter DepotTotals: 1 | 119 B / 119 B | no | no rates declared | — |
 | `D#{depotId}#ONSITE` | base table | unknown | Parcel OnSite copy: unknown | unknown / unknown | no | no rates declared | — |
+| `D#{depotId}#TAG#{tags\|lower}` | base table | unknown | Parcel ByTag copy: unknown | unknown / unknown | yes: Parcel never removed | no rates declared | — |
 | `KNOWN#{depotId}` | GSI Known | unknown | Parcel Known entry: unknown | unknown / unknown | no | no rates declared | — |
 
-Unknown counts: nothing declares how many items share a value of `tenantId` in `T#{tenantId}`, `region` in `R#{region}`. For a field that identifies another entity, name it (`ref:`, or a matching field name) and give the spread (`volume.by`).
+Unknown counts: nothing declares how many items share a value of `tenantId` in `T#{tenantId}`, `region` in `R#{region}`, `tags` in `D#{depotId}#TAG#{tags\|lower}`. For a field that identifies another entity, name it (`ref:`, or a matching field name) and give the spread (`volume.by`).
 
 ## Risks and costs
 
@@ -241,7 +254,7 @@ Unknown counts: nothing declares how many items share a value of `tenantId` in `
 |---|---|---|---|---|---|
 | Account | not declared | 277 B / 543 B | 0.00 GB | $0.00 | $0.00 |
 | Depot | not declared | 198 B / 335 B | 0.00 GB | $0.00 | $0.00 |
-| Parcel | not declared | 372 B / 732 B | 0.00 GB | $0.00 | $0.00 |
+| Parcel | not declared | 436 B / 1.1 KB | 0.00 GB | $0.00 | $0.00 |
 | Damage | not declared | 286 B / 596 B | 0.00 GB | $0.00 | $0.00 |
 
 Estimated total: **$0.00/month** for the declared volumes and rates.
@@ -395,8 +408,8 @@ Every item that exists because of a Depot, and what keeps it up to date.
 |---|---|---|---|---|---|
 | `Get` | item by key | `PK = D#{depotId}`, `SK = DEPOT` | eventual | GetItem | 0.5 |
 | `Totals` | counter `DepotTotals` | `PK = DEPOTS`, `SK = TOTALS` | strong | GetItem | 1 |
-| `Everything` | the whole partition, keeping `Depot`, `Parcel`, `Damage`, page 4 (max 100) | `PK = D#{depotId}`, filtered by `_t`, ascending | strong | Query | 1 |
-| `Newest` | the whole partition, keeping `Damage`, `Parcel`, page 50 (max 100) | `PK = D#{depotId}`, filtered by `_t`, descending | eventual | Query | 2.5 / 4.5 |
+| `Everything` | the whole partition, keeping `Depot`, `Parcel`, `Damage`, page 4 (max 100) | `PK = D#{depotId}`, filtered by `_t`, ascending | strong | Query | 1 / 2 |
+| `Newest` | the whole partition, keeping `Damage`, `Parcel`, page 50 (max 100) | `PK = D#{depotId}`, filtered by `_t`, descending | eventual | Query | 2.5 / 7 |
 
 #### Writes
 
@@ -413,34 +426,44 @@ Schema version **1**. Go type `Parcel`, store `Store.Parcels`.
 flowchart LR
   item_Parcel["Parcel item<br/>D#35;{depotId}<br/>PARCEL#35;{parcelId}"]
   ix_OnSite["copy OnSite<br/>D#35;{depotId}#35;ONSITE"]
+  ix_ByTag["copy ByTag<br/>D#35;{depotId}#35;TAG#35;{tags|lower}"]
   ix_Known[("GSI Known<br/>KNOWN#35;{depotId}")]
   item_Parcel -. DynamoDB maintains .-> ix_Known
   counter_DepotParcels["counter DepotParcels<br/>D#35;{depotId} / COUNTS"]
+  counter_TagCounts["counter TagCounts<br/>D#35;{depotId} / TAG#35;{tags}"]
   counter_StateCounts["counter StateCounts<br/>D#35;{depotId} / STATE#35;{state}"]
   w_Receive(["Receive"])
-  w_Receive --> item_Parcel & ix_OnSite & counter_DepotParcels & counter_StateCounts
+  w_Receive --> item_Parcel & ix_OnSite & ix_ByTag & counter_DepotParcels & counter_TagCounts & counter_StateCounts
   w_Arrive(["Arrive"])
-  w_Arrive --> item_Parcel & ix_OnSite & counter_DepotParcels & counter_StateCounts
+  w_Arrive --> item_Parcel & ix_OnSite & ix_ByTag & counter_DepotParcels & counter_TagCounts & counter_StateCounts
   other_Depot["Depot item"]
   w_Arrive -. checks and changes .-> other_Depot
   w_Leave(["Leave"])
-  w_Leave --> item_Parcel & ix_OnSite & counter_DepotParcels & counter_StateCounts
+  w_Leave --> item_Parcel & ix_OnSite & ix_ByTag & counter_DepotParcels & counter_TagCounts & counter_StateCounts
   other_Depot["Depot item"]
   w_Leave -. checks .-> other_Depot
   w_Shelve(["Shelve"])
-  w_Shelve --> item_Parcel & ix_OnSite & counter_DepotParcels & counter_StateCounts
+  w_Shelve --> item_Parcel & ix_OnSite & ix_ByTag & counter_DepotParcels & counter_TagCounts & counter_StateCounts
   w_SendOut(["SendOut"])
-  w_SendOut --> item_Parcel & ix_OnSite & counter_DepotParcels & counter_StateCounts
+  w_SendOut --> item_Parcel & ix_OnSite & ix_ByTag & counter_DepotParcels & counter_TagCounts & counter_StateCounts
   w_Lose(["Lose"])
-  w_Lose --> item_Parcel & ix_OnSite & counter_DepotParcels & counter_StateCounts
+  w_Lose --> item_Parcel & ix_OnSite & ix_ByTag & counter_DepotParcels & counter_TagCounts & counter_StateCounts
   w_Annotate(["Annotate"])
   w_Annotate --> item_Parcel
+  w_Retag(["Retag"])
+  w_Retag --> item_Parcel & ix_ByTag & counter_TagCounts
   r_Get{{"Get"}}
   item_Parcel --> r_Get
   r_GetSeveral{{"GetSeveral"}}
   item_Parcel --> r_GetSeveral
   r_States{{"States"}}
   counter_StateCounts --> r_States
+  r_Tagged{{"Tagged"}}
+  ix_ByTag --> r_Tagged
+  r_TagCount{{"TagCount"}}
+  counter_TagCounts --> r_TagCount
+  r_Tags{{"Tags"}}
+  counter_TagCounts --> r_Tags
   r_OnSite{{"OnSite"}}
   ix_OnSite --> r_OnSite
   r_Known{{"Known"}}
@@ -463,6 +486,7 @@ Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB
 | `damages` | int | `damages` | 8 / 11 B | How many damage reports name the parcel. Listed with the parcels on site. |
 | `disputes` | int | `disputes` | 8 / 11 B |  |
 | `lastDispute` | string | `lastDispute` | 20 / 64 B |  |
+| `tags` | string_set | `tags` | 60 / 400 B | Handling tags. A parcel is listed, and counted, under each of them. |
 
 #### Stored items
 
@@ -470,15 +494,18 @@ Every item that exists because of a Parcel, and what keeps it up to date.
 
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
-| **Parcel** | `D#{depotId}` | `PARCEL#{parcelId}` | `D#{depotId}`<br>`PARCEL#{parcelId}` | 372 B / 732 B | the writes below |
+| **Parcel** | `D#{depotId}` | `PARCEL#{parcelId}` | `D#{depotId}`<br>`PARCEL#{parcelId}` | 436 B / 1.1 KB | the writes below |
 | Copy `OnSite` | `D#{depotId}#ONSITE` | `P#{parcelId}` | `D#{depotId}#ONSITE`<br>`P#{parcelId}` | 226 B / 405 B | the writes below, in the same transaction as the item. Only when `state in ["received", "shelved", "returned"]`. |
+| Copy `ByTag` | `D#{depotId}#TAG#{tags|lower}` | `TAGGED#{parcelId}` | `D#{depotId}#TAG#{tags}`<br>`TAGGED#{parcelId}` | 298 B / 814 B | the writes below, in the same transaction as the item. |
 | GSI `Known` entry | `KNOWN#{depotId}` | `P#{parcelId}` | `KNOWN#{depotId}`<br>`P#{parcelId}` | 182 B / 446 B | DynamoDB, from the item's `KnownPK`/`KnownSK` attributes (eventually consistent). Sparse: absent when a key field is empty. Only when `state != "lost"`. |
 | Counter `DepotParcels` | `D#{depotId}` | `COUNTS` | `D#{depotId}`<br>`COUNTS` | ~149 B | the writes below, with atomic ADDs in the same transaction. |
+| Counter `TagCounts` | `D#{depotId}` | `TAG#{tags}` | `D#{depotId}`<br>`TAG#{tags}` | ~166 B | the writes below, with atomic ADDs in the same transaction. |
 | Counter `StateCounts` | `D#{depotId}` | `STATE#{state}` | `D#{depotId}`<br>`STATE#{state}` | ~144 B | the writes below, with atomic ADDs in the same transaction. |
 
 #### Indexes
 
 - **OnSite** (copy items written in the same transaction as the entity, readable strongly consistently; chosen because OnSite needs immediate freshness). The parcels physically in the depot. Projection: `state`, `damages` plus key fields.
+- **ByTag** (copy items written in the same transaction as the entity, readable strongly consistently; chosen because it is keyed by each element of tags, and a GSI holds an item under one key). The parcels with a tag. Keyed by each element of the set, so a parcel has a copy per tag. Projection: `state` plus key fields.
 - **Known** (global secondary index, maintained by DynamoDB, eventually consistent; chosen because no read through it needs immediate freshness). Every parcel that isn't lost. Projection: key fields only.
 
 #### Counters
@@ -486,6 +513,9 @@ Every item that exists because of a Parcel, and what keeps it up to date.
 - **DepotParcels**, keyed by `depotId`. 
   - `onSite`: count of items where `state in ["received", "shelved", "returned"]`.
   - `known`: count of items where `state != "lost"`.
+- **TagCounts**, keyed by `depotId`, `tags`. One counter item for each tag on a depot's parcels.
+  - `parcels`: count of items.
+  - `onSite`: count of items where `state in ["received", "shelved", "returned"]`.
 - **StateCounts**, keyed by `depotId`, `state`. One counter item for each state a depot's parcels are in, read together.
   - `parcels`: count of items.
 
@@ -496,6 +526,9 @@ Every item that exists because of a Parcel, and what keeps it up to date.
 | `Get` | item by key | `PK = D#{depotId}`, `SK = PARCEL#{parcelId}` | eventual | GetItem | 0.5 |
 | `GetSeveral` | items by key, 10 a call typically | `PK = D#{depotId}`, `SK = PARCEL#{parcelId}` | strong | BatchGetItem (10 keys) | 10 |
 | `States` | every item of counter `StateCounts` in a partition, page 50 (max 100) | `PK = D#{depotId}`, `begins_with(SK, "STATE#")` | strong | Query | 2 / 3 |
+| `Tagged` | copies `ByTag`, page 50 (max 100) | `PK = D#{depotId}#TAG#{tags\|lower}`, `begins_with(SK, "TAGGED#")`, ascending | strong | Query | 4 / 10 |
+| `TagCount` | counter `TagCounts` | `PK = D#{depotId}`, `SK = TAG#{tags}` | strong | GetItem | 1 |
+| `Tags` | every item of counter `TagCounts` in a partition, page 50 (max 100) | `PK = D#{depotId}`, `begins_with(SK, "TAG#")` | strong | Query | 3 |
 | `OnSite` | copies `OnSite`, page 50 (max 100) | `PK = D#{depotId}#ONSITE`, `begins_with(SK, "P#")`, ascending | strong | Query | 3 / 5 |
 | `Known` | GSI `Known`, page 50 (max 100) | `KnownPK = KNOWN#{depotId}`, `begins_with(KnownSK, "P#")`, ascending | eventual (GSI) | Query | 1.5 / 3 |
 | `Counts` | counter `DepotParcels` | `PK = D#{depotId}`, `SK = COUNTS` | eventual | GetItem | 0.5 |
@@ -504,13 +537,14 @@ Every item that exists because of a Parcel, and what keeps it up to date.
 
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
-| `Receive` | create (fails if it exists), set `state` = "received" | Parcel<br>copy OnSite<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts | no | transaction (4 items) | — | 9 | `ErrParcelExists` |
-| `Arrive` | create (fails if it exists), set `state` = "received"; requires any Depot there is to have closed = false and creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels | Parcel<br>copy OnSite<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts<br>Depot (creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels)<br>Depot's counter DepotTotals | no | transaction (6 items) | — | 13 | `ErrParcelExists`<br>`ErrParcelArriveRequiresDepot` |
-| `Leave` | create (fails if it exists), set `state` = "out"; creates the Depot if there is none | Parcel<br>GSI Known entry<br>counter DepotParcels<br>counter StateCounts<br>Depot (creates the Depot if there is none)<br>Depot's counter DepotTotals | no | transaction (5 items) | — | 11 | `ErrParcelExists` |
-| `Shelve` | set `state` = "shelved" when `state = "received"` | Parcel<br>copy OnSite<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes (1 consistent read; none with `dynago.From`) | transaction (5 items) | optional | 10 | `ErrParcelNotFound`<br>`ErrParcelShelvePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
-| `SendOut` | set `state` = "out" when `state in ["received", "shelved"]` | Parcel<br>copy OnSite (removed)<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes (1 consistent read; none with `dynago.From`) | transaction (5 items) | optional | 10 | `ErrParcelNotFound`<br>`ErrParcelSendOutPrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
-| `Lose` | set `state` = "lost" when `state != "lost"` | Parcel<br>copy OnSite (removed)<br>GSI Known entry (removed)<br>counter DepotParcels<br>counter StateCounts (moved: two counter items) | yes (1 consistent read; none with `dynago.From`) | transaction (5 items) | optional | 11 | `ErrParcelNotFound`<br>`ErrParcelLosePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
-| `Annotate` | set `note` when `state != "lost"` | Parcel | no | single item | optional | 1 | `ErrParcelNotFound`<br>`ErrParcelAnnotatePrecondition`<br>`dynago.ErrVersionMismatch` (with a version) |
+| `Receive` | create (fails if it exists), set `state` = "received" | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>GSI Known entry<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts | no | transaction (44 items) | — | 21 / 91 | `ErrParcelExists` |
+| `Arrive` | create (fails if it exists), set `state` = "received"; requires any Depot there is to have closed = false and creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>GSI Known entry<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts<br>Depot (creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels)<br>Depot's counter DepotTotals | no | transaction (46 items) | — | 25 / 95 | `ErrParcelExists`<br>`ErrParcelArriveRequiresDepot` |
+| `Leave` | create (fails if it exists), set `state` = "out"; creates the Depot if there is none | Parcel<br>copy ByTag (one per tags element)<br>GSI Known entry<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts<br>Depot (creates the Depot if there is none)<br>Depot's counter DepotTotals | no | transaction (45 items) | — | 23 / 93 | `ErrParcelExists` |
+| `Shelve` | set `state` = "shelved" when `state = "received"` | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts (moved: two counter items) | yes (1 consistent read; none with `dynago.From`) | transaction (45 items) | optional | 22 / 92 | `ErrParcelNotFound`<br>`ErrParcelShelvePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `SendOut` | set `state` = "out" when `state in ["received", "shelved"]` | Parcel<br>copy OnSite (removed)<br>copy ByTag (one per tags element)<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts (moved: two counter items) | yes (1 consistent read; none with `dynago.From`) | transaction (45 items) | optional | 22 / 92 | `ErrParcelNotFound`<br>`ErrParcelSendOutPrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `Lose` | set `state` = "lost" when `state != "lost"` | Parcel<br>copy OnSite (removed)<br>copy ByTag (one per tags element)<br>GSI Known entry (removed)<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts (moved: two counter items) | yes (1 consistent read; none with `dynago.From`) | transaction (45 items) | optional | 23 / 93 | `ErrParcelNotFound`<br>`ErrParcelLosePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `Annotate` | set `note` when `state != "lost"` | Parcel | no | single item | optional | 1 / 2 | `ErrParcelNotFound`<br>`ErrParcelAnnotatePrecondition`<br>`dynago.ErrVersionMismatch` (with a version) |
+| `Retag` | set `tags` | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes (1 consistent read; none with `dynago.From`) | transaction (81 items) | optional | 10 / 164 | `ErrParcelNotFound`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 
 ### Damage
 
@@ -571,8 +605,8 @@ Every item that exists because of a Damage, and what keeps it up to date.
 
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
-| `File` | create (fails if it exists); requires the Parcel to exist with state in ["received", "shelved", "returned"] and sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages | Damage<br>counter ParcelDamages<br>Parcel (sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages)<br>Parcel's copy OnSite | no | transaction (4 items) | — | 8 | `ErrDamageExists`<br>`ErrDamageFileRequiresParcel` |
-| `Dispute` | set `detail`; requires the Parcel to exist with state != "lost" and sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes | Damage<br>Parcel (sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes) | no: read-free (reads only if the item is not in the assumed state) | transaction (2 items) | optional | 4 | `ErrDamageNotFound`<br>`ErrDamageDisputeRequiresParcel`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `File` | create (fails if it exists); requires the Parcel to exist with state in ["received", "shelved", "returned"] and sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages | Damage<br>counter ParcelDamages<br>Parcel (sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages)<br>Parcel's copy OnSite | no | transaction (4 items) | — | 8 / 10 | `ErrDamageExists`<br>`ErrDamageFileRequiresParcel` |
+| `Dispute` | set `detail`; requires the Parcel to exist with state != "lost" and sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes | Damage<br>Parcel (sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes) | no: read-free (reads only if the item is not in the assumed state) | transaction (2 items) | optional | 4 / 6 | `ErrDamageNotFound`<br>`ErrDamageDisputeRequiresParcel`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 
 ## How to read this
 

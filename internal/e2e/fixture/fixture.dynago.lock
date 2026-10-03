@@ -211,7 +211,7 @@
         {
           "version": 1,
           "generation": 1,
-          "fingerprint": "c31d8207e05c0886",
+          "fingerprint": "846dbbf39529d2dd",
           "shape": {
             "fields": [
               {
@@ -260,6 +260,11 @@
                 "name": "lastDispute",
                 "attr": "lastDispute",
                 "type": "string"
+              },
+              {
+                "name": "tags",
+                "attr": "tags",
+                "type": "string_set"
               }
             ],
             "pk": "D#{depotId}",
@@ -277,6 +282,16 @@
                 ],
                 "where": [
                   "state in [received shelved returned]"
+                ]
+              },
+              {
+                "name": "ByTag",
+                "strategy": "copy",
+                "pk": "D#{depotId}#TAG#{tags|lower}",
+                "sk": "TAGGED#{parcelId}",
+                "projection": "include",
+                "project": [
+                  "state"
                 ]
               },
               {
@@ -307,6 +322,23 @@
                     "name": "known",
                     "where": [
                       "state!=lost"
+                    ]
+                  }
+                ]
+              },
+              {
+                "name": "TagCounts",
+                "pk": "D#{depotId}",
+                "sk": "TAG#{tags}",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "parcels"
+                  },
+                  {
+                    "name": "onSite",
+                    "where": [
+                      "state in [received shelved returned]"
                     ]
                   }
                 ]

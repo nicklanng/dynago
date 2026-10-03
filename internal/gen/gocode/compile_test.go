@@ -37,6 +37,12 @@ var awkward = []struct {
 	{"batch get of an expiring entity, and counters read together", "      until: time\n      mood: { type: enum, values: [calm, cross] }\n    ttl: until\n" +
 		"    counters:\n      Moods: { pk: \"M#{tenantId}\", sk: \"MOOD#{mood}#N#{name}#END\", values: { key: count, things: count } }\n" +
 		"    access:\n      Several: { get: key, batch: 25 }\n      Moods: { counter: Moods, all: true, page: 10 }\n      Mood: { counter: Moods }\n", ""},
+	{"index and counters keyed by a set's elements", "      labels: { type: string_set, size: 40/100 }\n      open: bool\n" +
+		"    indexes:\n      ByLabel: { pk: \"L#{tenantId}#{labels|lower}\", sk: \"AT#{at}#{thingId}\", project: [name], where: { open: true } }\n" +
+		"      InOrder: { pk: \"O#{tenantId}\", sk: \"O#{labels}#T#{thingId}\", project: all }\n" +
+		"    counters:\n      Labels: { pk: \"C#{tenantId}\", sk: \"LABEL#{labels}\", values: { key: count, open: { count: true, where: { open: true }, limit: 5 } } }\n" +
+		"      Spread: { pk: \"S#{labels}#T#{tenantId}\", sk: \"SPREAD\", shards: 3, values: { things: count } }\n" +
+		"    access:\n      Labelled: { query: ByLabel, range: at }\n      InOrder: { query: InOrder }\n      Label: { counter: Labels }\n      Labels: { counter: Labels, all: true }\n      Spread: { counter: Spread }\n", ""},
 	{"range query key field named from", "      from: string\n    indexes:\n      ByFrom: { pk: \"F#{from}\", sk: \"AT#{at}\", project: keys }\n    access:\n      L: { query: ByFrom, range: at }\n", "collides with the range bound"},
 }
 

@@ -93,6 +93,11 @@ func (a *analyzer) alternatives() {
 
 func (a *analyzer) alternative(e *schema.Entity, ix *schema.Index) *Alternative {
 	alt := &Alternative{Index: ix, Strategy: schema.StrategyCopy, Feasible: true}
+	if ix.Set != nil {
+		alt.Strategy = schema.StrategyGSI
+		alt.Feasible, alt.Why = false, fmt.Sprintf("it is keyed by each element of %s, and a GSI holds an item under one key", ix.Set.Name)
+		return alt
+	}
 	if ix.Strategy == schema.StrategyCopy {
 		alt.Strategy = schema.StrategyGSI
 		for _, ac := range e.Access {

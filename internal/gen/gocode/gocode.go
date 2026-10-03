@@ -467,7 +467,11 @@ func (g *gen) counters(e *schema.Entity) {
 		g.p("// %sKey identifies %s %s counter.", c.GoName, article(c.GoName), c.GoName)
 		g.p("type %sKey struct {", c.GoName)
 		for _, f := range c.KeyFields() {
-			g.p("%s %s", f.GoName, goType(e, f))
+			name, typ := keyMember(e, f)
+			if f == c.Set {
+				g.p("// %s is one element of %s: each has its own counter item.", name, f.Name)
+			}
+			g.p("%s %s", name, typ)
 		}
 		g.p("}")
 		g.p("")
@@ -533,11 +537,23 @@ func (g *gen) derived(e *schema.Entity) {
 		}
 		g.p("// counter %s", c.Name)
 		g.p("if %s {", orTrue(conds))
-		pk := tmplExpr(e, c.PK, "e")
+		vals := elemVals(c.KeyFields(), c.Set, "e", "elem")
+		if c.Set != nil {
+			// One counter item per element. Elements that render the same key count once.
+			g.p("counted := map[dynago.Key]bool{}")
+			g.p("for _, elem := range e.%s {", c.Set.GoName)
+		}
+		pk := tmplExprVals(e, c.PK, vals)
 		if c.Shards > 1 {
 			pk = fmt.Sprintf("dynago.ShardPK(%s, owner, %d)", pk, c.Shards)
 		}
-		g.p("k := dynago.Key{PK: %s, SK: %s}", pk, tmplExpr(e, c.SK, "e"))
+		g.p("k := dynago.Key{PK: %s, SK: %s}", pk, tmplExprVals(e, c.SK, vals))
+		if c.Set != nil {
+			g.p("if elem == \"\" || counted[k] {")
+			g.p("continue")
+			g.p("}")
+			g.p("counted[k] = true")
+		}
 		for _, v := range c.Values {
 			amount := "1"
 			if v.Sum != nil {
@@ -566,6 +582,9 @@ func (g *gen) derived(e *schema.Entity) {
 			} else {
 				g.p("%s", stmt)
 			}
+		}
+		if c.Set != nil {
+			g.p("}")
 		}
 		g.p("}")
 	}
@@ -602,7 +621,19 @@ func (g *gen) derived(e *schema.Entity) {
 		}
 		g.p("// copy index %s", ix.Name)
 		g.p("if %s {", orTrue(conds))
-		g.p("k := dynago.Key{PK: %s, SK: %s}", tmplExpr(e, ix.PK, "e"), tmplExpr(e, ix.SK, "e"))
+		vals := elemVals(templateFields(ix.PK, ix.SK, true), ix.Set, "e", "elem")
+		if ix.Set != nil {
+			// One copy per element. Elements that render the same key share one copy.
+			g.p("copied := map[dynago.Key]bool{}")
+			g.p("for _, elem := range e.%s {", ix.Set.GoName)
+		}
+		g.p("k := dynago.Key{PK: %s, SK: %s}", tmplExprVals(e, ix.PK, vals), tmplExprVals(e, ix.SK, vals))
+		if ix.Set != nil {
+			g.p("if elem == \"\" || copied[k] {")
+			g.p("continue")
+			g.p("}")
+			g.p("copied[k] = true")
+		}
 		var inner string
 		if ix.ReturnsEntity() {
 			inner = fmt.Sprintf("%s: *e", e.GoName)
@@ -615,6 +646,9 @@ func (g *gen) derived(e *schema.Entity) {
 		}
 		g.p("d = append(d, dynago.Derived{Kind: dynago.KindCopy, Key: k, Type: %q, Item: &%s%sCopy{%s, PK: k.PK, SK: k.SK, T: %q, V: %sVersion}, Created: dynago.FmtStamp(e.stamps.Created)})",
 			e.Name+"."+ix.Name, lo, ix.GoName, inner, e.Name+"."+ix.Name, lo)
+		if ix.Set != nil {
+			g.p("}")
+		}
 		g.p("}")
 	}
 	g.p("return d")
@@ -738,16 +772,16 @@ func (g *gen) counterAll(a *schema.Access) {
 	g.p("// %s selects the partition for %s.%s.", qt, a.Entity.Name, a.Name)
 	g.p("type %s struct {", qt)
 	for _, f := range c.PK.Fields {
-		g.p("%s %s", f.GoName, goType(e, f))
+		name, typ := keyMember(e, f)
+		g.p("%s %s", name, typ)
 	}
 	g.p("}")
 	g.p("")
 	g.docComment(a.GoName, a.Doc, fmt.Sprintf("returns one page of the %s counters of a partition, one for each %s something has counted, in key order, with exactly one %s Query (default %d, max %d items). It returns the cursor for the next page, or \"\" at the end.",
 		c.Name, fieldList(c.ItemFields()), consistency(a.Consistent), a.Page, a.MaxPage))
 	g.p("func (s *%sStore) %s(ctx context.Context, q %s, page dynago.Page) ([]%sEntry, string, error) {", a.Entity.GoName, a.GoName, qt, c.GoName)
-	g.presenceGuard(c.PK.Fields, "q", fmt.Sprintf("return nil, \"\", fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", a.Name, fieldList(c.PK.Fields)))
-	g.keyPartChecks(c.PK.Fields, func(f *schema.Field) string { return "q." + f.GoName }, "return nil, \"\", err")
-	g.p("pk := %s", tmplExpr(e, c.PK, "q"))
+	g.keyGuards(e, c.PK.Fields, "q", fmt.Sprintf("return nil, \"\", fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", a.Name, fieldList(c.PK.Fields)), "return nil, \"\", err")
+	g.p("pk := %s", tmplExprVals(e, c.PK, keyVals(e, c.PK.Fields, "q")))
 	sum := sha256.Sum256([]byte(strings.Join([]string{c.Name, c.PK.Raw, c.SK.Raw}, "\x00")))
 	spec := []string{
 		fmt.Sprintf("Scope: %q + pk", fmt.Sprintf("%s.%s#%s\x00", a.Entity.Name, a.Name, hex.EncodeToString(sum[:4]))),
@@ -783,14 +817,16 @@ func (g *gen) counterAll(a *schema.Access) {
 	literals = append(literals, strconv.Quote(lit))
 	var kv []string
 	for _, f := range c.PK.Fields {
-		kv = append(kv, fmt.Sprintf("%s: q.%s", f.GoName, f.GoName))
+		name, _ := keyMember(e, f)
+		kv = append(kv, fmt.Sprintf("%s: q.%s", name, name))
 	}
 	for _, f := range c.ItemFields() {
 		v := fmt.Sprintf("parts[%d]", slices.Index(placeholders, f.Name))
 		if f.Type == schema.TypeEnum {
 			v = goType(e, f) + "(" + v + ")"
 		}
-		kv = append(kv, fmt.Sprintf("%s: %s", f.GoName, v))
+		name, _ := keyMember(e, f)
+		kv = append(kv, fmt.Sprintf("%s: %s", name, v))
 	}
 	g.p("out := make([]%sEntry, 0, len(rows))", c.GoName)
 	g.p("for _, row := range rows {")
@@ -1049,7 +1085,11 @@ func (g *gen) query(a *schema.Access) {
 	g.p("// %s selects the partition for %s.%s.", qt, e.Name, a.Name)
 	g.p("type %s struct {", qt)
 	for _, f := range pk.Fields {
-		g.p("%s %s", f.GoName, goType(e, f))
+		name, typ := keyMember(e, f)
+		if f.Type == schema.TypeStringSet {
+			g.p("// %s is one element of %s: the %s that have it are in its partition.", name, f.Name, schema.Plural(e.Name))
+		}
+		g.p("%s %s", name, typ)
 	}
 	if a.Range != nil {
 		g.p("// From and To bound %s inclusively; nil leaves that end open.", a.Range.Name)
@@ -1064,9 +1104,8 @@ func (g *gen) query(a *schema.Access) {
 	g.docComment(a.GoName, a.Doc, fmt.Sprintf("returns one page of %s items from %s, %s by %q, with exactly one %s Query (default %d, max %d items). It returns the cursor for the next page, or \"\" at the end.",
 		e.Name, where, order, sk.Raw, consistency(a.Consistent), a.Page, a.MaxPage))
 	g.p("func (s *%sStore) %s(ctx context.Context, q %s, page dynago.Page) ([]%s, string, error) {", e.GoName, a.GoName, qt, result)
-	g.presenceGuard(pk.Fields, "q", fmt.Sprintf("return nil, \"\", fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", a.Name, fieldList(pk.Fields)))
-	g.keyPartChecks(pk.Fields, func(f *schema.Field) string { return "q." + f.GoName }, "return nil, \"\", err")
-	g.p("pk := %s", tmplExpr(e, pk, "q"))
+	g.keyGuards(e, pk.Fields, "q", fmt.Sprintf("return nil, \"\", fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", a.Name, fieldList(pk.Fields)), "return nil, \"\", err")
+	g.p("pk := %s", tmplExprVals(e, pk, keyVals(e, pk.Fields, "q")))
 	spec := []string{
 		// The scope ties a cursor to this query's shape and its partition, not to the schema
 		// version: a version that doesn't change the query keeps cursors working through a deploy.
@@ -1159,19 +1198,19 @@ func (g *gen) counterRead(a *schema.Access) {
 	g.docComment(a.GoName, a.Doc, fmt.Sprintf("reads the %s counter (%s). A counter nothing has touched reads as zero.",
 		c.Name, readCost(c, a.Consistent)))
 	g.p("func (s *%sStore) %s(ctx context.Context, k %sKey) (%s, error) {", a.Entity.GoName, a.GoName, c.GoName, c.GoName)
-	g.presenceGuard(c.KeyFields(), "k", fmt.Sprintf("return %s{}, fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", c.GoName, c.Name, fieldList(c.KeyFields())))
-	g.keyPartChecks(c.KeyFields(), func(f *schema.Field) string { return "k." + f.GoName }, fmt.Sprintf("return %s{}, err", c.GoName))
+	g.keyGuards(e, c.KeyFields(), "k", fmt.Sprintf("return %s{}, fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", c.GoName, c.Name, fieldList(c.KeyFields())), fmt.Sprintf("return %s{}, err", c.GoName))
+	vals := keyVals(e, c.KeyFields(), "k")
 	if c.Shards <= 1 {
 		g.p("var out %s", c.GoName)
-		g.p("_, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: %s, SK: %s}, %t, &out)", tmplExpr(e, c.PK, "k"), tmplExpr(e, c.SK, "k"), a.Consistent)
+		g.p("_, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: %s, SK: %s}, %t, &out)", tmplExprVals(e, c.PK, vals), tmplExprVals(e, c.SK, vals), a.Consistent)
 		g.p("return out, err")
 		g.p("}")
 		g.p("")
 		return
 	}
-	g.p("sk := %s", tmplExpr(e, c.SK, "k"))
+	g.p("sk := %s", tmplExprVals(e, c.SK, vals))
 	g.p("var keys []dynago.Key")
-	g.p("for _, pk := range dynago.ShardPKs(%s, %d) {", tmplExpr(e, c.PK, "k"), c.Shards)
+	g.p("for _, pk := range dynago.ShardPKs(%s, %d) {", tmplExprVals(e, c.PK, vals), c.Shards)
 	g.p("keys = append(keys, dynago.Key{PK: pk, SK: sk})")
 	g.p("}")
 	g.p("var parts []%s", c.GoName)
@@ -2624,6 +2663,75 @@ func comment(buf *bytes.Buffer, text string) {
 
 // uniqueVals maps the fields of a unique constraint to value expressions: recv's fields, and elem
 // for the set field.
+// A key struct (a counter's key, a query's partition) holds a set field as one element of it: the
+// key is for one of the items the set renders.
+
+// keyMember returns the name and Go type of a key struct's member for a field.
+func keyMember(e *schema.Entity, f *schema.Field) (name, typ string) {
+	if f.Type == schema.TypeStringSet {
+		return f.GoName + "Elem", "string"
+	}
+	return f.GoName, goType(e, f)
+}
+
+// keyVals maps each field to the Go expression of its member of the key struct recv.
+func keyVals(e *schema.Entity, fields []*schema.Field, recv string) map[string]string {
+	vals := map[string]string{}
+	for _, f := range fields {
+		name, _ := keyMember(e, f)
+		vals[f.Name] = recv + "." + name
+	}
+	return vals
+}
+
+// keyPresence returns a Go condition true when every sparse member of the key struct recv holds
+// a value, or "".
+func keyPresence(e *schema.Entity, fields []*schema.Field, recv string) string {
+	var conds []string
+	for _, f := range fields {
+		name, _ := keyMember(e, f)
+		c := present(f, recv+"."+name)
+		if f.Type == schema.TypeStringSet {
+			c = recv + "." + name + ` != ""`
+		}
+		if c != "" {
+			conds = append(conds, c)
+		}
+	}
+	return strings.Join(conds, " && ")
+}
+
+// keyGuards emits, for the key struct recv, an early return when a sparse member is empty, and
+// the separator checks of its members.
+func (g *gen) keyGuards(e *schema.Entity, fields []*schema.Field, recv, empty, ret string) {
+	if pc := keyPresence(e, fields, recv); pc != "" {
+		g.p("if %s {", negate(pc))
+		g.p("%s", empty)
+		g.p("}")
+	}
+	for _, f := range fields {
+		name, _ := keyMember(e, f)
+		if f.Type == schema.TypeStringSet {
+			g.keyPartCheck(f, recv+"."+name, ret)
+			continue
+		}
+		g.keyPartChecks([]*schema.Field{f}, func(*schema.Field) string { return recv + "." + name }, ret)
+	}
+}
+
+// elemVals maps each field to its Go expression over recv, with the set field (if any) taken
+// from the loop variable elem.
+func elemVals(fields []*schema.Field, set *schema.Field, recv, elem string) map[string]string {
+	vals := map[string]string{}
+	for _, f := range fields {
+		vals[f.Name] = recv + "." + f.GoName
+	}
+	if set != nil {
+		vals[set.Name] = elem
+	}
+	return vals
+}
+
 func uniqueVals(u *schema.Unique, recv, elem string) map[string]string {
 	vals := map[string]string{}
 	for _, f := range u.Fields {

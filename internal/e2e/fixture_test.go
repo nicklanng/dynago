@@ -474,3 +474,94 @@ func TestRequiresEnsureCreatesItsTarget(t *testing.T) {
 		t.Fatalf("after %d parcels arrived at once: %d counted on the depot, %d depots; want %d and 4", each, d.Parcels, depots(), each)
 	}
 }
+
+// An index and a counter keyed by a set field have a copy and a counter item for each element.
+// A parcel is listed under each of its tags and counted in each tag's counter, and a change to
+// the set, or to what the copies hold, is made to all of them in the write's transaction.
+func TestIndexAndCounterPerSetElement(t *testing.T) {
+	t.Parallel()
+	db := testdb.DB(t)
+	st := fixture.New(db, testdb.Table(t, db, fixture.TableSpec))
+	key := func(id string) fixture.ParcelKey { return fixture.ParcelKey{DepotID: "d1", ParcelID: id} }
+	must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d1", ParcelID: "p1", Tags: []string{"fragile", "Heavy"}}))
+	must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d1", ParcelID: "p2", Tags: []string{"fragile"}}))
+	must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d1", ParcelID: "p3"}))
+	must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d2", ParcelID: "p1", Tags: []string{"fragile"}}))
+
+	tagged := func(tag string) string {
+		t.Helper()
+		list, _, err := st.Parcels.Tagged(ctx, fixture.ParcelTaggedQuery{DepotID: "d1", TagsElem: tag}, dynago.Page{})
+		must(t, err)
+		var out []string
+		for _, p := range list {
+			out = append(out, fmt.Sprint(p.ParcelID, ":", p.State))
+		}
+		return fmt.Sprint(out)
+	}
+	counts := func() string {
+		t.Helper()
+		entries, _, err := st.Parcels.Tags(ctx, fixture.ParcelTagsQuery{DepotID: "d1"}, dynago.Page{})
+		must(t, err)
+		var out []string
+		for _, e := range entries {
+			out = append(out, fmt.Sprintf("%s=%d/%d", e.Key.TagsElem, e.Parcels, e.OnSite))
+		}
+		return fmt.Sprint(out)
+	}
+	if got := tagged("fragile"); got != "[p1:received p2:received]" {
+		t.Fatalf("fragile parcels: %s", got)
+	}
+	// The index lowers the tag, so it matches whatever its case; the counter keeps it as written.
+	if got := tagged("HEAVY"); got != "[p1:received]" {
+		t.Fatalf("heavy parcels: %s", got)
+	}
+	if got := counts(); got != "[Heavy=1/1 fragile=2/2]" {
+		t.Fatalf("tag counts: %s", got)
+	}
+	one, err := st.Parcels.TagCount(ctx, fixture.TagCountsKey{DepotID: "d1", TagsElem: "fragile"})
+	must(t, err)
+	if one != (fixture.TagCounts{Parcels: 2, OnSite: 2}) {
+		t.Fatalf("the fragile counter: %+v", one)
+	}
+
+	// Changing the set drops the copies and counts of the elements removed and adds the new ones.
+	must(t, st.Parcels.Retag(ctx, key("p1"), fixture.ParcelRetag{Tags: []string{"fragile", "cold"}}))
+	if a, b, c := tagged("heavy"), tagged("cold"), tagged("fragile"); a != "[]" || b != "[p1:received]" || c != "[p1:received p2:received]" {
+		t.Fatalf("after retagging p1: heavy %s, cold %s, fragile %s", a, b, c)
+	}
+	if got := counts(); got != "[Heavy=0/0 cold=1/1 fragile=2/2]" {
+		t.Fatalf("tag counts after retagging p1: %s", got)
+	}
+
+	// A change to something every copy holds, and that the counters filter on, reaches each tag's.
+	must(t, st.Parcels.SendOut(ctx, key("p1")))
+	if b, c := tagged("cold"), tagged("fragile"); b != "[p1:out]" || c != "[p1:out p2:received]" {
+		t.Fatalf("after sending p1 out: cold %s, fragile %s", b, c)
+	}
+	if got := counts(); got != "[Heavy=0/0 cold=1/0 fragile=2/1]" {
+		t.Fatalf("tag counts after sending p1 out: %s", got)
+	}
+
+	// Elements that render one key share one copy; the counter, keyed without the transform,
+	// counts each. An empty set leaves nothing behind.
+	must(t, st.Parcels.Retag(ctx, key("p3"), fixture.ParcelRetag{Tags: []string{"Cold", "cold"}}))
+	if got := tagged("cold"); got != "[p1:out p3:received]" {
+		t.Fatalf("cold parcels: %s", got)
+	}
+	must(t, st.Parcels.Retag(ctx, key("p3"), fixture.ParcelRetag{}))
+	must(t, st.Parcels.Retag(ctx, key("p1"), fixture.ParcelRetag{}))
+	if a, b := tagged("cold"), tagged("fragile"); a != "[]" || b != "[p2:received]" {
+		t.Fatalf("after clearing tags: cold %s, fragile %s", a, b)
+	}
+	if got := counts(); got != "[Cold=0/0 Heavy=0/0 cold=0/0 fragile=1/1]" {
+		t.Fatalf("tag counts after clearing tags: %s", got)
+	}
+	if _, _, err := st.Parcels.Tagged(ctx, fixture.ParcelTaggedQuery{DepotID: "d1"}, dynago.Page{}); !errors.Is(err, dynago.ErrInvalidKey) {
+		t.Fatalf("a query without a tag: %v", err)
+	}
+	// A tag ends its keys, so it may hold any character, and is read back whole.
+	must(t, st.Parcels.Retag(ctx, key("p2"), fixture.ParcelRetag{Tags: []string{"a#b"}}))
+	if a, got := tagged("a#b"), counts(); a != "[p2:received]" || got != "[Cold=0/0 Heavy=0/0 a#b=1/1 cold=0/0 fragile=0/0]" {
+		t.Fatalf("after tagging p2 a#b: %s, counts %s", a, got)
+	}
+}

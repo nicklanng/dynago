@@ -309,8 +309,12 @@ func analyzeEntity(r *Report, m *schema.Model, e *schema.Entity) *EntityReport {
 		bytes := n * float64(er.Item.P50+IndexOverhead)
 		er.BaseBytes, er.BaseItems = n*float64(er.Item.P50), n
 		for _, ix := range e.Indexes {
-			// A sparse index holds the share of the items its where matches, when declared.
+			// A sparse index holds the share of the items its where matches, when declared; an
+			// index keyed by a set's elements holds a copy for each.
 			in := n * ix.Share()
+			if ix.Set != nil {
+				in *= float64(setElements(ix.Set).P50)
+			}
 			bytes += in * float64(er.Indexes[ix.Name].P50+IndexOverhead)
 			if ix.Strategy == schema.StrategyCopy {
 				er.BaseBytes += in * float64(er.Indexes[ix.Name].P50)
@@ -524,6 +528,25 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 			}
 			return 1
 		}
+		if ix.Set != nil {
+			// One copy for each element of the set. A change to the set adds and drops copies:
+			// typically one of each, at worst all of them. A change to anything else the copies
+			// hold, or to their keys, rewrites every one.
+			n := setElements(ix.Set)
+			each := fmt.Sprintf("%s (one per %s element)", entry, ix.Set.Name)
+			switch {
+			case before == schema.No && after == schema.No:
+			case all:
+				write(t, false, async, each, size, n.maybe(max(chance(before), chance(after))))
+			case touches(keys) && !touches(minusField(keys, ix.Set)) && !projectedBeyond(ix, changed):
+				write(t, false, async, fmt.Sprintf("%s (added and dropped %s elements)", entry, ix.Set.Name), size, Count{P50: 2, P99: 2 * n.P99, Spread: true}.maybe(chance(before)))
+			case touches(keys):
+				write(t, false, async, each+moved, size, Count{P50: 2 * n.P50, P99: 2 * n.P99, Spread: true}.maybe((chance(before)+chance(after))/2))
+			case touches(predFields(ix.Where)) || projected:
+				write(t, false, async, each, size, n.maybe(max(chance(before), chance(after))))
+			}
+			continue
+		}
 		switch {
 		case before == schema.No && after == schema.No:
 			// Never in the index: nothing to write.
@@ -561,6 +584,22 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 			}
 		}
 		size := CounterSize(c)
+		if c.Set != nil {
+			// One counter item for each element of the set.
+			n := setElements(c.Set)
+			each := fmt.Sprintf("%scounter %s (one item per %s element)", owner, c.Name, c.Set.Name)
+			switch {
+			case all:
+				write(t, false, false, each, size, n)
+			case changed[c.Set] && !touches(minusField(c.KeyFields(), c.Set)):
+				write(t, false, false, fmt.Sprintf("%scounter %s (added and dropped %s elements)", owner, c.Name, c.Set.Name), size, Count{P50: 2, P99: 2 * n.P99, Spread: true})
+			case touches(c.KeyFields()):
+				write(t, false, false, each+" (moved: two counter items each)", size, Count{P50: 2 * n.P50, P99: 2 * n.P99, Spread: true})
+			case touches(in...):
+				write(t, false, false, each, size, n)
+			}
+			continue
+		}
 		switch {
 		case all:
 			write(t, false, false, owner+"counter "+c.Name, size, once)
@@ -597,6 +636,28 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 			write(t, false, false, owner+"claim "+u.Name+" (moved: put + delete)", claimSize, apart)
 		}
 	}
+}
+
+// minusField returns fields without f.
+func minusField(fields []*schema.Field, f *schema.Field) []*schema.Field {
+	var out []*schema.Field
+	for _, x := range fields {
+		if x != f {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// projectedBeyond reports whether a write changes a field the index's copies hold, other than
+// the set that keys them.
+func projectedBeyond(ix *schema.Index, changed map[*schema.Field]bool) bool {
+	for _, f := range ix.ProjectedFields() {
+		if f != ix.Set && changed[f] {
+			return true
+		}
+	}
+	return false
 }
 
 // ClaimSize is the size of one uniqueness claim item: its keys, type, owner's key and timestamps.
@@ -670,6 +731,9 @@ func templateSize(t schema.Template) Size {
 		}
 		f := fields[seg.Field]
 		switch f.Type {
+		case schema.TypeStringSet:
+			// One element of the set: the key is rendered once for each.
+			s = s.add(Size{setElementBytes, setElementBytes})
 		case schema.TypeTime:
 			s = s.add(Size{30, 30})
 		case schema.TypeInt:

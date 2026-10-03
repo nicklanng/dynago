@@ -29,6 +29,11 @@ format, the generated code and the runtime API; the changelog says how to move.
   `AllCounts: { counter: LabelCounts, all: true }` returns every item of a counter in one
   partition (each label's counts for a user) with one Query, a page at a time, each with the key
   its sort key holds. The runtime gained `dynago.GetBatch` and `dynago.SplitKey` for them.
+- Indexes and counters keyed by each element of a `string_set`, as unique constraints already
+  were: `pk: "USER#{userId}#LABEL#{labelIds}"` gives a thread a copy in each of its labels' lists,
+  and `sk: "COUNTS#LABEL#{labelIds}"` a count in each label's counter item, all maintained in the
+  write's transaction. Such an index is a copy. Queries and counter keys take one element
+  (`LabelIDsElem`).
 - A requirement can create its item: `ensure: { subject: "{subject}" }` on a `requires` entry
   creates the target when it is absent, in the write's transaction, with those fields and the
   entry's `set`, `add` and `patch` applied, and with the counters, claims and copies a create of

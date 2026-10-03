@@ -90,6 +90,7 @@ entities:
       damages: { type: int, doc: How many damage reports name the parcel. Listed with the parcels on site. }
       disputes: int
       lastDispute: string
+      tags: { type: string_set, doc: "Handling tags. A parcel is listed, and counted, under each of them." }
     key:
       pk: "D#{depotId}"
       sk: "PARCEL#{parcelId}"
@@ -100,6 +101,11 @@ entities:
         sk: "P#{parcelId}"
         where: { state: { in: [received, shelved, returned] } }
         project: [state, damages]
+      ByTag:
+        doc: The parcels with a tag. Keyed by each element of the set, so a parcel has a copy per tag.
+        pk: "D#{depotId}#TAG#{tags|lower}"
+        sk: "TAGGED#{parcelId}"
+        project: [state]
       Known:
         doc: Every parcel that isn't lost.
         pk: "KNOWN#{depotId}"
@@ -113,6 +119,13 @@ entities:
         values:
           onSite: { count: true, where: { state: { in: [received, shelved, returned] } } }
           known: { count: true, where: { state: { not: lost } } }
+      TagCounts:
+        doc: One counter item for each tag on a depot's parcels.
+        pk: "D#{depotId}"
+        sk: "TAG#{tags}"
+        values:
+          parcels: count
+          onSite: { count: true, where: { state: { in: [received, shelved, returned] } } }
       StateCounts:
         doc: One counter item for each state a depot's parcels are in, read together.
         pk: "D#{depotId}"
@@ -123,6 +136,9 @@ entities:
       Get: get
       GetSeveral: { get: key, batch: 10, freshness: immediate }
       States: { counter: StateCounts, all: true, freshness: immediate }
+      Tagged: { query: ByTag }
+      TagCount: { counter: TagCounts, freshness: immediate }
+      Tags: { counter: TagCounts, all: true, freshness: immediate }
       OnSite: { query: OnSite, freshness: immediate }
       Known: { query: Known }
       Counts: { counter: DepotParcels }
@@ -146,6 +162,7 @@ entities:
       SendOut: { set: { state: out }, when: { state: { in: [received, shelved] } } }
       Lose: { set: { state: lost }, when: { state: { not: lost } } }
       Annotate: { update: [note], when: { state: { not: lost } } }
+      Retag: { update: [tags] }
 
   # A damage report can only be filed against a parcel that is still on site. Filing one counts on
   # the parcel (add) and marks it fragile if the report says so (patch), leaving the mark alone

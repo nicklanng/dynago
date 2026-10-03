@@ -461,6 +461,24 @@ func (r *resolver) template(e *Entity, where, raw string, required bool, multi .
 	return t, ok
 }
 
+// setFields returns the string_set fields of e that the key templates name, in order. Templates
+// that don't parse name none: their own resolution reports why.
+func setFields(e *Entity, templates ...string) []*Field {
+	var out []*Field
+	for _, raw := range templates {
+		kt, err := keytmpl.Parse(raw)
+		if err != nil {
+			continue
+		}
+		for _, name := range kt.Fields() {
+			if f := e.Field(name); f != nil && f.Type == TypeStringSet && !slices.Contains(out, f) {
+				out = append(out, f)
+			}
+		}
+	}
+	return out
+}
+
 func (r *resolver) preds(e *Entity, where string, raw Ordered[any]) []*Pred {
 	var out []*Pred
 	for _, p := range raw {
@@ -586,12 +604,18 @@ func (r *resolver) index(e *Entity, name string, raw RawIndex, fresh []string) *
 		return nil
 	}
 	ix := &Index{Name: name, GoName: name, Entity: e, Doc: raw.Doc}
+	// A key holding a string_set renders one key per element, which only copies can have: a GSI
+	// entry is the item itself, under one key.
+	sets := setFields(e, raw.PK, raw.SK)
 	strategy := raw.Strategy
 	if strategy == "" {
 		ix.StrategyInferred = true
 		strategy = string(StrategyGSI)
 		ix.StrategyReason = "no read through it needs immediate freshness"
-		if len(fresh) > 0 {
+		if len(sets) > 0 {
+			strategy = string(StrategyCopy)
+			ix.StrategyReason = fmt.Sprintf("it is keyed by each element of %s, and a GSI holds an item under one key", sets[0].Name)
+		} else if len(fresh) > 0 {
 			strategy = string(StrategyCopy)
 			verb := "needs"
 			if len(fresh) > 1 {
@@ -612,12 +636,22 @@ func (r *resolver) index(e *Entity, name string, raw RawIndex, fresh []string) *
 		r.errorf("%s: strategy must be gsi or copy", where)
 		return nil
 	}
+	switch {
+	case len(sets) > 1:
+		r.errorf("%s: %s and %s are both sets; an index can be keyed by the elements of one", where, sets[0].Name, sets[1].Name)
+		return nil
+	case len(sets) == 1 && ix.Strategy == StrategyGSI:
+		r.errorf("%s: its keys hold %s, a string_set: the entity would need an entry for each element, and a GSI holds an item under one key. Make it a copy (strategy: copy, or leave strategy out)", where, sets[0].Name)
+		return nil
+	case len(sets) == 1:
+		ix.Set = sets[0]
+	}
 	var ok bool
-	if ix.PK, ok = r.template(e, where+" pk", raw.PK, true); !ok {
+	if ix.PK, ok = r.template(e, where+" pk", raw.PK, true, sets...); !ok {
 		return nil
 	}
 	if raw.SK != "" {
-		if ix.SK, ok = r.template(e, where+" sk", raw.SK, true); !ok {
+		if ix.SK, ok = r.template(e, where+" sk", raw.SK, true, sets...); !ok {
 			return nil
 		}
 		ix.HasSK = true
@@ -763,11 +797,19 @@ func (r *resolver) counter(e *Entity, name string, raw RawCounter) *Counter {
 	if c.Shards < 1 || c.Shards > 100 {
 		r.errorf("%s: shards must be between 1 and 100", where)
 	}
+	sets := setFields(e, raw.PK, raw.SK)
+	switch {
+	case len(sets) > 1:
+		r.errorf("%s: %s and %s are both sets; a counter can be keyed by the elements of one", where, sets[0].Name, sets[1].Name)
+		return nil
+	case len(sets) == 1:
+		c.Set = sets[0]
+	}
 	var ok bool
-	if c.PK, ok = r.template(e, where+" pk", raw.PK, true); !ok {
+	if c.PK, ok = r.template(e, where+" pk", raw.PK, true, sets...); !ok {
 		return nil
 	}
-	if c.SK, ok = r.template(e, where+" sk", raw.SK, true); !ok {
+	if c.SK, ok = r.template(e, where+" sk", raw.SK, true, sets...); !ok {
 		return nil
 	}
 	if c.SK.LiteralPrefix() == "" {
@@ -944,6 +986,8 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 			switch {
 			case f == nil:
 				r.errorf("%s: range field %s is not a field of %s", where, raw.Range, e.Name)
+			case !f.KeyCapable():
+				r.errorf("%s: range field %s is a %s; a range bounds a single value", where, f.Name, f.Type)
 			case !ok || rangeSegment(sk) != f.Name:
 				r.errorf("%s: range field %s must be the first placeholder of the sort key, directly after its literal prefix", where, f.Name)
 			default:
@@ -1288,7 +1332,7 @@ func (r *resolver) counterAll(e *Entity, a *Access, entries map[*Counter]bool) {
 		case sg.Transform != "":
 			r.errorf("%s: %s's sort key holds {%s|%s}, which can't be read back into %s; a counter read with all needs its sort key fields as they are", where, c.Name, sg.Field, sg.Transform, sg.Field)
 			return
-		case f.Type != TypeString && f.Type != TypeEnum:
+		case f.Type != TypeString && f.Type != TypeEnum && f.Type != TypeStringSet:
 			r.errorf("%s: %s's sort key holds %s, a %s; a counter read with all needs string or enum fields there, to read each item's key back", where, c.Name, f.Name, f.Type)
 			return
 		case i+1 < len(segs) && segs[i+1].IsField():
@@ -1318,6 +1362,10 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 		req.Counter, owner, keyFields = c, c.Entity, c.KeyFields()
 		if c.Shards > 1 {
 			r.errorf("%s: %s is sharded, so no single item holds its values to check", where, target)
+		}
+		if c.Set != nil {
+			r.errorf("%s: %s has an item for each element of %s; requiring one of them isn't supported", where, target, c.Set.Name)
+			return nil
 		}
 		if len(raw.Set)+len(raw.Add)+len(raw.Patch) > 0 || raw.Optional || raw.Consume || raw.Ensure != nil {
 			r.errorf("%s: a counter can only be checked with when (an absent value counts as 0)", where)

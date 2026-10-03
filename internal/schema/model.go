@@ -483,6 +483,9 @@ type Index struct {
 	Projection string
 	Project    []*Field
 	Where      []*Pred
+	// Set, if not nil, is the one string_set field in the index's keys: the entity has a copy for
+	// each of its elements.
+	Set *Field
 	// Matches is the declared share of the entity's items that satisfy Where (0 < share <= 1), or
 	// 0 when the schema doesn't say: the analysis then counts every item, as an upper bound.
 	Matches float64
@@ -661,6 +664,9 @@ type Counter struct {
 	Shards int
 	Values []*CounterValue
 	Doc    string
+	// Set, if not nil, is the one string_set field in the counter's keys: the entity counts
+	// towards one counter item for each of its elements.
+	Set *Field
 }
 
 // KeyFields returns the fields that address the counter item.

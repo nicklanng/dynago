@@ -86,6 +86,9 @@ func (d *doc) otherKind(ix *schema.Index) string {
 		return ""
 	}
 	if !alt.Feasible {
+		if alt.Strategy == schema.StrategyGSI {
+			return "Can't be a GSI: " + alt.Why + "."
+		}
 		return "Can't be a copy: " + alt.Why + "."
 	}
 	var parts []string

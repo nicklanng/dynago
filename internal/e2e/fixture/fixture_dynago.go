@@ -940,6 +940,8 @@ type Parcel struct {
 	Damages     int64  `dynamo:"damages,omitempty"`
 	Disputes    int64  `dynamo:"disputes,omitempty"`
 	LastDispute string `dynamo:"lastDispute,omitempty"`
+	// Handling tags. A parcel is listed, and counted, under each of them.
+	Tags []string `dynamo:"tags,set,omitempty"`
 
 	loaded *parcelLoaded // set when the store returns the entity
 	stamps dynago.Timestamps
@@ -973,6 +975,7 @@ func (e *Parcel) Timestamps() dynago.Timestamps { return e.stamps }
 func (e *Parcel) clone() Parcel {
 	c := *e
 	c.loaded = nil
+	c.Tags = append([]string(nil), e.Tags...)
 	return c
 }
 
@@ -1040,7 +1043,7 @@ type parcelItem struct {
 }
 
 // parcelKnown is every attribute this code writes on Parcel items.
-var parcelKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "depotId": true, "parcelId": true, "state": true, "note": true, "fragile": true, "damages": true, "disputes": true, "lastDispute": true, "KnownPK": true, "KnownSK": true}
+var parcelKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "depotId": true, "parcelId": true, "state": true, "note": true, "fragile": true, "damages": true, "disputes": true, "lastDispute": true, "tags": true, "KnownPK": true, "KnownSK": true}
 
 // parcelToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
 // unknown).
@@ -1069,6 +1072,22 @@ type parcelOnSiteCopy struct {
 	V  int    `dynamo:"_v"`
 }
 
+// ParcelByTag is a Parcel as seen through the ByTag index: key fields plus the projected fields.
+type ParcelByTag struct {
+	DepotID  string      `dynamo:"depotId"`
+	ParcelID string      `dynamo:"parcelId"`
+	State    ParcelState `dynamo:"state,omitempty"`
+	Tags     []string    `dynamo:"tags,set,omitempty"`
+}
+
+type parcelByTagCopy struct {
+	ParcelByTag
+	PK string `dynamo:"PK"`
+	SK string `dynamo:"SK"`
+	T  string `dynamo:"_t"`
+	V  int    `dynamo:"_v"`
+}
+
 // ParcelKnown is a Parcel as seen through the Known index: key fields plus the projected fields.
 type ParcelKnown struct {
 	DepotID  string `dynamo:"depotId"`
@@ -1088,6 +1107,21 @@ type DepotParcelsKey struct {
 	DepotID string
 }
 
+// TagCounts is one counter item for each tag on a depot's parcels.
+type TagCounts struct {
+	// Parcels counts items.
+	Parcels int64 `dynamo:"parcels"`
+	// OnSite counts items where state in ["received", "shelved", "returned"].
+	OnSite int64 `dynamo:"onSite"`
+}
+
+// TagCountsKey identifies a TagCounts counter.
+type TagCountsKey struct {
+	DepotID string
+	// TagsElem is one element of tags: each has its own counter item.
+	TagsElem string
+}
+
 // StateCounts is one counter item for each state a depot's parcels are in, read together.
 type StateCounts struct {
 	// Parcels counts items.
@@ -1098,6 +1132,12 @@ type StateCounts struct {
 type StateCountsKey struct {
 	DepotID string
 	State   ParcelState
+}
+
+// TagCountsEntry is one TagCounts counter item, with the key that identifies it.
+type TagCountsEntry struct {
+	Key TagCountsKey
+	TagCounts
 }
 
 // StateCountsEntry is one StateCounts counter item, with the key that identifies it.
@@ -1120,6 +1160,21 @@ func parcelDerived(e *Parcel, owner dynago.Key) []dynago.Derived {
 			d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: "DepotParcels", Attr: "known", Amount: 1})
 		}
 	}
+	// counter TagCounts
+	if e.DepotID != "" {
+		counted := map[dynago.Key]bool{}
+		for _, elem := range e.Tags {
+			k := dynago.Key{PK: "D#" + e.DepotID, SK: "TAG#" + elem}
+			if elem == "" || counted[k] {
+				continue
+			}
+			counted[k] = true
+			d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: "TagCounts", Attr: "parcels", Amount: 1})
+			if e.State == ParcelStateReceived || e.State == ParcelStateShelved || e.State == ParcelStateReturned {
+				d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: "TagCounts", Attr: "onSite", Amount: 1})
+			}
+		}
+	}
 	// counter StateCounts
 	if e.DepotID != "" && e.State != "" {
 		k := dynago.Key{PK: "D#" + e.DepotID, SK: "STATE#" + string(e.State)}
@@ -1129,6 +1184,18 @@ func parcelDerived(e *Parcel, owner dynago.Key) []dynago.Derived {
 	if e.DepotID != "" && e.ParcelID != "" && e.State == ParcelStateReceived || e.State == ParcelStateShelved || e.State == ParcelStateReturned {
 		k := dynago.Key{PK: "D#" + e.DepotID + "#ONSITE", SK: "P#" + e.ParcelID}
 		d = append(d, dynago.Derived{Kind: dynago.KindCopy, Key: k, Type: "Parcel.OnSite", Item: &parcelOnSiteCopy{ParcelOnSite: ParcelOnSite{DepotID: e.DepotID, ParcelID: e.ParcelID, State: e.State, Damages: e.Damages}, PK: k.PK, SK: k.SK, T: "Parcel.OnSite", V: parcelVersion}, Created: dynago.FmtStamp(e.stamps.Created)})
+	}
+	// copy index ByTag
+	if e.DepotID != "" && e.ParcelID != "" {
+		copied := map[dynago.Key]bool{}
+		for _, elem := range e.Tags {
+			k := dynago.Key{PK: "D#" + e.DepotID + "#TAG#" + dynago.Lower(elem), SK: "TAGGED#" + e.ParcelID}
+			if elem == "" || copied[k] {
+				continue
+			}
+			copied[k] = true
+			d = append(d, dynago.Derived{Kind: dynago.KindCopy, Key: k, Type: "Parcel.ByTag", Item: &parcelByTagCopy{ParcelByTag: ParcelByTag{DepotID: e.DepotID, ParcelID: e.ParcelID, State: e.State, Tags: e.Tags}, PK: k.PK, SK: k.SK, T: "Parcel.ByTag", V: parcelVersion}, Created: dynago.FmtStamp(e.stamps.Created)})
+		}
 	}
 	return d
 }
@@ -1313,6 +1380,83 @@ func (s *ParcelStore) States(ctx context.Context, q ParcelStatesQuery, page dyna
 	return out, next, nil
 }
 
+// ParcelTaggedQuery selects the partition for Parcel.Tagged.
+type ParcelTaggedQuery struct {
+	DepotID string
+	// TagsElem is one element of tags: the Parcels that have it are in its partition.
+	TagsElem string
+}
+
+// Tagged returns one page of Parcel items from the ByTag copy items, ascending by
+// "TAGGED#{parcelId}", with exactly one strongly consistent Query (default 50, max 100 items). It
+// returns the cursor for the next page, or "" at the end.
+func (s *ParcelStore) Tagged(ctx context.Context, q ParcelTaggedQuery, page dynago.Page) ([]ParcelByTag, string, error) {
+	if q.DepotID == "" || q.TagsElem == "" {
+		return nil, "", fmt.Errorf("%w: Tagged needs depotId and tags", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return nil, "", err
+	}
+	pk := "D#" + q.DepotID + "#TAG#" + dynago.Lower(q.TagsElem)
+	spec := dynago.QuerySpec{Scope: "Parcel.Tagged#78703a53\x00" + pk, PK: pk, PageSize: 50, MaxPage: 100, PKAttr: "PK", SKAttr: "SK", Prefix: "TAGGED#", Consistent: true}
+	var out []ParcelByTag
+	next, err := dynago.Query(ctx, s.t, spec, page, &out)
+	if err != nil {
+		return nil, "", err
+	}
+	return out, next, nil
+}
+
+// TagCount reads the TagCounts counter (one strongly consistent GetItem). A counter nothing has
+// touched reads as zero.
+func (s *ParcelStore) TagCount(ctx context.Context, k TagCountsKey) (TagCounts, error) {
+	if k.DepotID == "" || k.TagsElem == "" {
+		return TagCounts{}, fmt.Errorf("%w: TagCounts needs depotId and tags", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", k.DepotID, "#"); err != nil {
+		return TagCounts{}, err
+	}
+	var out TagCounts
+	_, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: "D#" + k.DepotID, SK: "TAG#" + k.TagsElem}, true, &out)
+	return out, err
+}
+
+// ParcelTagsQuery selects the partition for Parcel.Tags.
+type ParcelTagsQuery struct {
+	DepotID string
+}
+
+// Tags returns one page of the TagCounts counters of a partition, one for each tags something has
+// counted, in key order, with exactly one strongly consistent Query (default 50, max 100 items). It
+// returns the cursor for the next page, or "" at the end.
+func (s *ParcelStore) Tags(ctx context.Context, q ParcelTagsQuery, page dynago.Page) ([]TagCountsEntry, string, error) {
+	if q.DepotID == "" {
+		return nil, "", fmt.Errorf("%w: Tags needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return nil, "", err
+	}
+	pk := "D#" + q.DepotID
+	var rows []struct {
+		SK string `dynamo:"SK"`
+		TagCounts
+	}
+	next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{Scope: "Parcel.Tags#9d71fb22\x00" + pk, PK: pk, PKAttr: "PK", SKAttr: "SK", Prefix: "TAG#", PageSize: 50, MaxPage: 100, Consistent: true}, page, &rows)
+	if err != nil {
+		return nil, "", err
+	}
+	out := make([]TagCountsEntry, 0, len(rows))
+	for _, row := range rows {
+		// A counter item stores no fields: its sort key says which one it is.
+		parts, ok := dynago.SplitKey(row.SK, "TAG#", "")
+		if !ok {
+			return nil, "", fmt.Errorf("dynago: TagCounts item with sort key %q, which doesn't fit TAG#{tags}", row.SK)
+		}
+		out = append(out, TagCountsEntry{Key: TagCountsKey{DepotID: q.DepotID, TagsElem: parts[0]}, TagCounts: row.TagCounts})
+	}
+	return out, next, nil
+}
+
 // ParcelOnSiteQuery selects the partition for Parcel.OnSite.
 type ParcelOnSiteQuery struct {
 	DepotID string
@@ -1379,7 +1523,8 @@ func (s *ParcelStore) Counts(ctx context.Context, k DepotParcelsKey) (DepotParce
 
 // Receive creates a Parcel, failing with ErrParcelExists if one already exists. It sets state to
 // "received", whatever e holds. In the same transaction it maintains counter DepotParcels, counter
-// StateCounts, copy index OnSite. Afterwards e.Version() returns the new item's version.
+// TagCounts, counter StateCounts, copy index OnSite, copy index ByTag. Afterwards e.Version()
+// returns the new item's version.
 func (s *ParcelStore) Receive(ctx context.Context, e *Parcel) error {
 	e.State = ParcelStateReceived
 	key, err := e.Key().dynamoKey()
@@ -1417,8 +1562,8 @@ func (s *ParcelStore) Receive(ctx context.Context, e *Parcel) error {
 // "received", whatever e holds. In the same transaction it requires any Depot there is to have
 // closed = false (else ErrParcelArriveRequiresDepot), and creates the Depot if there is none (with
 // name "unnamed"), and adds 1 to its parcels. In the same transaction it maintains counter
-// DepotParcels, counter StateCounts, copy index OnSite. Afterwards e.Version() returns the new
-// item's version.
+// DepotParcels, counter TagCounts, counter StateCounts, copy index OnSite, copy index ByTag.
+// Afterwards e.Version() returns the new item's version.
 func (s *ParcelStore) Arrive(ctx context.Context, e *Parcel) error {
 	e.State = ParcelStateReceived
 	key, err := e.Key().dynamoKey()
@@ -1467,8 +1612,8 @@ func (s *ParcelStore) Arrive(ctx context.Context, e *Parcel) error {
 
 // Leave creates a Parcel, failing with ErrParcelExists if one already exists. It sets state to
 // "out", whatever e holds. In the same transaction it creates the Depot if there is none. In the
-// same transaction it maintains counter DepotParcels, counter StateCounts, copy index OnSite.
-// Afterwards e.Version() returns the new item's version.
+// same transaction it maintains counter DepotParcels, counter TagCounts, counter StateCounts, copy
+// index OnSite, copy index ByTag. Afterwards e.Version() returns the new item's version.
 func (s *ParcelStore) Leave(ctx context.Context, e *Parcel) error {
 	e.State = ParcelStateOut
 	key, err := e.Key().dynamoKey()
@@ -1517,9 +1662,10 @@ func (s *ParcelStore) Leave(ctx context.Context, e *Parcel) error {
 
 // Shelve updates state of a Parcel when state = "received" (else ErrParcelShelvePrecondition). It
 // reads the item consistently first (not with dynago.From) because the change affects the OnSite
-// index entry, the Known index entry, counter DepotParcels, counter StateCounts, then writes
-// everything in one transaction guarded by the item's revision. In the same transaction it
-// maintains counter DepotParcels, counter StateCounts, copy index OnSite.
+// index entry, the ByTag index entry, the Known index entry, counter DepotParcels, counter
+// TagCounts, counter StateCounts, then writes everything in one transaction guarded by the item's
+// revision. In the same transaction it maintains counter DepotParcels, counter TagCounts, counter
+// StateCounts, copy index OnSite, copy index ByTag.
 func (s *ParcelStore) Shelve(ctx context.Context, k ParcelKey, opts ...dynago.WriteOption) error {
 	key, err := k.dynamoKey()
 	if err != nil {
@@ -1559,9 +1705,10 @@ func (s *ParcelStore) Shelve(ctx context.Context, k ParcelKey, opts ...dynago.Wr
 
 // SendOut updates state of a Parcel when state in ["received", "shelved"] (else
 // ErrParcelSendOutPrecondition). It reads the item consistently first (not with dynago.From)
-// because the change affects the OnSite index entry, the Known index entry, counter DepotParcels,
-// counter StateCounts, then writes everything in one transaction guarded by the item's revision. In
-// the same transaction it maintains counter DepotParcels, counter StateCounts, copy index OnSite.
+// because the change affects the OnSite index entry, the ByTag index entry, the Known index entry,
+// counter DepotParcels, counter TagCounts, counter StateCounts, then writes everything in one
+// transaction guarded by the item's revision. In the same transaction it maintains counter
+// DepotParcels, counter TagCounts, counter StateCounts, copy index OnSite, copy index ByTag.
 func (s *ParcelStore) SendOut(ctx context.Context, k ParcelKey, opts ...dynago.WriteOption) error {
 	key, err := k.dynamoKey()
 	if err != nil {
@@ -1601,9 +1748,10 @@ func (s *ParcelStore) SendOut(ctx context.Context, k ParcelKey, opts ...dynago.W
 
 // Lose updates state of a Parcel when state != "lost" (else ErrParcelLosePrecondition). It reads
 // the item consistently first (not with dynago.From) because the change affects the OnSite index
-// entry, the Known index entry, counter DepotParcels, counter StateCounts, then writes everything
-// in one transaction guarded by the item's revision. In the same transaction it maintains counter
-// DepotParcels, counter StateCounts, copy index OnSite.
+// entry, the ByTag index entry, the Known index entry, counter DepotParcels, counter TagCounts,
+// counter StateCounts, then writes everything in one transaction guarded by the item's revision. In
+// the same transaction it maintains counter DepotParcels, counter TagCounts, counter StateCounts,
+// copy index OnSite, copy index ByTag.
 func (s *ParcelStore) Lose(ctx context.Context, k ParcelKey, opts ...dynago.WriteOption) error {
 	key, err := k.dynamoKey()
 	if err != nil {
@@ -1667,6 +1815,49 @@ func (s *ParcelStore) Annotate(ctx context.Context, k ParcelKey, v ParcelAnnotat
 			o.Written(rev)
 		}
 		return dynago.StaleAs(guard.ExpectRev != 0, err)
+	})
+}
+
+// ParcelRetag holds the new values for Parcel.Retag.
+type ParcelRetag struct {
+	Tags []string
+}
+
+// Retag updates tags of a Parcel. It reads the item consistently first (not with dynago.From)
+// because the change affects the ByTag index entry, counter TagCounts, then writes everything in
+// one transaction guarded by the item's revision. In the same transaction it maintains counter
+// DepotParcels, counter TagCounts, counter StateCounts, copy index OnSite, copy index ByTag.
+func (s *ParcelStore) Retag(ctx context.Context, k ParcelKey, v ParcelRetag, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	return dynago.Retry(ctx, func() error {
+		it, versioned, err := s.start(ctx, key, o, false)
+		if err != nil {
+			return err
+		}
+		before := &it.Parcel
+		after := before.clone()
+		after.Tags = v.Tags
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return dynago.StaleAs(versioned, err)
+		}
+		o.Written(it.Rev + 1)
+		return nil
 	})
 }
 

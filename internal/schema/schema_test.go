@@ -105,7 +105,7 @@ func TestValidationErrors(t *testing.T) {
 		{"typo in key", "    acess: {}\n", `unknown key "acess"`},
 		{"index without project", "    indexes:\n      ByName: { pk: \"N#{name}\", sk: \"T#{thingId}\" }\n", "project is required"},
 		{"projected field unknown", "    indexes:\n      ByName: { pk: \"N#{name}\", project: [nope] }\n", "projected field nope"},
-		{"list field in key", "    indexes:\n      ByTag: { pk: \"N#{tags}\", project: keys }\n", "cannot be part of a key"},
+		{"list field in key", "      aliases: string_list\n    indexes:\n      ByAlias: { pk: \"N#{aliases}\", project: keys }\n", "cannot be part of a key"},
 		{"consistent gsi", "    indexes:\n      ByName: { pk: \"N#{name}\", project: keys }\n    access:\n      L: { query: ByName, consistent: true }\n", "cannot be read consistently"},
 		{"range not after prefix", "    access:\n      L: { query: key, range: name }\n", "must be the first placeholder"},
 		{"update key field", "    writes:\n      W: { update: [thingId] }\n", "part of the primary key"},
@@ -195,6 +195,12 @@ func TestValidationErrors(t *testing.T) {
 		{"ensure of the wrong type", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, ensure: { count: many } } } }\n", "does not match field type"},
 		{"ensure without a required field", "      must: { type: string, required: true }\n    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, ensure: { count: 2 } } } }\n", "Thing.must is required, so a Thing this write creates needs it"},
 		{"ensure of a counter", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, ensure: {}, when: { n: 0 } } } }\n", "can only be checked with when"},
+		{"set-keyed GSI", "    indexes:\n      ByTag: { strategy: gsi, pk: \"TAG#{tags}\", sk: \"T#{thingId}\", project: keys }\n", "a GSI holds an item under one key"},
+		{"index keyed by two sets", "      more: string_set\n    indexes:\n      ByTag: { pk: \"TAG#{tags}#{more}\", sk: \"T#{tenantId}#{thingId}\", project: keys }\n", "are both sets"},
+		{"counter keyed by two sets", "      more: string_set\n    counters:\n      C: { pk: \"C#{tags}\", sk: \"C#{more}\", values: { n: count } }\n", "are both sets"},
+		{"range over a set", "    indexes:\n      ByTag: { pk: \"TAG#{tenantId}\", sk: \"T#{tags}#{tenantId}#{thingId}\", project: keys }\n    access:\n      L: { query: ByTag, range: tags }\n", "a range bounds a single value"},
+		{"requires a set-keyed counter", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{tags}\", values: { n: count } }\n    writes:\n      W: { update: [name], requires: { C: { key: { tenantId: tenantId, tags: name }, when: { n: 0 } } } }\n", "requiring one of them isn't supported"},
+		{"set in the primary key", "  Other:\n    fields: { tenantId: string, tags: string_set }\n    key: { pk: \"O#{tenantId}\", sk: \"OTHER#{tags}\" }\n", "cannot be part of a key"},
 		{"requires unknown counter value", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, when: { m: 0 } } } }\n", "m is not a value of counter C"},
 	}
 	for _, c := range cases {
@@ -272,6 +278,42 @@ func TestNotAndInConditions(t *testing.T) {
 	rq := writes["Other"].Requires[0]
 	if got := rq.Condition("Thing"); got != `the Thing to exist with status != "c" and name != Thing.name` {
 		t.Errorf("the requirement reads %q", got)
+	}
+}
+
+// A key template that names a string_set makes the index or counter one per element: the index
+// becomes a copy (a GSI entry has one key), and writes that change the set read the item.
+func TestKeysPerSetElement(t *testing.T) {
+	m, err := Parse([]byte(base + `    indexes:
+      ByTag: { pk: "TAG#{tenantId}#{tags|lower}", sk: "T#{thingId}", project: [name] }
+    counters:
+      TagCounts: { pk: "T#{tenantId}", sk: "TAGS#{tags}", values: { things: count } }
+    access:
+      Tagged: { query: ByTag }
+      TagCounts: { counter: TagCounts, all: true }
+    writes:
+      Retag: { update: [tags] }
+      Rename: { update: [name] }
+      Touch: { update: [at] }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := m.Entity("Thing")
+	ix, c := e.Indexes[0], e.Counters[0]
+	if ix.Set == nil || ix.Set.Name != "tags" || ix.Strategy != StrategyCopy || !ix.StrategyInferred || !strings.Contains(ix.StrategyReason, "each element of tags") {
+		t.Errorf("index: set %v, strategy %s (%s)", ix.Set, ix.Strategy, ix.StrategyReason)
+	}
+	if c.Set == nil || c.Set.Name != "tags" || len(c.ItemFields()) != 1 {
+		t.Errorf("counter: set %v, item fields %v", c.Set, c.ItemFields())
+	}
+	reads := map[string]bool{}
+	for _, w := range e.Writes {
+		reads[w.Name] = w.ReadFirst
+	}
+	// The set keys copies and counters; the name is in every copy; the time feeds nothing.
+	if !reads["Retag"] || !reads["Rename"] || reads["Touch"] {
+		t.Errorf("writes that read first: %v", reads)
 	}
 }
 
