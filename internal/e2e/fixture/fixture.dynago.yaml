@@ -50,3 +50,163 @@ entities:
             key: { tenantId: tenantId, accountId: successorId }
             when: { status: pending }
             set: { status: active }
+
+  # A depot, its parcels and their damage reports share a partition, and are read together.
+  # A parcel arriving at a depot nobody has opened yet creates the depot in the same transaction
+  # (ensure), counted among the depots like any other.
+  Depot:
+    fields:
+      depotId: string
+      name: string
+      closed: bool
+      parcels: int
+    key:
+      pk: "D#{depotId}"
+      sk: "DEPOT"
+    counters:
+      DepotTotals:
+        pk: "DEPOTS"
+        sk: "TOTALS"
+        values:
+          depots: count
+    access:
+      Get: get
+      Totals: { counter: DepotTotals, freshness: immediate }
+      Everything: { query: partition, of: [Depot, Parcel, Damage], page: 4, freshness: immediate }
+      Newest: { query: partition, of: [Damage, Parcel], order: desc, freshness: eventual }
+    writes:
+      Open: create
+      Close: { set: { closed: true } }
+
+  # A parcel moves through a depot's states. Its index, counter values and preconditions exclude a
+  # state (not) or list several (in), rather than naming one.
+  Parcel:
+    fields:
+      depotId: string
+      parcelId: string
+      state: { type: enum, values: [received, shelved, out, returned, lost] }
+      note: string
+      fragile: bool
+      damages: { type: int, doc: How many damage reports name the parcel. Listed with the parcels on site. }
+      disputes: int
+      lastDispute: string
+      tags: { type: string_set, size: 20/60, doc: "Handling tags. A parcel is listed, and counted, under each of them." }
+    key:
+      pk: "D#{depotId}"
+      sk: "PARCEL#{parcelId}"
+    indexes:
+      OnSite:
+        doc: The parcels physically in the depot.
+        pk: "D#{depotId}#ONSITE"
+        sk: "P#{parcelId}"
+        where: { state: { in: [received, shelved, returned] } }
+        project: [state, damages]
+      ByTag:
+        doc: The parcels with a tag. Keyed by each element of the set, so a parcel has a copy per tag.
+        pk: "D#{depotId}#TAG#{tags|lower}"
+        sk: "TAGGED#{parcelId}"
+        project: [state]
+      Known:
+        doc: Every parcel that isn't lost.
+        pk: "KNOWN#{depotId}"
+        sk: "P#{parcelId}"
+        where: { state: { not: lost } }
+        project: keys
+    counters:
+      DepotParcels:
+        pk: "D#{depotId}"
+        sk: "COUNTS"
+        values:
+          onSite: { count: true, where: { state: { in: [received, shelved, returned] } } }
+          known: { count: true, where: { state: { not: lost } } }
+      TagCounts:
+        doc: One counter item for each tag on a depot's parcels.
+        pk: "D#{depotId}"
+        sk: "TAG#{tags}"
+        values:
+          parcels: count
+          onSite: { count: true, where: { state: { in: [received, shelved, returned] } } }
+      StateCounts:
+        doc: One counter item for each state a depot's parcels are in, read together.
+        pk: "D#{depotId}"
+        sk: "STATE#{state}"
+        values:
+          parcels: count
+    access:
+      Get: get
+      GetSeveral: { get: key, batch: 10, freshness: immediate }
+      States: { counter: StateCounts, all: true, freshness: immediate }
+      Tagged: { query: ByTag }
+      TagCount: { counter: TagCounts, freshness: immediate }
+      Tags: { counter: TagCounts, all: true, freshness: immediate }
+      OnSite: { query: OnSite, freshness: immediate }
+      Known: { query: Known }
+      Counts: { counter: DepotParcels }
+    writes:
+      Receive: { create: true, set: { state: received } }
+      Arrive:
+        create: true
+        set: { state: received }
+        requires:
+          Depot:
+            key: { depotId: depotId }
+            when: { closed: false }
+            ensure: { name: unnamed }
+            add: { parcels: 1 }
+      Leave:
+        create: true
+        set: { state: out }
+        requires:
+          Depot: { key: { depotId: depotId }, ensure: {} }
+      Shelve: { set: { state: shelved }, when: { state: received } }
+      SendOut: { set: { state: out }, when: { state: { in: [received, shelved] } } }
+      Lose: { set: { state: lost }, when: { state: { not: lost } } }
+      Annotate: { update: [note], when: { state: { not: lost } } }
+      Retag: { update: [tags] }
+      # Batch writes: the same change to several parcels, several to a transaction, with the
+      # depot's counter items updated once per transaction.
+      ShelveSeveral: { set: { state: shelved }, when: { state: received }, batch: 20 }
+      AnnotateSeveral: { update: [note], batch: 10 }
+
+  # A damage report can only be filed against a parcel that is still on site. Filing one counts on
+  # the parcel (add) and marks it fragile if the report says so (patch), leaving the mark alone
+  # otherwise. The count is listed in the OnSite copy, so the parcel is read first; a dispute
+  # changes nothing derived, so its addition and patch go on one update without a read.
+  Damage:
+    fields:
+      depotId: string
+      parcelId: string
+      damageId: string
+      detail: string
+      fragile: bool
+    key:
+      pk: "D#{depotId}"
+      sk: "DAMAGE#{parcelId}#{damageId}"
+    counters:
+      ParcelDamages:
+        doc: One counter item for each parcel with damage reports.
+        pk: "D#{depotId}"
+        sk: "DAMAGED#{parcelId}"
+        values:
+          reports: count
+    access:
+      Get: get
+      Damaged: { counter: ParcelDamages, all: true, page: 2, freshness: immediate }
+    writes:
+      File:
+        create: true
+        requires:
+          Parcel:
+            key: { depotId: depotId, parcelId: parcelId }
+            when: { state: { in: [received, shelved, returned] } }
+            add: { damages: 1 }
+            patch: { fragile: "{fragile}" }
+      Dispute:
+        update: [detail]
+        requires:
+          Parcel:
+            key: { depotId: depotId, parcelId: parcelId }
+            when: { state: { not: lost } }
+            set: { note: disputed }
+            add: { disputes: 1 }
+            patch: { lastDispute: "{detail}" }

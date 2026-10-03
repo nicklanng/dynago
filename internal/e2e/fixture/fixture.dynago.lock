@@ -5,7 +5,22 @@
   "tables": [
     {
       "generation": 1,
-      "spec": {}
+      "spec": {
+        "gsis": [
+          {
+            "name": "Known",
+            "pk": "KnownPK",
+            "sk": "KnownSK",
+            "projection": "INCLUDE",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "depotId",
+              "parcelId"
+            ]
+          }
+        ]
+      }
     }
   ],
   "entities": {
@@ -82,6 +97,260 @@
                     "where": [
                       "status=active"
                     ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "Damage": {
+      "versions": [
+        {
+          "version": 1,
+          "generation": 1,
+          "fingerprint": "2a60b0223bd33295",
+          "shape": {
+            "fields": [
+              {
+                "name": "depotId",
+                "attr": "depotId",
+                "type": "string"
+              },
+              {
+                "name": "parcelId",
+                "attr": "parcelId",
+                "type": "string"
+              },
+              {
+                "name": "damageId",
+                "attr": "damageId",
+                "type": "string"
+              },
+              {
+                "name": "detail",
+                "attr": "detail",
+                "type": "string"
+              },
+              {
+                "name": "fragile",
+                "attr": "fragile",
+                "type": "bool"
+              }
+            ],
+            "pk": "D#{depotId}",
+            "sk": "DAMAGE#{parcelId}#{damageId}",
+            "counters": [
+              {
+                "name": "ParcelDamages",
+                "pk": "D#{depotId}",
+                "sk": "DAMAGED#{parcelId}",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "reports"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "Depot": {
+      "versions": [
+        {
+          "version": 1,
+          "generation": 1,
+          "fingerprint": "fe8c60c869038a0c",
+          "shape": {
+            "fields": [
+              {
+                "name": "depotId",
+                "attr": "depotId",
+                "type": "string"
+              },
+              {
+                "name": "name",
+                "attr": "name",
+                "type": "string"
+              },
+              {
+                "name": "closed",
+                "attr": "closed",
+                "type": "bool"
+              },
+              {
+                "name": "parcels",
+                "attr": "parcels",
+                "type": "int"
+              }
+            ],
+            "pk": "D#{depotId}",
+            "sk": "DEPOT",
+            "counters": [
+              {
+                "name": "DepotTotals",
+                "pk": "DEPOTS",
+                "sk": "TOTALS",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "depots"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "Parcel": {
+      "versions": [
+        {
+          "version": 1,
+          "generation": 1,
+          "fingerprint": "846dbbf39529d2dd",
+          "shape": {
+            "fields": [
+              {
+                "name": "depotId",
+                "attr": "depotId",
+                "type": "string"
+              },
+              {
+                "name": "parcelId",
+                "attr": "parcelId",
+                "type": "string"
+              },
+              {
+                "name": "state",
+                "attr": "state",
+                "type": "enum",
+                "values": [
+                  "received",
+                  "shelved",
+                  "out",
+                  "returned",
+                  "lost"
+                ]
+              },
+              {
+                "name": "note",
+                "attr": "note",
+                "type": "string"
+              },
+              {
+                "name": "fragile",
+                "attr": "fragile",
+                "type": "bool"
+              },
+              {
+                "name": "damages",
+                "attr": "damages",
+                "type": "int"
+              },
+              {
+                "name": "disputes",
+                "attr": "disputes",
+                "type": "int"
+              },
+              {
+                "name": "lastDispute",
+                "attr": "lastDispute",
+                "type": "string"
+              },
+              {
+                "name": "tags",
+                "attr": "tags",
+                "type": "string_set"
+              }
+            ],
+            "pk": "D#{depotId}",
+            "sk": "PARCEL#{parcelId}",
+            "indexes": [
+              {
+                "name": "OnSite",
+                "strategy": "copy",
+                "pk": "D#{depotId}#ONSITE",
+                "sk": "P#{parcelId}",
+                "projection": "include",
+                "project": [
+                  "state",
+                  "damages"
+                ],
+                "where": [
+                  "state in [received shelved returned]"
+                ]
+              },
+              {
+                "name": "ByTag",
+                "strategy": "copy",
+                "pk": "D#{depotId}#TAG#{tags|lower}",
+                "sk": "TAGGED#{parcelId}",
+                "projection": "include",
+                "project": [
+                  "state"
+                ]
+              },
+              {
+                "name": "Known",
+                "strategy": "gsi",
+                "pk": "KNOWN#{depotId}",
+                "sk": "P#{parcelId}",
+                "projection": "keys",
+                "where": [
+                  "state!=lost"
+                ]
+              }
+            ],
+            "counters": [
+              {
+                "name": "DepotParcels",
+                "pk": "D#{depotId}",
+                "sk": "COUNTS",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "onSite",
+                    "where": [
+                      "state in [received shelved returned]"
+                    ]
+                  },
+                  {
+                    "name": "known",
+                    "where": [
+                      "state!=lost"
+                    ]
+                  }
+                ]
+              },
+              {
+                "name": "TagCounts",
+                "pk": "D#{depotId}",
+                "sk": "TAG#{tags}",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "parcels"
+                  },
+                  {
+                    "name": "onSite",
+                    "where": [
+                      "state in [received shelved returned]"
+                    ]
+                  }
+                ]
+              },
+              {
+                "name": "StateCounts",
+                "pk": "D#{depotId}",
+                "sk": "STATE#{state}",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "parcels"
                   }
                 ]
               }

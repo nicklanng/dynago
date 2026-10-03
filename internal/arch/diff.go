@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/nicklanng/dynago/internal/cost"
@@ -284,6 +285,9 @@ func (d *differ) indexes(oe, ne *Entity) {
 		if oi.Where != ni.Where {
 			ch = append(ch, fmt.Sprintf("where %q → %q", oi.Where, ni.Where))
 		}
+		if oi.Matches != ni.Matches {
+			ch = append(ch, fmt.Sprintf("share of items matching its where %s → %s", shareText(oi.Matches), shareText(ni.Matches)))
+		}
 		if strings.Join(oi.ReadBy, ",") != strings.Join(ni.ReadBy, ",") {
 			ch = append(ch, fmt.Sprintf("read by %s → %s", listOrNothing(oi.ReadBy), listOrNothing(ni.ReadBy)))
 		}
@@ -291,6 +295,14 @@ func (d *differ) indexes(oe, ne *Entity) {
 			d.add("Indexes", "%s `%s.%s`: %s", changed, ne.Name, ni.Name, strings.Join(ch, "; "))
 		}
 	}
+}
+
+// shareText renders a sparse index's declared share of items.
+func shareText(m float64) string {
+	if m == 0 {
+		return "not declared"
+	}
+	return strconv.FormatFloat(m*100, 'g', 3, 64) + "%"
 }
 
 func listOrNothing(ss []string) string {
@@ -315,6 +327,9 @@ func indexText(ix Index) string {
 	s += ", projecting " + ix.Projection
 	if ix.Where != "" {
 		s += ", only when " + ix.Where
+		if ix.Matches > 0 {
+			s += " (" + shareText(ix.Matches) + " of items)"
+		}
 	}
 	s += "; read by " + listOrNothing(ix.ReadBy)
 	return s

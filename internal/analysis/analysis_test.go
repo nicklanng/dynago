@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -118,10 +119,10 @@ func TestExamplePartitions(t *testing.T) {
 	if loan == nil || !loan.Grows || loan.Count.Typical != 20 || loan.Count.Max != 500 || !tool.Grows {
 		t.Errorf("loan member = %+v", loan)
 	}
-	// Overdue gathers a library's loans in one GSI partition: 60 tools × 20 loans typically, and
-	// the biggest skew (5,000 tools) at most.
+	// Overdue gathers a library's active loans in one GSI partition: of 60 tools × 20 loans
+	// typically, and the biggest skew (5,000 tools) at most, the 2% its where matches.
 	due := find("GSI Overdue", "LIB#{libraryId}#DUE")
-	if c := due.Members[0].Count; c.Typical != 1200 || c.Max != 100000 {
+	if c := due.Members[0].Count; c.Typical != 24 || c.Max != 2000 || due.Bound() {
 		t.Errorf("overdue count = %+v", c)
 	}
 	// An enum in the key divides the typical count, not the largest.
@@ -136,7 +137,8 @@ func TestExamplePartitions(t *testing.T) {
 	}
 	// A member's partition holds their loan copies, counted by the declared spread over members.
 	mine := find("base table", "LIB#{libraryId}#MEMBER#{memberId}")
-	if c := mine.Members[0].Count; c.Typical != 60 || c.Max != 400 {
+	// Only the active ones are copied there: 2% of the 60 typical and 400 at most.
+	if c := mine.Members[0].Count; math.Abs(c.Typical-1.2) > 1e-9 || c.Max != 8 {
 		t.Errorf("my loans count = %+v", c)
 	}
 	for _, p := range r.Partitions {
@@ -348,6 +350,97 @@ func TestDeclaredSpreadBeatsTheChain(t *testing.T) {
 	}
 }
 
+// A sparse index holds the items its where matches. With the share declared (matches), its
+// partitions, their traffic and the writes that maintain it are sized by it; without, every item
+// is counted and the result is marked as the most it can be.
+func TestSparseIndexIsSizedByItsShare(t *testing.T) {
+	src := func(matches string) string {
+		return strings.Replace(base, "    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n", `    indexes:
+      Binned:
+        pk: "BIN"
+        sk: "T#{orgId}#{thingId}"
+        where: { kind: b }
+        project: keys
+`+matches+`    access:
+      Binned: { query: Binned, rate: 1 }
+    writes:
+      Add: { create: true, rate: 10 }
+      AddA: { create: true, set: { kind: a }, rate: 10 }
+      Bin: { set: { kind: b }, when: { kind: a }, rate: 1 }
+      Rename: { update: [name], rate: 10 }
+    volume: { typical: 10, max: 1000 }
+`, 1)
+	}
+	binned := func(r *Result) (*Partition, *Member) {
+		t.Helper()
+		for _, p := range r.Partitions {
+			if p.PK == "BIN" {
+				return p, p.Members[0]
+			}
+		}
+		t.Fatal("no partition for the Binned index")
+		return nil, nil
+	}
+	units := func(r *Result, write string) float64 {
+		t.Helper()
+		for _, er := range r.Cost.Entities {
+			for _, wc := range er.Writes {
+				if wc.Write.Entity.Name != "Thing" || wc.Write.Name != write {
+					continue
+				}
+				for _, tc := range wc.Touches {
+					if tc.Target.Index != nil {
+						return tc.Units.P50
+					}
+				}
+				return 0
+			}
+		}
+		t.Fatalf("no write %s", write)
+		return 0
+	}
+
+	// Not declared: all 1,000 things are counted, as a bound.
+	r := Analyze(parse(t, src("")), cost.DefaultPrices, nil)
+	p, mb := binned(r)
+	if !mb.Bound || !p.Bound() || mb.Count.Typical != 1000 {
+		t.Errorf("without matches: bound %v, count %+v; want a bound of 1,000", mb.Bound, mb.Count)
+	}
+	if !has(r, "low-cardinality-key", Note, "Thing.Binned", `every Thing with kind = "b" lands in one partition`) ||
+		!has(r, "low-cardinality-key", Note, "Thing.Binned", "at most (if every Thing matched") {
+		t.Errorf("the finding should speak of matching things, and of a bound:\n%s", dump(r))
+	}
+	if st := r.Reads[r.Model.Entity("Thing").Access[0]]; !st.Filtered {
+		t.Errorf("the read should say fewer items qualify than counted")
+	}
+	loose := p.PeakWRU
+
+	// One thing in a hundred is binned.
+	r = Analyze(parse(t, src("        matches: 0.01\n")), cost.DefaultPrices, nil)
+	p, mb = binned(r)
+	if mb.Bound || mb.Count.Typical != 10 || p.Count.Typical != 1 {
+		t.Errorf("with matches: bound %v, count %+v, %v partitions; want 10 things in one partition", mb.Bound, mb.Count, p.Count.Typical)
+	}
+	if has(r, "low-cardinality-key", Note, "Thing.Binned", "at most (if every") {
+		t.Errorf("a sized index isn't a bound:\n%s", dump(r))
+	}
+	if st := r.Reads[r.Model.Entity("Thing").Access[0]]; st.Filtered || st.Items.Typical != 10 {
+		t.Errorf("the read returns %+v, want 10 items and no caveat", st.Items)
+	}
+	// What a write pays for the index follows what it says about the item: a create that may or
+	// may not match pays the share; one that sets another kind pays nothing; binning always adds
+	// the entry; a rename touches no index key, and the index projects nothing.
+	for write, want := range map[string]float64{"Add": 0.01, "AddA": 0, "Bin": 1, "Rename": 0} {
+		if got := units(r, write); got != want {
+			t.Errorf("%s pays %v WRU for the index typically, want %v", write, got, want)
+		}
+	}
+	// 10 creates/s at 1% and one binning a second, against 21 writes/s counted in full.
+	if p.PeakWRU >= loose || p.PeakWRU < 1 || p.PeakWRU > 1.2 {
+		t.Errorf("peak on the index partition: %v WRU/s (was %v as a bound), want about 1.1", p.PeakWRU, loose)
+	}
+}
+
 // A busy partition key: every Thing write lands on its org's partition, and the counter keyed by
 // the org takes every write of the org's things.
 func TestHotPartition(t *testing.T) {
@@ -415,6 +508,53 @@ func TestAcceptance(t *testing.T) {
 	r := Analyze(parse(t, src), cost.DefaultPrices, nil)
 	if !has(r, "accept-invalid", Error, "Thing", "is an error, which can't be accepted") || !has(r, "item-too-large", Error, "Thing", "") {
 		t.Errorf("accepting an error:\n%s", dump(r))
+	}
+}
+
+// An acceptance on an entity covers the rule's findings about its fields (and whatever else it
+// declares), so a reason shared by all of them is given once. One on the field itself wins, and
+// an entity-wide acceptance with nothing under it to accept is still an error.
+func TestAcceptanceForAWholeEntity(t *testing.T) {
+	note := func(fieldAccept, entityAccept string) string {
+		return base + `  Note:
+    fields:
+      orgId: string
+      thingId: string
+      noteId: string
+      thingName: { type: string, copy_of: Thing.name` + fieldAccept + ` }
+      thingBody: { type: string, copy_of: Thing.body }
+    key: { pk: "ORG#{orgId}#T#{thingId}", sk: "NOTE#{noteId}" }
+    writes:
+      Add: create
+    volume: { per: Thing, typical: 5, max: 50 }
+` + entityAccept
+	}
+	reasons := func(r *Result) map[string]string {
+		out := map[string]string{}
+		for _, f := range r.Findings {
+			if f.Rule == "copy-drift" && f.Accepted != nil {
+				out[f.Subject.String()] = f.Accepted.Reason
+			}
+		}
+		return out
+	}
+	r := Analyze(parse(t, note("", "    accept: { copy-drift: \"one pass rewrites them\" }\n")), cost.DefaultPrices, nil)
+	if got := reasons(r); len(r.Open()) != 0 || got["Note.thingName"] != "one pass rewrites them" || got["Note.thingBody"] != "one pass rewrites them" {
+		t.Errorf("accepted on the entity: %v\n%s", got, dump(r))
+	}
+	r = Analyze(parse(t, note(", accept: { copy-drift: \"names never change\" }", "    accept: { copy-drift: \"one pass rewrites them\" }\n")), cost.DefaultPrices, nil)
+	if got := reasons(r); len(r.Open()) != 0 || got["Note.thingName"] != "names never change" || got["Note.thingBody"] != "one pass rewrites them" {
+		t.Errorf("the field's own acceptance wins: %v\n%s", got, dump(r))
+	}
+	r = Analyze(parse(t, note("", "    accept: { sparse-index: \"because\" }\n")), cost.DefaultPrices, nil)
+	if !has(r, "accept-invalid", Error, "Note", "neither entity Note nor anything it declares has a sparse-index finding") {
+		t.Errorf("nothing under the entity to accept:\n%s", dump(r))
+	}
+	// It doesn't reach another entity's findings.
+	r = Analyze(parse(t, strings.Replace(note("", ""), "    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n",
+		"    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n    accept: { copy-drift: \"because\" }\n", 1)), cost.DefaultPrices, nil)
+	if !has(r, "accept-invalid", Error, "Thing", "") || len(reasons(r)) != 0 {
+		t.Errorf("accepted on another entity:\n%s", dump(r))
 	}
 }
 

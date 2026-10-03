@@ -48,6 +48,65 @@ func GetMany(ctx context.Context, t dynamo.Table, keys []Key, consistent bool, o
 	return err
 }
 
+// GetBatch reads several items by key and returns those that exist, in the order of keys (a key
+// given twice is read once, and returned at its first place). It makes one BatchGetItem per 100
+// keys. Each item is charged as a GetItem of it would be.
+func GetBatch(ctx context.Context, t dynamo.Table, keys []Key, consistent bool) ([]dynamo.Item, error) {
+	place := make(map[Key]int, len(keys))
+	distinct := make([]Key, 0, len(keys))
+	for _, k := range keys {
+		if _, seen := place[k]; !seen {
+			place[k] = len(distinct)
+			distinct = append(distinct, k)
+		}
+	}
+	var raws []dynamo.Item
+	if err := GetMany(ctx, t, distinct, consistent, &raws); err != nil {
+		return nil, err
+	}
+	found := make([]dynamo.Item, len(distinct))
+	for _, raw := range raws {
+		if i, ok := place[ItemKey(raw)]; ok {
+			found[i] = raw
+		}
+	}
+	out := raws[:0]
+	for _, raw := range found {
+		if raw != nil {
+			out = append(out, raw)
+		}
+	}
+	return out, nil
+}
+
+// SplitKey reads the placeholder values back out of a rendered key. literals are the template's
+// literal parts in order, one more than it has placeholders: the text before the first
+// placeholder, between each two, and after the last ("" where there is none; only the first and
+// last may be empty). It reports false if the key doesn't have that shape.
+//
+// Reading back is exact because a value may not contain the first character of the literal that
+// follows it (CheckKeyPart), so the first occurrence of that literal ends the value.
+func SplitKey(key string, literals ...string) ([]string, bool) {
+	if len(literals) < 2 || !strings.HasPrefix(key, literals[0]) {
+		return nil, false
+	}
+	rest := key[len(literals[0]):]
+	n := len(literals) - 1
+	out := make([]string, 0, n)
+	for i := 1; i < n; i++ {
+		at := strings.Index(rest, literals[i])
+		if literals[i] == "" || at < 0 {
+			return nil, false
+		}
+		out = append(out, rest[:at])
+		rest = rest[at+len(literals[i]):]
+	}
+	if !strings.HasSuffix(rest, literals[n]) {
+		return nil, false
+	}
+	return append(out, rest[:len(rest)-len(literals[n])]), true
+}
+
 // QuerySpec describes one generated query.
 type QuerySpec struct {
 	// Scope identifies the access pattern and partition; a cursor is only valid for the scope
@@ -69,6 +128,10 @@ type QuerySpec struct {
 	// TTLAttr, if set, leaves out items whose TTL has passed but that DynamoDB has not yet deleted.
 	// Such a page may hold fewer items than its size and still have a next cursor.
 	TTLAttr string
+	// Types, if set, keeps only items of these types (_t): a read of a whole partition returns
+	// some of the kinds it holds. A page evaluates up to its size of the partition's items, of
+	// every kind, so it may hold fewer and still have a next cursor.
+	Types []string
 	// Project, if set, reads only these attributes. It saves bandwidth and keeps other attributes
 	// from callers; DynamoDB still charges for the whole item.
 	Project []string
@@ -101,6 +164,13 @@ func Query(ctx context.Context, t dynamo.Table, spec QuerySpec, page Page, out a
 	}
 	if spec.TTLAttr != "" {
 		q.Filter("attribute_not_exists($) OR $ > ?", spec.TTLAttr, spec.TTLAttr, Now())
+	}
+	if len(spec.Types) > 0 {
+		args := []any{AttrType}
+		for _, t := range spec.Types {
+			args = append(args, t)
+		}
+		q.Filter("$ IN (?"+strings.Repeat(", ?", len(spec.Types)-1)+")", args...)
 	}
 	if len(spec.Project) > 0 {
 		paths := make([]string, len(spec.Project))

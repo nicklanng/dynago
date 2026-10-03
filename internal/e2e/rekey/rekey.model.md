@@ -16,7 +16,7 @@ Table generation **2**: `rekey-g2`. It is filled from generation 1 (`rekey-g1`) 
 | Indexes | 0 GSIs, 0 copy indexes |
 | Uniqueness claims, counters | 0, 1 |
 | Workload | No peak factor declared (peaks taken as the averages); volumes declared for 0 of 1 entities |
-| Largest partition | `E#{email}` (base table): 204 B typical, 204 B at most |
+| Largest partition | `E#{email}` (base table): 204 B typical, 204 B at most. |
 | Cost | $0.00/month at the declared volumes and rates |
 | Findings | 0 errors, 0 warnings, 0 notes open; 0 accepted |
 
@@ -100,7 +100,7 @@ Assumptions:
 - Peak traffic is assumed equal to the declared average rates (no workload.peak).
 - Items per partition follow the volumes: an entity's items per parent (typical and max), multiplied up the parents. A partition's largest count takes the biggest skew along its path, not every one at once.
 - An enum in a partition key splits the items evenly among its values typically; at worst they all share one. A field that refers to another entity (by name, ref or requires) spreads the items evenly over that entity's items, unless volume.by says otherwise. Any other field leaves the count unknown.
-- Index entries are counted as if every item had one: `where` and empty key fields only make an index smaller.
+- An index with a `where` holds the share of the items its `matches` declares. Without `matches`, every item is counted, so its sizes, traffic and write costs are upper bounds, marked as such. Empty key fields only make an index smaller.
 - The busiest partition gets traffic in proportion to its share of the items: its largest count over the entity's total. A write's declared hot_key_rate replaces that estimate for every partition it touches.
 - A partition key value takes at most 1000 WRU and 3000 RRU per second. Risk is the larger share of either at peak: low under 10%, medium under 50%, high above.
 - Sizes use each field's declared size (p50/p99); undeclared sizes use type defaults (string 20/64 B, time 30/35 B, int 8/11 B).

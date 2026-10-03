@@ -98,6 +98,13 @@ generation needed for existing items could be missed. `dynago generate` refuses 
 version or generation 1 with no history. Restore the file from version control. For a new table
 whose entities start above version 1, `-new-history` starts the history there.
 
+**Until a table exists, delete it freely.** The lock can't tell a schema still being designed
+from one with a table behind it, so after the first `generate` it asks for a version (and perhaps a
+generation) on every change of shape. While no table has been created from the schema anywhere,
+there are no stored items for it to keep track of: delete the lock file and generate again, and
+the design is recorded afresh as version 1 in generation 1. The error suggests this for as long as
+the lock records only a first design. Stop once a table exists, in any environment.
+
 The shape records what is stored, not how the schema is written: reordering fields, indexes or
 counters is not a change. A lock file written by an older dynago is upgraded in place.
 

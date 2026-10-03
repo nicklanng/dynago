@@ -12,9 +12,71 @@ format, the generated code and the runtime API; the changelog says how to move.
 - The generated Terraform has an output `<table>_table_arns`: every declared table's ARN (the current
   generation and the retained ones) under a name that doesn't change with the generation, so an IAM
   policy written against it follows the table through a migration.
+- A read of several entities that share a partition, in one Query:
+  `Open: { query: partition, of: [Thread, Message, Attachment, Draft] }` returns a page of the
+  partition with each kind in its own field (`ThreadOpen{Thread, Messages, Attachments, Drafts}`).
+  The entities must have the same partition key template. `dynago.QuerySpec` gained `Types`.
+- Reads of several items at once. `GetSeveral: { get: key, batch: 40 }` takes a slice of keys and
+  returns the items that exist, in the order asked, with one BatchGetItem per 100 keys.
+  `AllCounts: { counter: LabelCounts, all: true }` returns every item of a counter in one
+  partition (each label's counts for a user) with one Query, a page at a time, each with the key
+  its sort key holds. The runtime gained `dynago.GetBatch` and `dynago.SplitKey` for them.
+- Batch updates: `Archive: { set: { mailbox: archived }, batch: 50 }` generates a method taking a
+  slice of keys. The items are read together and written several to a transaction, and a counter
+  item they share is updated once per transaction, not once per item. Each transaction is atomic;
+  the method returns a `*dynago.BatchError` naming the items it could not write, and writes the
+  rest. The runtime gained `dynago.BatchWrite`.
+- Indexes and counters keyed by each element of a `string_set`, as unique constraints already
+  were: `pk: "USER#{userId}#LABEL#{labelIds}"` gives a thread a copy in each of its labels' lists,
+  and `sk: "COUNTS#LABEL#{labelIds}"` a count in each label's counter item, all maintained in the
+  write's transaction. Such an index is a copy. Queries and counter keys take one element
+  (`LabelIDsElem`).
+- A requirement can create its item: `ensure: { subject: "{subject}" }` on a `requires` entry
+  creates the target when it is absent, in the write's transaction, with those fields and the
+  entry's `set`, `add` and `patch` applied, and with the counters, claims and copies a create of
+  it writes. A parent and its first child are written together, and two first children racing
+  settle between themselves.
+- A requirement can do more to its item than assign: `add: { messageCount: 1 }` adds to an int
+  field (atomically, so concurrent writes all count), and `patch: { hasAttachments:
+  "{hasAttachments}" }` sets a field from the writing entity's only when that has a value,
+  leaving it alone otherwise. Both maintain the item's counters, copies and index keys as `set`
+  does. The runtime's `dynago.Set` gained `Add`.
+- `matches` on an index with a `where`: the share of the entity's items that satisfy it. The
+  analysis sizes the index's partitions, storage and traffic with it, and the writes that maintain
+  it pay for the entry in that share of their calls.
+- Conditions can exclude a value or list several: `where: { mailbox: { not: trash } }`,
+  `when: { mailbox: { in: [inbox, archived] } }`. They work wherever a condition does: an index's
+  and a counter value's `where`, a write's `when`, and a require's `when` (where `not` may also
+  name a field of the writing entity). A `when` using one doesn't pin the state the write starts
+  from, so a write that moves a counter or an index entry on that field reads the item first.
+  The runtime's `dynago.Cond` gained `Not` and `In` for them.
+- An `accept` on an entity also covers the rule's findings about what the entity declares: its
+  fields, indexes, constraints, counters, reads and writes. An entity whose fields are all copies,
+  for one reason, states the reason once, and the model document lists it once. An acceptance on
+  the object itself takes precedence; one that matches nothing under the entity is still an error.
+- When a shape changes under the version the lock recorded, and the lock holds only a first design
+  (generation 1, every entity at version 1), the error also says what to do if no table exists
+  yet: delete the lock file and generate again. The schema-changes guide and getting-started say
+  when that is right.
+
+### Changed
+
+- Go names keep the capitals of an initialism in the plural: a field `labelIds` generates
+  `LabelIDs`, where it generated `LabelIds`, and likewise `imageUrls` → `ImageURLs`. After
+  regenerating, rename the uses of the affected names in your code; the compiler finds them.
+  Stored attribute names don't change.
 
 ### Fixed
 
+- A sparse index (one with a `where`) was sized, and its writes priced, as if every item of the
+  entity were in it, and reported as fact: it could be the model document's largest partition
+  while holding a sliver of the items. Now a write's `when` and `set` decide what it does to the
+  index where they can: a write that takes the item out of the index removes one entry (it was
+  costed as a delete and a put), and one that can't match doesn't touch it. Where the write
+  doesn't say, the index's `matches` share is used, and without one the numbers are marked as
+  upper bounds: "at most" in the partition table, worded so in the `low-cardinality-key` finding,
+  and kept out of the summary's largest and busiest partition. Estimated costs and transaction
+  sizes of existing schemas can go down as a result.
 - A `volume.by` naming an entity further up the parent chain (a draft's spread `by: User`, where
   drafts are counted per thread and threads per user) was ignored: the partitions keyed by that
   entity were sized from the chain, whose largest value multiplies the most skewed step by the
@@ -24,6 +86,10 @@ format, the generated code and the runtime API; the changelog says how to move.
   refused with `dynago.ErrInvalidKey` by every read and write, before any request is made. It used
   to come back as DynamoDB's `ValidationException`, which callers matching `ErrInvalidKey` for bad
   input didn't catch. Index key attributes are not checked yet.
+- `EnsureTable` looks before it changes anything (`DescribeTable`, `DescribeTimeToLive`), so calling
+  it at every start makes no failing request once the table exists. It used to send `CreateTable`
+  and `UpdateTimeToLive` every time and ignore their errors, and against DynamoDB Local each of
+  those errors made the AWS SDK log a warning.
 
 ## [0.1.0] - 2026-09-30
 

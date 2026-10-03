@@ -14,6 +14,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/nicklanng/dynago/internal/cost"
 	"github.com/nicklanng/dynago/internal/gen/infra"
 	"github.com/nicklanng/dynago/internal/schema"
 )
@@ -290,6 +291,7 @@ func (g *gen) entity(e *schema.Entity) {
 
 	g.views(e)
 	g.counters(e)
+	g.counterEntries(e)
 	g.limits(e)
 	if e.HasDerived() {
 		g.derived(e)
@@ -466,7 +468,11 @@ func (g *gen) counters(e *schema.Entity) {
 		g.p("// %sKey identifies %s %s counter.", c.GoName, article(c.GoName), c.GoName)
 		g.p("type %sKey struct {", c.GoName)
 		for _, f := range c.KeyFields() {
-			g.p("%s %s", f.GoName, goType(e, f))
+			name, typ := keyMember(e, f)
+			if f == c.Set {
+				g.p("// %s is one element of %s: each has its own counter item.", name, f.Name)
+			}
+			g.p("%s %s", name, typ)
 		}
 		g.p("}")
 		g.p("")
@@ -532,11 +538,23 @@ func (g *gen) derived(e *schema.Entity) {
 		}
 		g.p("// counter %s", c.Name)
 		g.p("if %s {", orTrue(conds))
-		pk := tmplExpr(e, c.PK, "e")
+		vals := elemVals(c.KeyFields(), c.Set, "e", "elem")
+		if c.Set != nil {
+			// One counter item per element. Elements that render the same key count once.
+			g.p("counted := map[dynago.Key]bool{}")
+			g.p("for _, elem := range e.%s {", c.Set.GoName)
+		}
+		pk := tmplExprVals(e, c.PK, vals)
 		if c.Shards > 1 {
 			pk = fmt.Sprintf("dynago.ShardPK(%s, owner, %d)", pk, c.Shards)
 		}
-		g.p("k := dynago.Key{PK: %s, SK: %s}", pk, tmplExpr(e, c.SK, "e"))
+		g.p("k := dynago.Key{PK: %s, SK: %s}", pk, tmplExprVals(e, c.SK, vals))
+		if c.Set != nil {
+			g.p("if elem == \"\" || counted[k] {")
+			g.p("continue")
+			g.p("}")
+			g.p("counted[k] = true")
+		}
 		for _, v := range c.Values {
 			amount := "1"
 			if v.Sum != nil {
@@ -565,6 +583,9 @@ func (g *gen) derived(e *schema.Entity) {
 			} else {
 				g.p("%s", stmt)
 			}
+		}
+		if c.Set != nil {
+			g.p("}")
 		}
 		g.p("}")
 	}
@@ -601,7 +622,19 @@ func (g *gen) derived(e *schema.Entity) {
 		}
 		g.p("// copy index %s", ix.Name)
 		g.p("if %s {", orTrue(conds))
-		g.p("k := dynago.Key{PK: %s, SK: %s}", tmplExpr(e, ix.PK, "e"), tmplExpr(e, ix.SK, "e"))
+		vals := elemVals(templateFields(ix.PK, ix.SK, true), ix.Set, "e", "elem")
+		if ix.Set != nil {
+			// One copy per element. Elements that render the same key share one copy.
+			g.p("copied := map[dynago.Key]bool{}")
+			g.p("for _, elem := range e.%s {", ix.Set.GoName)
+		}
+		g.p("k := dynago.Key{PK: %s, SK: %s}", tmplExprVals(e, ix.PK, vals), tmplExprVals(e, ix.SK, vals))
+		if ix.Set != nil {
+			g.p("if elem == \"\" || copied[k] {")
+			g.p("continue")
+			g.p("}")
+			g.p("copied[k] = true")
+		}
 		var inner string
 		if ix.ReturnsEntity() {
 			inner = fmt.Sprintf("%s: *e", e.GoName)
@@ -614,6 +647,9 @@ func (g *gen) derived(e *schema.Entity) {
 		}
 		g.p("d = append(d, dynago.Derived{Kind: dynago.KindCopy, Key: k, Type: %q, Item: &%s%sCopy{%s, PK: k.PK, SK: k.SK, T: %q, V: %sVersion}, Created: dynago.FmtStamp(e.stamps.Created)})",
 			e.Name+"."+ix.Name, lo, ix.GoName, inner, e.Name+"."+ix.Name, lo)
+		if ix.Set != nil {
+			g.p("}")
+		}
 		g.p("}")
 	}
 	g.p("return d")
@@ -625,6 +661,14 @@ func (g *gen) derived(e *schema.Entity) {
 
 func (g *gen) access(a *schema.Access) {
 	e := a.Entity
+	switch {
+	case a.Kind == schema.AccessGet && a.Batch > 0:
+		g.getBatch(a)
+		return
+	case a.Kind == schema.AccessCounter && a.All:
+		g.counterAll(a)
+		return
+	}
 	switch a.Kind {
 	case schema.AccessGet:
 		g.docComment(a.GoName, a.Doc, fmt.Sprintf("reads %s %s by primary key with one %s GetItem.", article(e.Name), e.Name, consistency(a.Consistent)))
@@ -649,6 +693,154 @@ func (g *gen) access(a *schema.Access) {
 	case schema.AccessScan:
 		g.scan(a)
 	}
+}
+
+// getBatch emits a read of several items by their keys.
+func (g *gen) getBatch(a *schema.Access) {
+	e := a.Entity
+	lo := lowerFirst(e.GoName)
+	gone := "A key with no item is left out"
+	if e.TTL != nil {
+		gone = "A key with no item, or an expired one, is left out"
+	}
+	g.docComment(a.GoName, a.Doc, fmt.Sprintf("reads the %s with the given keys, with one %s BatchGetItem per 100 keys. %s, so the result can be shorter than keys; the others come back in the order of keys, and a key given twice is returned once.",
+		schema.Plural(e.Name), consistency(a.Consistent), gone))
+	g.p("func (s *%sStore) %s(ctx context.Context, keys []%sKey) ([]%s, error) {", e.GoName, a.GoName, e.GoName, e.GoName)
+	g.p("ks := make([]dynago.Key, len(keys))")
+	g.p("for i, k := range keys {")
+	g.p("key, err := k.dynamoKey()")
+	g.p("if err != nil {")
+	g.p("return nil, err")
+	g.p("}")
+	g.p("ks[i] = key")
+	g.p("}")
+	g.p("raws, err := dynago.GetBatch(ctx, s.t, ks, %t)", a.Consistent)
+	g.p("if err != nil {")
+	g.p("return nil, err")
+	g.p("}")
+	if e.TTL == nil {
+		g.p("return %sDecodeAll(raws)", lo)
+		g.p("}")
+		g.p("")
+		return
+	}
+	g.p("out := make([]%s, 0, len(raws))", e.GoName)
+	g.p("now := dynago.Now()")
+	g.p("for _, raw := range raws {")
+	g.p("it, err := %sDecode(raw)", lo)
+	g.p("if err != nil {")
+	g.p("return nil, err")
+	g.p("}")
+	g.p("// DynamoDB deletes expired items lazily, often hours later: treat them as gone.")
+	g.p("if !dynago.Expired(it.TTL, now) {")
+	g.p("out = append(out, it.%s)", e.GoName)
+	g.p("}")
+	g.p("}")
+	g.p("return out, nil")
+	g.p("}")
+	g.p("")
+}
+
+// counterEntries emits, once per counter read with all, the type pairing a counter item with the
+// key that identifies it.
+func (g *gen) counterEntries(e *schema.Entity) {
+	for _, c := range e.Counters {
+		used := false
+		for _, oe := range g.m.Entities {
+			for _, a := range oe.Access {
+				used = used || (a.Counter == c && a.All)
+			}
+		}
+		if !used {
+			continue
+		}
+		g.p("// %sEntry is one %s counter item, with the key that identifies it.", c.GoName, c.Name)
+		g.p("type %sEntry struct {", c.GoName)
+		g.p("Key %sKey", c.GoName)
+		g.p("%s", c.GoName)
+		g.p("}")
+		g.p("")
+	}
+}
+
+// counterAll emits a read of every item of a counter in one partition: a Query of the counter's
+// sort key prefix, with each item's key read back from its sort key.
+func (g *gen) counterAll(a *schema.Access) {
+	c := a.Counter
+	e := c.Entity // the counter's fields belong to the entity it counts
+	qt := a.Entity.GoName + a.GoName + "Query"
+	prefix := c.SK.LiteralPrefix()
+	g.p("// %s selects the partition for %s.%s.", qt, a.Entity.Name, a.Name)
+	g.p("type %s struct {", qt)
+	for _, f := range c.PK.Fields {
+		name, typ := keyMember(e, f)
+		g.p("%s %s", name, typ)
+	}
+	g.p("}")
+	g.p("")
+	g.docComment(a.GoName, a.Doc, fmt.Sprintf("returns one page of the %s counters of a partition, one for each %s something has counted, in key order, with exactly one %s Query (default %d, max %d items). It returns the cursor for the next page, or \"\" at the end.",
+		c.Name, fieldList(c.ItemFields()), consistency(a.Consistent), a.Page, a.MaxPage))
+	g.p("func (s *%sStore) %s(ctx context.Context, q %s, page dynago.Page) ([]%sEntry, string, error) {", a.Entity.GoName, a.GoName, qt, c.GoName)
+	g.keyGuards(e, c.PK.Fields, "q", fmt.Sprintf("return nil, \"\", fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", a.Name, fieldList(c.PK.Fields)), "return nil, \"\", err")
+	g.p("pk := %s", tmplExprVals(e, c.PK, keyVals(e, c.PK.Fields, "q")))
+	sum := sha256.Sum256([]byte(strings.Join([]string{c.Name, c.PK.Raw, c.SK.Raw}, "\x00")))
+	spec := []string{
+		fmt.Sprintf("Scope: %q + pk", fmt.Sprintf("%s.%s#%s\x00", a.Entity.Name, a.Name, hex.EncodeToString(sum[:4]))),
+		"PK: pk", `PKAttr: "PK"`, `SKAttr: "SK"`,
+		fmt.Sprintf("Prefix: %q", prefix),
+		fmt.Sprintf("PageSize: %d", a.Page),
+		fmt.Sprintf("MaxPage: %d", a.MaxPage),
+	}
+	if a.Consistent {
+		spec = append(spec, "Consistent: true")
+	}
+	g.p("var rows []struct {")
+	g.p("SK string `dynamo:\"SK\"`")
+	g.p("%s", c.GoName)
+	g.p("}")
+	g.p("next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{%s}, page, &rows)", strings.Join(spec, ", "))
+	g.p("if err != nil {")
+	g.p("return nil, \"\", err")
+	g.p("}")
+	// The literal parts of the sort key, around its placeholders.
+	var literals []string
+	var placeholders []string
+	lit := ""
+	for _, sg := range c.SK.Segments {
+		if sg.IsField() {
+			literals = append(literals, strconv.Quote(lit))
+			placeholders = append(placeholders, sg.Field)
+			lit = ""
+			continue
+		}
+		lit += sg.Literal
+	}
+	literals = append(literals, strconv.Quote(lit))
+	var kv []string
+	for _, f := range c.PK.Fields {
+		name, _ := keyMember(e, f)
+		kv = append(kv, fmt.Sprintf("%s: q.%s", name, name))
+	}
+	for _, f := range c.ItemFields() {
+		v := fmt.Sprintf("parts[%d]", slices.Index(placeholders, f.Name))
+		if f.Type == schema.TypeEnum {
+			v = goType(e, f) + "(" + v + ")"
+		}
+		name, _ := keyMember(e, f)
+		kv = append(kv, fmt.Sprintf("%s: %s", name, v))
+	}
+	g.p("out := make([]%sEntry, 0, len(rows))", c.GoName)
+	g.p("for _, row := range rows {")
+	g.p("// A counter item stores no fields: its sort key says which one it is.")
+	g.p("parts, ok := dynago.SplitKey(row.SK, %s)", strings.Join(literals, ", "))
+	g.p("if !ok {")
+	g.p("return nil, \"\", fmt.Errorf(\"dynago: %s item with sort key %%q, which doesn't fit %s\", row.SK)", c.Name, strings.ReplaceAll(c.SK.Raw, "%", "%%"))
+	g.p("}")
+	g.p("out = append(out, %sEntry{Key: %sKey{%s}, %s: row.%s})", c.GoName, c.GoName, strings.Join(kv, ", "), c.GoName, c.GoName)
+	g.p("}")
+	g.p("return out, next, nil")
+	g.p("}")
+	g.p("")
 }
 
 func (g *gen) scan(a *schema.Access) {
@@ -768,7 +960,104 @@ func queryShape(a *schema.Access) string {
 	return hex.EncodeToString(sum[:4])
 }
 
+// partitionField names the field of a partition read's result that holds an entity's items.
+func partitionField(oe *schema.Entity) string {
+	if oe.Singleton() {
+		return oe.GoName
+	}
+	return schema.Plural(oe.GoName)
+}
+
+// partitionRead emits a read of several entities' items under one partition key: one Query of the
+// whole partition, its items sorted by kind.
+func (g *gen) partitionRead(a *schema.Access) {
+	e := a.Entity
+	rt, qt := e.GoName+a.GoName, e.GoName+a.GoName+"Query"
+	var names, types []string
+	ttl := false
+	for _, oe := range a.Of {
+		names = append(names, oe.Name)
+		types = append(types, strconv.Quote(oe.Name))
+		ttl = ttl || oe.TTL != nil
+	}
+	g.p("// %s is one page of what %s.%s reads: the page's items of each kind.", rt, e.Name, a.Name)
+	g.p("type %s struct {", rt)
+	for _, oe := range a.Of {
+		if oe.Singleton() {
+			g.p("// %s is the partition's one %s, or nil if this page doesn't hold it.", oe.GoName, oe.Name)
+			g.p("%s *%s", oe.GoName, oe.GoName)
+			continue
+		}
+		g.p("%s []%s", partitionField(oe), oe.GoName)
+	}
+	g.p("}")
+	g.p("")
+	g.p("// %s selects the partition for %s.%s.", qt, e.Name, a.Name)
+	g.p("type %s struct {", qt)
+	for _, f := range e.PK.Fields {
+		g.p("%s %s", f.GoName, goType(e, f))
+	}
+	g.p("}")
+	g.p("")
+	order := "ascending"
+	if a.Desc {
+		order = "descending"
+	}
+	g.docComment(a.GoName, a.Doc, fmt.Sprintf("returns one page of a partition's %s items, each kind in its own field, with exactly one %s Query (default %d, max %d items evaluated). The partition's items are read in %s sort key order, every kind of them, and these kinds kept: a page can hold few items, or none, and still have a next cursor, and a kind's items can span pages. Keep going until the cursor is \"\" for all of them.",
+		schema.JoinAnd(names), consistency(a.Consistent), a.Page, a.MaxPage, order))
+	g.p("func (s *%sStore) %s(ctx context.Context, q %s, page dynago.Page) (%s, string, error) {", e.GoName, a.GoName, qt, rt)
+	g.presenceGuard(e.PK.Fields, "q", fmt.Sprintf("return %s{}, \"\", fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", rt, a.Name, fieldList(e.PK.Fields)))
+	g.keyPartChecks(e.PK.Fields, func(f *schema.Field) string { return "q." + f.GoName }, fmt.Sprintf("return %s{}, \"\", err", rt))
+	g.p("pk := %s", tmplExpr(e, e.PK, "q"))
+	sum := sha256.Sum256([]byte(strings.Join(append([]string{e.PK.Raw, strconv.FormatBool(a.Desc)}, names...), "\x00")))
+	spec := []string{
+		fmt.Sprintf("Scope: %q + pk", fmt.Sprintf("%s.%s#%s\x00", e.Name, a.Name, hex.EncodeToString(sum[:4]))),
+		"PK: pk", `PKAttr: "PK"`, `SKAttr: "SK"`,
+		fmt.Sprintf("PageSize: %d", a.Page),
+		fmt.Sprintf("MaxPage: %d", a.MaxPage),
+		fmt.Sprintf("Types: []string{%s}", strings.Join(types, ", ")),
+	}
+	if a.Desc {
+		spec = append(spec, "Desc: true")
+	}
+	if a.Consistent {
+		spec = append(spec, "Consistent: true")
+	}
+	if ttl {
+		spec = append(spec, fmt.Sprintf("TTLAttr: %q", g.m.Table.TTLAttr))
+	}
+	g.p("var raws []dynamo.Item")
+	g.p("next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{%s}, page, &raws)", strings.Join(spec, ", "))
+	g.p("if err != nil {")
+	g.p("return %s{}, \"\", err", rt)
+	g.p("}")
+	g.p("var out %s", rt)
+	g.p("for _, raw := range raws {")
+	g.p("switch dynago.ItemType(raw) {")
+	for _, oe := range a.Of {
+		g.p("case %q:", oe.Name)
+		g.p("it, err := %sDecode(raw)", lowerFirst(oe.GoName))
+		g.p("if err != nil {")
+		g.p("return %s{}, \"\", err", rt)
+		g.p("}")
+		if oe.Singleton() {
+			g.p("out.%s = &it.%s", oe.GoName, oe.GoName)
+		} else {
+			g.p("out.%s = append(out.%s, it.%s)", partitionField(oe), partitionField(oe), oe.GoName)
+		}
+	}
+	g.p("}")
+	g.p("}")
+	g.p("return out, next, nil")
+	g.p("}")
+	g.p("")
+}
+
 func (g *gen) query(a *schema.Access) {
+	if a.Of != nil {
+		g.partitionRead(a)
+		return
+	}
 	e := a.Entity
 	qt := e.GoName + a.GoName + "Query"
 	pk := a.QueryPK()
@@ -797,7 +1086,11 @@ func (g *gen) query(a *schema.Access) {
 	g.p("// %s selects the partition for %s.%s.", qt, e.Name, a.Name)
 	g.p("type %s struct {", qt)
 	for _, f := range pk.Fields {
-		g.p("%s %s", f.GoName, goType(e, f))
+		name, typ := keyMember(e, f)
+		if f.Type == schema.TypeStringSet {
+			g.p("// %s is one element of %s: the %s that have it are in its partition.", name, f.Name, schema.Plural(e.Name))
+		}
+		g.p("%s %s", name, typ)
 	}
 	if a.Range != nil {
 		g.p("// From and To bound %s inclusively; nil leaves that end open.", a.Range.Name)
@@ -812,9 +1105,8 @@ func (g *gen) query(a *schema.Access) {
 	g.docComment(a.GoName, a.Doc, fmt.Sprintf("returns one page of %s items from %s, %s by %q, with exactly one %s Query (default %d, max %d items). It returns the cursor for the next page, or \"\" at the end.",
 		e.Name, where, order, sk.Raw, consistency(a.Consistent), a.Page, a.MaxPage))
 	g.p("func (s *%sStore) %s(ctx context.Context, q %s, page dynago.Page) ([]%s, string, error) {", e.GoName, a.GoName, qt, result)
-	g.presenceGuard(pk.Fields, "q", fmt.Sprintf("return nil, \"\", fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", a.Name, fieldList(pk.Fields)))
-	g.keyPartChecks(pk.Fields, func(f *schema.Field) string { return "q." + f.GoName }, "return nil, \"\", err")
-	g.p("pk := %s", tmplExpr(e, pk, "q"))
+	g.keyGuards(e, pk.Fields, "q", fmt.Sprintf("return nil, \"\", fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", a.Name, fieldList(pk.Fields)), "return nil, \"\", err")
+	g.p("pk := %s", tmplExprVals(e, pk, keyVals(e, pk.Fields, "q")))
 	spec := []string{
 		// The scope ties a cursor to this query's shape and its partition, not to the schema
 		// version: a version that doesn't change the query keeps cursors working through a deploy.
@@ -907,19 +1199,19 @@ func (g *gen) counterRead(a *schema.Access) {
 	g.docComment(a.GoName, a.Doc, fmt.Sprintf("reads the %s counter (%s). A counter nothing has touched reads as zero.",
 		c.Name, readCost(c, a.Consistent)))
 	g.p("func (s *%sStore) %s(ctx context.Context, k %sKey) (%s, error) {", a.Entity.GoName, a.GoName, c.GoName, c.GoName)
-	g.presenceGuard(c.KeyFields(), "k", fmt.Sprintf("return %s{}, fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", c.GoName, c.Name, fieldList(c.KeyFields())))
-	g.keyPartChecks(c.KeyFields(), func(f *schema.Field) string { return "k." + f.GoName }, fmt.Sprintf("return %s{}, err", c.GoName))
+	g.keyGuards(e, c.KeyFields(), "k", fmt.Sprintf("return %s{}, fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", c.GoName, c.Name, fieldList(c.KeyFields())), fmt.Sprintf("return %s{}, err", c.GoName))
+	vals := keyVals(e, c.KeyFields(), "k")
 	if c.Shards <= 1 {
 		g.p("var out %s", c.GoName)
-		g.p("_, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: %s, SK: %s}, %t, &out)", tmplExpr(e, c.PK, "k"), tmplExpr(e, c.SK, "k"), a.Consistent)
+		g.p("_, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: %s, SK: %s}, %t, &out)", tmplExprVals(e, c.PK, vals), tmplExprVals(e, c.SK, vals), a.Consistent)
 		g.p("return out, err")
 		g.p("}")
 		g.p("")
 		return
 	}
-	g.p("sk := %s", tmplExpr(e, c.SK, "k"))
+	g.p("sk := %s", tmplExprVals(e, c.SK, vals))
 	g.p("var keys []dynago.Key")
-	g.p("for _, pk := range dynago.ShardPKs(%s, %d) {", tmplExpr(e, c.PK, "k"), c.Shards)
+	g.p("for _, pk := range dynago.ShardPKs(%s, %d) {", tmplExprVals(e, c.PK, vals), c.Shards)
 	g.p("keys = append(keys, dynago.Key{PK: pk, SK: sk})")
 	g.p("}")
 	g.p("var parts []%s", c.GoName)
@@ -1161,6 +1453,93 @@ func (g *gen) applyChanges(w *schema.Write) {
 	}
 }
 
+// updateBatch emits an update of several items: read together and written several to a
+// transaction, so that what they share (a counter item) is written once per transaction.
+func (g *gen) updateBatch(w *schema.Write, argType string, hasV bool) {
+	e := w.Entity
+	lo := lowerFirst(e.GoName)
+	size := schema.BatchSize(cost.BatchItems(g.m, w))
+	var desc strings.Builder
+	fmt.Fprintf(&desc, "updates %s of several %s, the same way", fieldList(w.Changed()), schema.Plural(e.Name))
+	if len(w.When) > 0 {
+		fmt.Fprintf(&desc, ", each when %s", predText(w.When))
+	}
+	fmt.Fprintf(&desc, ". The items are read with one consistent BatchGetItem and written up to %d to a transaction, each guarded by its revision", size)
+	if e.HasDerived() {
+		fmt.Fprintf(&desc, "; a counter item several of them change is updated once per transaction.%s", maintains(e))
+	} else {
+		desc.WriteString(".")
+	}
+	desc.WriteString(" Each transaction is atomic; the batch is not. It returns nil if every item was written, and otherwise a *dynago.BatchError naming those that were not, by their place in keys, each with its error")
+	fmt.Fprintf(&desc, " (Err%sNotFound", e.GoName)
+	if len(w.When) > 0 {
+		fmt.Fprintf(&desc, ", Err%s%sPrecondition", e.GoName, w.GoName)
+	}
+	desc.WriteString(", or what refused its transaction): the others were written. A key given twice is written once.")
+	g.docComment(w.GoName, w.Doc, desc.String())
+	vparam := ""
+	if hasV {
+		vparam = fmt.Sprintf(", v %s", argType)
+	}
+	g.p("func (s *%sStore) %s(ctx context.Context, keys []%sKey%s) error {", e.GoName, w.GoName, e.GoName, vparam)
+	g.requiredChecks(e, w.Args, "v", "return err")
+	for _, f := range w.Patch {
+		if f.Required {
+			g.p("if v.%s != nil && %s {", f.GoName, zeroCond(f, "*v."+f.GoName))
+			g.p("return fmt.Errorf(\"%%w: %s.%s\", dynago.ErrFieldRequired)", e.Name, f.Name)
+			g.p("}")
+		}
+	}
+	g.changedKeyPartChecks(w)
+	g.p("ks := make([]dynago.Key, len(keys))")
+	g.p("for i, k := range keys {")
+	g.p("key, err := k.dynamoKey()")
+	g.p("if err != nil {")
+	g.p("return err")
+	g.p("}")
+	g.p("ks[i] = key")
+	g.p("}")
+	if e.TTL != nil {
+		g.p("now := dynago.Now()")
+	}
+	g.p("return dynago.BatchWrite(ctx, s.db, s.t, ks, %d, Err%sNotFound, func(key dynago.Key, raw dynamo.Item) (dynago.Op, dynago.Change, error) {", size, e.GoName)
+	g.p("it, err := %sDecode(raw)", lo)
+	g.p("if err != nil {")
+	g.p("return dynago.Op{}, dynago.Change{}, err")
+	g.p("}")
+	if e.TTL != nil {
+		g.p("// DynamoDB deletes expired items lazily, often hours later: treat them as gone.")
+		g.p("if dynago.Expired(it.TTL, now) {")
+		g.p("return dynago.Op{}, dynago.Change{}, Err%sNotFound", e.GoName)
+		g.p("}")
+	}
+	g.p("before := &it.%s", e.GoName)
+	if len(w.When) > 0 {
+		g.p("if %s {", notWhereExpr(e, w.When, "before"))
+		g.p("return dynago.Op{}, dynago.Change{}, Err%s%sPrecondition", e.GoName, w.GoName)
+		g.p("}")
+	}
+	g.p("after := before.clone()")
+	g.applyChanges(w)
+	g.p("// Keep attributes this code doesn't know: a newer compatible version may have written them.")
+	g.p("item, err := dynago.KeepUnknown(it.raw, %sKnown, %sToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))", lo, lo)
+	g.p("if err != nil {")
+	g.p("return dynago.Op{}, dynago.Change{}, err")
+	g.p("}")
+	change := "dynago.Change{}"
+	if e.HasDerived() {
+		lim := ""
+		if hasLimitArgs(e) {
+			lim = fmt.Sprintf(", %sLimits{}", lo)
+		}
+		change = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(before, key%s), After: %sDerived(&after, key%s)}", lo, lim, lo, lim)
+	}
+	g.p("return dynago.PutOp(key, s.t.Put(item).If(\"$ = ?\", \"_rev\", it.Rev), dynago.ErrStale), %s, nil", change)
+	g.p("})")
+	g.p("}")
+	g.p("")
+}
+
 func (g *gen) update(w *schema.Write) {
 	e := w.Entity
 	lo := lowerFirst(e.GoName)
@@ -1180,6 +1559,10 @@ func (g *gen) update(w *schema.Write) {
 		}
 		g.p("}")
 		g.p("")
+	}
+	if w.Batch > 0 {
+		g.updateBatch(w, argType, hasV)
+		return
 	}
 	param, conv := g.limitsArg(w)
 	slowPatch := patchFastPath(w)
@@ -1254,7 +1637,7 @@ func (g *gen) update(w *schema.Write) {
 	}
 	var conds []string
 	for _, p := range w.When {
-		conds = append(conds, fmt.Sprintf("{Attr: %q, Value: %s, Zero: %t}", p.Field.Attr, literal(e, p.Field, p.Value), isZeroValue(p.Value)))
+		conds = append(conds, condLit(e, p, ""))
 	}
 	when := "nil"
 	if len(conds) > 0 {
@@ -1303,7 +1686,7 @@ func (g *gen) update(w *schema.Write) {
 	g.p("}")
 	g.p("before := &it.%s", e.GoName)
 	if len(w.When) > 0 {
-		g.p("if %s {", negate(whereExpr(e, w.When, "before")))
+		g.p("if %s {", notWhereExpr(e, w.When, "before"))
 		g.p("return %s", precond)
 		g.p("}")
 	}
@@ -1386,7 +1769,10 @@ func (g *gen) transition(w *schema.Write, when, beforeConv, conv string) {
 		known = append(known, fmt.Sprintf("%s: k.%s", f.GoName, f.GoName))
 	}
 	for _, p := range w.When {
-		known = append(known, fmt.Sprintf("%s: %s", p.Field.GoName, literal(e, p.Field, p.Value)))
+		// `not` and `in` pin nothing: nothing derived from the field changes (see transitionable).
+		if p.Pins() {
+			known = append(known, fmt.Sprintf("%s: %s", p.Field.GoName, literal(e, p.Field, p.Value)))
+		}
 	}
 	g.p("// The derived changes depend only on the key and the state `when` pins, so try without")
 	g.p("// reading. ReturnVersion and dynago.From need the read path.")
@@ -1681,7 +2067,7 @@ func typeDoc(name, doc, fallback string) string {
 
 func hasVersionedWrites(e *schema.Entity) bool {
 	for _, w := range e.Writes {
-		if w.Kind != schema.WriteCreate {
+		if w.Kind != schema.WriteCreate && w.Batch == 0 {
 			return true
 		}
 	}
@@ -1693,7 +2079,7 @@ func (g *gen) versionHelpers(e *schema.Entity) {
 	lo := lowerFirst(e.GoName)
 	fast, slow := false, false
 	for _, w := range e.Writes {
-		if w.Kind == schema.WriteCreate {
+		if w.Kind == schema.WriteCreate || w.Batch > 0 {
 			continue
 		}
 		if w.ReadFirst {
@@ -1951,20 +2337,7 @@ func counterValueText(v *schema.CounterValue) string {
 	return b.String()
 }
 
-func predText(ps []*schema.Pred) string {
-	var parts []string
-	for _, p := range ps {
-		parts = append(parts, fmt.Sprintf("%s = %v", p.Field.Name, fmtValue(p.Value)))
-	}
-	return strings.Join(parts, " and ")
-}
-
-func fmtValue(v any) string {
-	if s, ok := v.(string); ok {
-		return strconv.Quote(s)
-	}
-	return fmt.Sprint(v)
-}
+func predText(ps []*schema.Pred) string { return schema.PredText(ps, "") }
 
 func goType(e *schema.Entity, f *schema.Field) string {
 	switch f.Type {
@@ -2108,7 +2481,7 @@ func negate(cond string) string {
 			return strings.Join(terms, " || ")
 		}
 	}
-	if !strings.Contains(cond, "&&") {
+	if !strings.Contains(cond, "&&") && !strings.Contains(cond, "||") {
 		switch {
 		case strings.HasPrefix(cond, "!") && !strings.HasPrefix(cond, "!("):
 			return strings.TrimPrefix(cond, "!")
@@ -2131,20 +2504,58 @@ func orTrue(conds []string) string {
 }
 
 func whereExpr(e *schema.Entity, ps []*schema.Pred, recv string) string {
-	var conds []string
-	for _, p := range ps {
-		x := recv + "." + p.Field.GoName
-		if b, ok := p.Value.(bool); ok {
-			if b {
-				conds = append(conds, x)
-			} else {
-				conds = append(conds, "!"+x)
-			}
-			continue
-		}
-		conds = append(conds, fmt.Sprintf("%s == %s", x, literal(e, p.Field, p.Value)))
+	return predsExpr(ps, false, func(p *schema.Pred) (string, func(any) string) {
+		return recv + "." + p.Field.GoName, func(v any) string { return literal(e, p.Field, v) }
+	})
+}
+
+// notWhereExpr is the condition that some predicate fails.
+func notWhereExpr(e *schema.Entity, ps []*schema.Pred, recv string) string {
+	return predsExpr(ps, true, func(p *schema.Pred) (string, func(any) string) {
+		return recv + "." + p.Field.GoName, func(v any) string { return literal(e, p.Field, v) }
+	})
+}
+
+// predsExpr renders predicates as one Go condition: that all hold, or (negated) that one fails.
+// operand gives the expression each predicate tests and how to render a constant of its type.
+func predsExpr(ps []*schema.Pred, negated bool, operand func(*schema.Pred) (string, func(any) string)) string {
+	conds := make([]string, len(ps))
+	for i, p := range ps {
+		x, lit := operand(p)
+		conds[i] = predExpr(p, x, lit, negated, len(ps) > 1)
+	}
+	if negated {
+		return strings.Join(conds, " || ")
 	}
 	return strings.Join(conds, " && ")
+}
+
+// predExpr renders a predicate as a Go condition on the expression x, or its negation; lit renders
+// a constant of the field's type. A list is parenthesised when it is one term among others.
+func predExpr(p *schema.Pred, x string, lit func(v any) string, negated, among bool) string {
+	switch {
+	case p.In != nil:
+		op, join := "==", " || "
+		if negated {
+			op, join = "!=", " && "
+		}
+		alts := make([]string, len(p.In))
+		for i, v := range p.In {
+			alts[i] = fmt.Sprintf("%s %s %s", x, op, lit(v))
+		}
+		if among {
+			return "(" + strings.Join(alts, join) + ")"
+		}
+		return strings.Join(alts, join)
+	case p.Source == nil && p.Field.Type == schema.TypeBool:
+		if (p.Value.(bool) != p.Not) != negated {
+			return x
+		}
+		return "!" + x
+	case p.Not != negated:
+		return fmt.Sprintf("%s != %s", x, lit(p.Value))
+	}
+	return fmt.Sprintf("%s == %s", x, lit(p.Value))
 }
 
 // literal renders a constant of a field's type.
@@ -2270,8 +2681,9 @@ func lowerFirst(s string) string {
 		n++
 	}
 	// Lower a leading acronym as a unit, keeping the capital that starts the next word:
-	// "Registration" → "registration", "URLMap" → "urlMap", "API" → "api".
-	if n > 1 && n < len(r) {
+	// "Registration" → "registration", "URLMap" → "urlMap", "API" → "api". A plural initialism
+	// is lowered whole: "IDs" → "ids".
+	if n > 1 && n < len(r) && (r[n] != 's' || (n+1 < len(r) && !unicode.IsUpper(r[n+1]))) {
 		n--
 	}
 	for i := 0; i < n; i++ {
@@ -2343,6 +2755,75 @@ func comment(buf *bytes.Buffer, text string) {
 
 // uniqueVals maps the fields of a unique constraint to value expressions: recv's fields, and elem
 // for the set field.
+// A key struct (a counter's key, a query's partition) holds a set field as one element of it: the
+// key is for one of the items the set renders.
+
+// keyMember returns the name and Go type of a key struct's member for a field.
+func keyMember(e *schema.Entity, f *schema.Field) (name, typ string) {
+	if f.Type == schema.TypeStringSet {
+		return f.GoName + "Elem", "string"
+	}
+	return f.GoName, goType(e, f)
+}
+
+// keyVals maps each field to the Go expression of its member of the key struct recv.
+func keyVals(e *schema.Entity, fields []*schema.Field, recv string) map[string]string {
+	vals := map[string]string{}
+	for _, f := range fields {
+		name, _ := keyMember(e, f)
+		vals[f.Name] = recv + "." + name
+	}
+	return vals
+}
+
+// keyPresence returns a Go condition true when every sparse member of the key struct recv holds
+// a value, or "".
+func keyPresence(e *schema.Entity, fields []*schema.Field, recv string) string {
+	var conds []string
+	for _, f := range fields {
+		name, _ := keyMember(e, f)
+		c := present(f, recv+"."+name)
+		if f.Type == schema.TypeStringSet {
+			c = recv + "." + name + ` != ""`
+		}
+		if c != "" {
+			conds = append(conds, c)
+		}
+	}
+	return strings.Join(conds, " && ")
+}
+
+// keyGuards emits, for the key struct recv, an early return when a sparse member is empty, and
+// the separator checks of its members.
+func (g *gen) keyGuards(e *schema.Entity, fields []*schema.Field, recv, empty, ret string) {
+	if pc := keyPresence(e, fields, recv); pc != "" {
+		g.p("if %s {", negate(pc))
+		g.p("%s", empty)
+		g.p("}")
+	}
+	for _, f := range fields {
+		name, _ := keyMember(e, f)
+		if f.Type == schema.TypeStringSet {
+			g.keyPartCheck(f, recv+"."+name, ret)
+			continue
+		}
+		g.keyPartChecks([]*schema.Field{f}, func(*schema.Field) string { return recv + "." + name }, ret)
+	}
+}
+
+// elemVals maps each field to its Go expression over recv, with the set field (if any) taken
+// from the loop variable elem.
+func elemVals(fields []*schema.Field, set *schema.Field, recv, elem string) map[string]string {
+	vals := map[string]string{}
+	for _, f := range fields {
+		vals[f.Name] = recv + "." + f.GoName
+	}
+	if set != nil {
+		vals[set.Name] = elem
+	}
+	return vals
+}
+
 func uniqueVals(u *schema.Unique, recv, elem string) map[string]string {
 	vals := map[string]string{}
 	for _, f := range u.Fields {

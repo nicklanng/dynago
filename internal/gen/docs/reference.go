@@ -210,8 +210,15 @@ func (d *doc) entity(e *schema.Entity) {
 			if wc.Transactional {
 				atomic = fmt.Sprintf("transaction (%d items)", wc.MaxTxItems)
 			}
+			units := unitsText(wc.WRU)
+			if w.Batch > 0 {
+				reads = "yes (one consistent BatchGetItem per transaction)"
+				version = "—"
+				atomic = fmt.Sprintf("each transaction, not the batch: up to %d %s to one", wc.BatchSize, schema.Plural(e.Name))
+				units += fmt.Sprintf(" for %d %s", w.Batch, schema.Plural(e.Name))
+			}
 			d.p("| `%s` | %s | %s | %s | %s | %s | %s | %s |", w.Name, escape(writeText(w)), strings.Join(wc.Items, "<br>"),
-				reads, atomic, version, unitsText(wc.WRU), strings.Join(writeErrors(w), "<br>"))
+				reads, atomic, version, units, strings.Join(writeErrors(w), "<br>"))
 		}
 		d.p("")
 		d.docList(func(yield func(name, doc string)) {
@@ -349,6 +356,18 @@ func ttlAttr(m *schema.Model) string {
 }
 
 func readsText(a *schema.Access) string {
+	switch {
+	case a.Of != nil:
+		var kinds []string
+		for _, oe := range a.Of {
+			kinds = append(kinds, "`"+oe.Name+"`")
+		}
+		return fmt.Sprintf("the whole partition, keeping %s, page %d (max %d)", strings.Join(kinds, ", "), a.Page, a.MaxPage)
+	case a.Batch > 0:
+		return fmt.Sprintf("items by key, %d a call typically", a.Batch)
+	case a.All:
+		return fmt.Sprintf("every item of counter `%s` in a partition, page %d (max %d)", a.Counter.Name, a.Page, a.MaxPage)
+	}
 	switch a.Kind {
 	case schema.AccessGet:
 		return "item by key"
@@ -381,6 +400,9 @@ func keyCondition(a *schema.Access) string {
 	case schema.AccessGetUnique:
 		return fmt.Sprintf("`PK = %s`", a.Unique.PK.Raw)
 	case schema.AccessCounter:
+		if a.All {
+			return fmt.Sprintf("`PK = %s`, `begins_with(SK, %q)`", a.Counter.PK.Raw, a.Counter.SK.LiteralPrefix())
+		}
 		return fmt.Sprintf("`PK = %s`, `SK = %s`", a.Counter.PK.Raw, a.Counter.SK.Raw)
 	case schema.AccessScan:
 		return fmt.Sprintf("none: a Scan, filtered to `_t = %s`", e.Name)
@@ -392,6 +414,8 @@ func keyCondition(a *schema.Access) string {
 	cond := fmt.Sprintf("`%s = %s`", pkAttr, a.QueryPK().Raw)
 	sk, ok := a.QuerySK()
 	switch {
+	case a.Of != nil:
+		cond += ", filtered by `_t`"
 	case a.Range != nil:
 		cond += fmt.Sprintf(", `%s` between optional bounds on `%s`", skAttr, a.Range.Name)
 	case ok && sk.LiteralPrefix() != "":
@@ -415,6 +439,11 @@ func consistencyText(a *schema.Access) string {
 }
 
 func writeText(w *schema.Write) string {
+	if w.Batch > 0 {
+		one := *w
+		one.Batch = 0
+		return "of each of several items: " + writeText(&one)
+	}
 	switch w.Kind {
 	case schema.WriteCreate:
 		text := "create (fails if it exists)"
@@ -445,11 +474,7 @@ func writeText(w *schema.Write) string {
 func requiresText(w *schema.Write) string {
 	var parts []string
 	for _, rq := range w.Requires {
-		t := "requires " + rq.Condition(w.Entity.Name)
-		if eff := rq.Effect(w.Entity.Name); eff != "" {
-			t += " and " + eff
-		}
-		parts = append(parts, t)
+		parts = append(parts, rq.Sentence(w.Entity.Name, " and "))
 	}
 	if len(parts) == 0 {
 		return ""
@@ -515,7 +540,7 @@ func writeErrors(w *schema.Write) []string {
 			}
 		}
 	}
-	if w.Kind != schema.WriteCreate {
+	if w.Kind != schema.WriteCreate && w.Batch == 0 {
 		out = append(out, "`dynago.ErrVersionMismatch` (with a version)")
 	}
 	if w.VersionRequired {
@@ -523,6 +548,9 @@ func writeErrors(w *schema.Write) []string {
 	}
 	if w.ReadFirst {
 		out = append(out, "`dynago.ErrConflict` (after retries)")
+	}
+	if w.Batch > 0 {
+		out = append([]string{"`*dynago.BatchError`, holding for each item not written:"}, out...)
 	}
 	return out
 }
@@ -565,7 +593,7 @@ func projText(ix *schema.Index) string {
 func predText(ps []*schema.Pred) string {
 	var parts []string
 	for _, p := range ps {
-		parts = append(parts, fmt.Sprintf("`%s = %s`", p.Field.Name, value(p.Value)))
+		parts = append(parts, "`"+p.Text("")+"`")
 	}
 	return strings.Join(parts, " and ")
 }

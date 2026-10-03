@@ -66,18 +66,35 @@ func (s TableSpec) CreateTableInput(name string) *dynamodb.CreateTableInput {
 // EnsureTable creates the table if it does not exist, waits for it to become active and enables
 // TTL. It is meant for local development and tests; production tables belong in infrastructure
 // code (dynago generates Terraform for them).
+//
+// It looks before it changes anything, so calling it at every start makes no failing request once
+// the table exists.
 func EnsureTable(ctx context.Context, db *dynamo.DB, name string, spec TableSpec) error {
 	client := db.Client()
-	_, err := client.CreateTable(ctx, spec.CreateTableInput(name))
-	var inUse *types.ResourceInUseException
-	if err != nil && !errors.As(err, &inUse) {
-		return fmt.Errorf("dynago: create table %s: %w", name, err)
+	_, err := client.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(name)})
+	var missing *types.ResourceNotFoundException
+	switch {
+	case errors.As(err, &missing):
+		// Another process starting at the same moment may create it first.
+		var inUse *types.ResourceInUseException
+		if _, err := client.CreateTable(ctx, spec.CreateTableInput(name)); err != nil && !errors.As(err, &inUse) {
+			return fmt.Errorf("dynago: create table %s: %w", name, err)
+		}
+	case err != nil:
+		return fmt.Errorf("dynago: describe table %s: %w", name, err)
 	}
 	if err := db.Table(name).Wait(ctx); err != nil {
 		return fmt.Errorf("dynago: wait for table %s: %w", name, err)
 	}
 	if spec.TTLAttr == "" {
 		return nil
+	}
+	// If TTL can't be described (credentials without the permission), enabling it says the same.
+	if ttl, err := client.DescribeTimeToLive(ctx, &dynamodb.DescribeTimeToLiveInput{TableName: aws.String(name)}); err == nil {
+		if d := ttl.TimeToLiveDescription; d != nil && aws.ToString(d.AttributeName) == spec.TTLAttr &&
+			(d.TimeToLiveStatus == types.TimeToLiveStatusEnabled || d.TimeToLiveStatus == types.TimeToLiveStatusEnabling) {
+			return nil
+		}
 	}
 	_, err = client.UpdateTimeToLive(ctx, &dynamodb.UpdateTimeToLiveInput{
 		TableName: aws.String(name),

@@ -197,6 +197,7 @@ type RawIndex struct {
 	SK       string          `yaml:"sk"`
 	Project  RawProject      `yaml:"project"`
 	Where    Ordered[any]    `yaml:"where"`
+	Matches  *float64        `yaml:"matches"`
 	Doc      string          `yaml:"doc"`
 	Accept   Ordered[string] `yaml:"accept"`
 }
@@ -266,9 +267,15 @@ func (v *RawCounterValue) UnmarshalYAML(n *yaml.Node) error {
 
 // RawAccess declares a read. Short forms: `Get: get`.
 type RawAccess struct {
-	Get     *RawGet `yaml:"get"`
-	Query   string  `yaml:"query"`
-	Counter string  `yaml:"counter"`
+	Get *RawGet `yaml:"get"`
+	// Batch, with get: key, makes the read take several keys: the typical number per call.
+	Batch any    `yaml:"batch"`
+	Query string `yaml:"query"`
+	// Of, with query: partition, lists the entities of the partition the read returns.
+	Of      []string `yaml:"of"`
+	Counter string   `yaml:"counter"`
+	// All, with counter, reads every item of the counter in one partition with a Query.
+	All bool `yaml:"all"`
 	// Scan reads every item of the entity, a page at a time: a declared exception, with a reason.
 	Scan   bool   `yaml:"scan"`
 	Reason string `yaml:"reason"`
@@ -329,18 +336,20 @@ func (a *RawAccess) UnmarshalYAML(n *yaml.Node) error {
 
 // RawWrite declares a write. Short forms: `Create: create`, `Delete: delete`.
 type RawWrite struct {
-	Create     bool                `yaml:"create"`
-	Delete     bool                `yaml:"delete"`
-	Update     []string            `yaml:"update"`
-	Patch      []string            `yaml:"patch"`
-	Set        Ordered[any]        `yaml:"set"`
-	When       Ordered[any]        `yaml:"when"`
-	Requires   Ordered[RawRequire] `yaml:"requires"`
-	Versioned  string              `yaml:"versioned"`
-	Doc        string              `yaml:"doc"`
-	Rate       float64             `yaml:"rate"`
-	HotKeyRate float64             `yaml:"hot_key_rate"`
-	Accept     Ordered[string]     `yaml:"accept"`
+	Create   bool                `yaml:"create"`
+	Delete   bool                `yaml:"delete"`
+	Update   []string            `yaml:"update"`
+	Patch    []string            `yaml:"patch"`
+	Set      Ordered[any]        `yaml:"set"`
+	When     Ordered[any]        `yaml:"when"`
+	Requires Ordered[RawRequire] `yaml:"requires"`
+	// Batch makes an update take several keys: the typical number per call.
+	Batch      any             `yaml:"batch"`
+	Versioned  string          `yaml:"versioned"`
+	Doc        string          `yaml:"doc"`
+	Rate       float64         `yaml:"rate"`
+	HotKeyRate float64         `yaml:"hot_key_rate"`
+	Accept     Ordered[string] `yaml:"accept"`
 	isUpdate   bool
 }
 
@@ -480,6 +489,12 @@ type RawRequire struct {
 	When Ordered[any]    `yaml:"when"`
 	// Set changes the required item in the same transaction.
 	Set Ordered[any] `yaml:"set"`
+	// Ensure creates the required item when it is absent, with these fields (and set applied).
+	Ensure *Ordered[any] `yaml:"ensure"`
+	// Add adds to int fields of the required item.
+	Add Ordered[any] `yaml:"add"`
+	// Patch sets fields of the required item from this entity's fields, where those have a value.
+	Patch Ordered[string] `yaml:"patch"`
 	// Optional lets the write go ahead when the item is absent (or expired); when only applies if
 	// it is there.
 	Optional bool `yaml:"optional"`

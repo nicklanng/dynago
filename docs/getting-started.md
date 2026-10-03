@@ -212,10 +212,15 @@ Add a field `dueAt: time` and run `generate`:
 ```
 tasks.dynago.yaml: entity Task: its storage shape changed but its version is still 1. Set `version: 2` so stored
 items record which shape wrote them. Changes: field dueAt added
+or, if no table has been created from this schema yet, delete tasks.dynago.lock and generate again: there are
+no stored items to keep track of, and the design is recorded afresh as version 1
 ```
 
 Set `version: 2` on the entity (under `Task:`, beside `doc:`) and generate again. The lock file
 records both versions.
+
+While you are still designing and no table exists anywhere, do what the last line says instead:
+delete the lock file and generate again. Versions are for items already stored.
 
 Adding an optional field is a change existing items fit. A change they don't fit, such as a new
 index, claim or counter, or a changed key, also needs a new table generation:

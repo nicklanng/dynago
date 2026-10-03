@@ -24,11 +24,18 @@ func TableName(base string) string {
 
 // TableSpec is the physical shape of the fixture table: base key PK/SK, its global secondary
 // indexes and its TTL attribute. See also the generated Terraform.
-var TableSpec = dynago.TableSpec{}
+var TableSpec = dynago.TableSpec{
+	GSIs: []dynago.GSISpec{
+		{Name: "Known", PKAttr: "KnownPK", SKAttr: "KnownSK", Projection: "INCLUDE", NonKeyAttrs: []string{"_t", "_v", "depotId", "parcelId"}},
+	},
+}
 
 // Store gives typed access to the fixture table.
 type Store struct {
 	Accounts *AccountStore
+	Depots   *DepotStore
+	Parcels  *ParcelStore
+	Damages  *DamageStore
 }
 
 // New returns a Store for the table named tableName.
@@ -36,6 +43,9 @@ func New(db *dynamo.DB, tableName string) *Store {
 	t := db.Table(tableName)
 	return &Store{
 		Accounts: &AccountStore{db: db, t: t},
+		Depots:   &DepotStore{db: db, t: t},
+		Parcels:  &ParcelStore{db: db, t: t},
+		Damages:  &DamageStore{db: db, t: t},
 	}
 }
 
@@ -513,6 +523,2030 @@ func (s *AccountStore) requireHandOverAccount(ctx context.Context, e *Account, r
 		return nil, dynago.Change{}, err
 	}
 	return []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}, dynago.Change{Owner: key, Before: accountDerived(before, key), After: accountDerived(&after, key)}, nil
+}
+
+// ---- Depot ----
+
+// Depot is stored in the fixture table.
+type Depot struct {
+	DepotID string `dynamo:"depotId"`
+	Name    string `dynamo:"name,omitempty"`
+	Closed  bool   `dynamo:"closed,omitempty"`
+	Parcels int64  `dynamo:"parcels,omitempty"`
+
+	loaded *depotLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
+}
+
+// depotLoaded remembers the stored state an entity was read at, so a write passed the entity
+// with dynago.From can start from it without reading again.
+type depotLoaded struct {
+	rev      int64
+	v        int
+	snapshot Depot
+	raw      dynamo.Item // as stored, including attributes this code doesn't know
+}
+
+// Version identifies the stored state e was read at, for optimistic concurrency: pass it back
+// with dynago.IfVersion (e.g. from an ETag) to make a write fail if anything changed since.
+// It is "" for an entity that was not read from the store.
+func (e *Depot) Version() string {
+	if e.loaded == nil {
+		return ""
+	}
+	return dynago.FormatVersion(e.loaded.rev)
+}
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Depot) Timestamps() dynago.Timestamps { return e.stamps }
+
+// clone copies e, including its slices and maps, without its loaded state.
+func (e *Depot) clone() Depot {
+	c := *e
+	c.loaded = nil
+	return c
+}
+
+// checkKeyParts rejects values containing a character their key templates use as a separator.
+func (e *Depot) checkKeyParts() error {
+	if err := dynago.CheckKeyPart("depotId", e.DepotID, "#"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// DepotKey identifies a Depot.
+type DepotKey struct {
+	DepotID string
+}
+
+// Key returns the primary key of e.
+func (e *Depot) Key() DepotKey {
+	return DepotKey{DepotID: e.DepotID}
+}
+
+func (k DepotKey) dynamoKey() (dynago.Key, error) {
+	if k.DepotID == "" {
+		return dynago.Key{}, fmt.Errorf("%w: Depot needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", k.DepotID, "#"); err != nil {
+		return dynago.Key{}, err
+	}
+	return dynago.Key{PK: "D#" + k.DepotID, SK: "DEPOT"}, nil
+}
+
+// Errors returned by DepotStore. Each wraps the matching dynago sentinel.
+var (
+	ErrDepotNotFound = fmt.Errorf("%w: Depot", dynago.ErrNotFound)
+	ErrDepotExists   = fmt.Errorf("%w: Depot", dynago.ErrExists)
+)
+
+const depotVersion = 1
+
+type depotItem struct {
+	Depot
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
+
+	raw dynamo.Item // as read, for writes to keep attributes this code doesn't know
+}
+
+// depotKnown is every attribute this code writes on Depot items.
+var depotKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "depotId": true, "name": true, "closed": true, "parcels": true}
+
+// depotToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func depotToItem(e *Depot, key dynago.Key, rev int64, created, updated string) *depotItem {
+	it := &depotItem{Depot: *e, PK: key.PK, SK: key.SK, T: "Depot", V: depotVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
+	return it
+}
+
+// DepotTotals is an atomic counter maintained by every Depot write.
+type DepotTotals struct {
+	// Depots counts items.
+	Depots int64 `dynamo:"depots"`
+}
+
+// DepotTotalsKey identifies a DepotTotals counter.
+type DepotTotalsKey struct {
+}
+
+// depotDerived returns the counter contributions, claims and copies that exist because of e.
+func depotDerived(e *Depot, owner dynago.Key) []dynago.Derived {
+	_ = owner // only sharded counters use it
+	var d []dynago.Derived
+	// counter DepotTotals
+	if true {
+		k := dynago.Key{PK: "DEPOTS", SK: "TOTALS"}
+		d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: "DepotTotals", Attr: "depots", Amount: 1})
+	}
+	return d
+}
+
+// DepotStore reads and writes Depot items. Only the access patterns declared in the schema
+// exist as methods.
+type DepotStore struct {
+	db *dynamo.DB
+	t  dynamo.Table
+}
+
+func (s *DepotStore) load(ctx context.Context, key dynago.Key, consistent bool) (*depotItem, error) {
+	var raw dynamo.Item
+	found, err := dynago.GetOne(ctx, s.t, key, consistent, &raw)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrDepotNotFound
+	}
+	return depotDecode(raw)
+}
+
+// depotDecode decodes a stored item, remembering its state for writes passed dynago.From.
+func depotDecode(raw dynamo.Item) (*depotItem, error) {
+	var it depotItem
+	if err := dynamo.UnmarshalItem(raw, &it); err != nil {
+		return nil, err
+	}
+	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
+	it.loaded = &depotLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
+	return &it, nil
+}
+
+func depotDecodeAll(raws []dynamo.Item) ([]Depot, error) {
+	out := make([]Depot, 0, len(raws))
+	for _, raw := range raws {
+		it, err := depotDecode(raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, it.Depot)
+	}
+	return out, nil
+}
+
+// from returns the entity passed with dynago.From, checked to be this item and read from the
+// store, or nil if none was passed.
+func (s *DepotStore) from(key dynago.Key, o dynago.WriteOptions) (*Depot, error) {
+	if o.From == nil {
+		return nil, nil
+	}
+	from, ok := o.From.(*Depot)
+	if !ok || from == nil || from.loaded == nil {
+		return nil, fmt.Errorf("%w: dynago.From needs a *Depot read from its own item, not built by hand or read through a copy index", dynago.ErrVersionRequired)
+	}
+	if fk, err := from.Key().dynamoKey(); err != nil || fk != key {
+		return nil, fmt.Errorf("%w: the Depot passed with dynago.From is a different item", dynago.ErrInvalidKey)
+	}
+	return from, nil
+}
+
+// guard resolves the conditions a single-request write must meet.
+func (s *DepotStore) guard(key dynago.Key, o dynago.WriteOptions, required bool) (dynago.Guard, error) {
+	expect, err := o.ExpectedRev()
+	if err != nil {
+		return dynago.Guard{}, err
+	}
+	from, err := s.from(key, o)
+	if err != nil {
+		return dynago.Guard{}, err
+	}
+	if from != nil {
+		if expect != 0 && expect != from.loaded.rev {
+			return dynago.Guard{}, dynago.ErrVersionMismatch
+		}
+		expect = from.loaded.rev
+	}
+	if required && expect == 0 {
+		return dynago.Guard{}, dynago.ErrVersionRequired
+	}
+	return dynago.Guard{ExpectRev: expect, NotFound: ErrDepotNotFound}, nil
+}
+
+// Get reads a Depot by primary key with one eventually consistent GetItem.
+func (s *DepotStore) Get(ctx context.Context, k DepotKey) (*Depot, error) {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return nil, err
+	}
+	it, err := s.load(ctx, key, false)
+	if err != nil {
+		return nil, err
+	}
+	return &it.Depot, nil
+}
+
+// Totals reads the DepotTotals counter (one strongly consistent GetItem). A counter nothing has
+// touched reads as zero.
+func (s *DepotStore) Totals(ctx context.Context, k DepotTotalsKey) (DepotTotals, error) {
+	var out DepotTotals
+	_, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: "DEPOTS", SK: "TOTALS"}, true, &out)
+	return out, err
+}
+
+// DepotEverything is one page of what Depot.Everything reads: the page's items of each kind.
+type DepotEverything struct {
+	// Depot is the partition's one Depot, or nil if this page doesn't hold it.
+	Depot   *Depot
+	Parcels []Parcel
+	Damages []Damage
+}
+
+// DepotEverythingQuery selects the partition for Depot.Everything.
+type DepotEverythingQuery struct {
+	DepotID string
+}
+
+// Everything returns one page of a partition's Depot, Parcel and Damage items, each kind in its own
+// field, with exactly one strongly consistent Query (default 4, max 100 items evaluated). The
+// partition's items are read in ascending sort key order, every kind of them, and these kinds kept:
+// a page can hold few items, or none, and still have a next cursor, and a kind's items can span
+// pages. Keep going until the cursor is "" for all of them.
+func (s *DepotStore) Everything(ctx context.Context, q DepotEverythingQuery, page dynago.Page) (DepotEverything, string, error) {
+	if q.DepotID == "" {
+		return DepotEverything{}, "", fmt.Errorf("%w: Everything needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return DepotEverything{}, "", err
+	}
+	pk := "D#" + q.DepotID
+	var raws []dynamo.Item
+	next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{Scope: "Depot.Everything#5a1c631a\x00" + pk, PK: pk, PKAttr: "PK", SKAttr: "SK", PageSize: 4, MaxPage: 100, Types: []string{"Depot", "Parcel", "Damage"}, Consistent: true}, page, &raws)
+	if err != nil {
+		return DepotEverything{}, "", err
+	}
+	var out DepotEverything
+	for _, raw := range raws {
+		switch dynago.ItemType(raw) {
+		case "Depot":
+			it, err := depotDecode(raw)
+			if err != nil {
+				return DepotEverything{}, "", err
+			}
+			out.Depot = &it.Depot
+		case "Parcel":
+			it, err := parcelDecode(raw)
+			if err != nil {
+				return DepotEverything{}, "", err
+			}
+			out.Parcels = append(out.Parcels, it.Parcel)
+		case "Damage":
+			it, err := damageDecode(raw)
+			if err != nil {
+				return DepotEverything{}, "", err
+			}
+			out.Damages = append(out.Damages, it.Damage)
+		}
+	}
+	return out, next, nil
+}
+
+// DepotNewest is one page of what Depot.Newest reads: the page's items of each kind.
+type DepotNewest struct {
+	Damages []Damage
+	Parcels []Parcel
+}
+
+// DepotNewestQuery selects the partition for Depot.Newest.
+type DepotNewestQuery struct {
+	DepotID string
+}
+
+// Newest returns one page of a partition's Damage and Parcel items, each kind in its own field,
+// with exactly one eventually consistent Query (default 50, max 100 items evaluated). The
+// partition's items are read in descending sort key order, every kind of them, and these kinds
+// kept: a page can hold few items, or none, and still have a next cursor, and a kind's items can
+// span pages. Keep going until the cursor is "" for all of them.
+func (s *DepotStore) Newest(ctx context.Context, q DepotNewestQuery, page dynago.Page) (DepotNewest, string, error) {
+	if q.DepotID == "" {
+		return DepotNewest{}, "", fmt.Errorf("%w: Newest needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return DepotNewest{}, "", err
+	}
+	pk := "D#" + q.DepotID
+	var raws []dynamo.Item
+	next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{Scope: "Depot.Newest#98928f05\x00" + pk, PK: pk, PKAttr: "PK", SKAttr: "SK", PageSize: 50, MaxPage: 100, Types: []string{"Damage", "Parcel"}, Desc: true}, page, &raws)
+	if err != nil {
+		return DepotNewest{}, "", err
+	}
+	var out DepotNewest
+	for _, raw := range raws {
+		switch dynago.ItemType(raw) {
+		case "Damage":
+			it, err := damageDecode(raw)
+			if err != nil {
+				return DepotNewest{}, "", err
+			}
+			out.Damages = append(out.Damages, it.Damage)
+		case "Parcel":
+			it, err := parcelDecode(raw)
+			if err != nil {
+				return DepotNewest{}, "", err
+			}
+			out.Parcels = append(out.Parcels, it.Parcel)
+		}
+	}
+	return out, next, nil
+}
+
+// Open creates a Depot, failing with ErrDepotExists if one already exists. In the same transaction
+// it maintains counter DepotTotals. Afterwards e.Version() returns the new item's version.
+func (s *DepotStore) Open(ctx context.Context, e *Depot) error {
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		put := s.t.Put(depotToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+		ops := []dynago.Op{dynago.CreateOp(key, put, ErrDepotExists, rev)}
+		changes := []dynago.Change{{Owner: key, After: depotDerived(e, key)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return err
+		}
+		e.loaded = &depotLoaded{rev: rev, v: depotVersion, snapshot: e.clone()}
+		return nil
+	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
+}
+
+// Close updates closed of a Depot with a single conditional UpdateItem.
+func (s *DepotStore) Close(ctx context.Context, k DepotKey, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	sets := []dynago.Set{
+		{Attr: "closed", Value: true},
+	}
+	guard, err := s.guard(key, o, false)
+	if err != nil {
+		return err
+	}
+	return dynago.Retry(ctx, func() error {
+		rev, err := dynago.UpdateFields(ctx, s.t, key, sets, nil, guard, nil)
+		if err == nil {
+			o.Written(rev)
+		}
+		return dynago.StaleAs(guard.ExpectRev != 0, err)
+	})
+}
+
+// ---- Parcel ----
+
+// ParcelState is the set of values of Parcel.state.
+type ParcelState string
+
+// Values of ParcelState.
+const (
+	ParcelStateReceived ParcelState = "received"
+	ParcelStateShelved  ParcelState = "shelved"
+	ParcelStateOut      ParcelState = "out"
+	ParcelStateReturned ParcelState = "returned"
+	ParcelStateLost     ParcelState = "lost"
+)
+
+// Parcel is stored in the fixture table.
+type Parcel struct {
+	DepotID  string      `dynamo:"depotId"`
+	ParcelID string      `dynamo:"parcelId"`
+	State    ParcelState `dynamo:"state,omitempty"`
+	Note     string      `dynamo:"note,omitempty"`
+	Fragile  bool        `dynamo:"fragile,omitempty"`
+	// How many damage reports name the parcel. Listed with the parcels on site.
+	Damages     int64  `dynamo:"damages,omitempty"`
+	Disputes    int64  `dynamo:"disputes,omitempty"`
+	LastDispute string `dynamo:"lastDispute,omitempty"`
+	// Handling tags. A parcel is listed, and counted, under each of them.
+	Tags []string `dynamo:"tags,set,omitempty"`
+
+	loaded *parcelLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
+}
+
+// parcelLoaded remembers the stored state an entity was read at, so a write passed the entity
+// with dynago.From can start from it without reading again.
+type parcelLoaded struct {
+	rev      int64
+	v        int
+	snapshot Parcel
+	raw      dynamo.Item // as stored, including attributes this code doesn't know
+}
+
+// Version identifies the stored state e was read at, for optimistic concurrency: pass it back
+// with dynago.IfVersion (e.g. from an ETag) to make a write fail if anything changed since.
+// It is "" for an entity that was not read from the store.
+func (e *Parcel) Version() string {
+	if e.loaded == nil {
+		return ""
+	}
+	return dynago.FormatVersion(e.loaded.rev)
+}
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Parcel) Timestamps() dynago.Timestamps { return e.stamps }
+
+// clone copies e, including its slices and maps, without its loaded state.
+func (e *Parcel) clone() Parcel {
+	c := *e
+	c.loaded = nil
+	c.Tags = append([]string(nil), e.Tags...)
+	return c
+}
+
+// checkKeyParts rejects values containing a character their key templates use as a separator.
+func (e *Parcel) checkKeyParts() error {
+	if err := dynago.CheckKeyPart("depotId", e.DepotID, "#"); err != nil {
+		return err
+	}
+	if err := dynago.CheckKeyPart("parcelId", e.ParcelID, "#"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ParcelKey identifies a Parcel.
+type ParcelKey struct {
+	DepotID  string
+	ParcelID string
+}
+
+// Key returns the primary key of e.
+func (e *Parcel) Key() ParcelKey {
+	return ParcelKey{DepotID: e.DepotID, ParcelID: e.ParcelID}
+}
+
+func (k ParcelKey) dynamoKey() (dynago.Key, error) {
+	if k.DepotID == "" || k.ParcelID == "" {
+		return dynago.Key{}, fmt.Errorf("%w: Parcel needs depotId and parcelId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", k.DepotID, "#"); err != nil {
+		return dynago.Key{}, err
+	}
+	if err := dynago.CheckKeyPart("parcelId", k.ParcelID, "#"); err != nil {
+		return dynago.Key{}, err
+	}
+	return dynago.Key{PK: "D#" + k.DepotID, SK: "PARCEL#" + k.ParcelID}, nil
+}
+
+// Errors returned by ParcelStore. Each wraps the matching dynago sentinel.
+var (
+	ErrParcelNotFound                  = fmt.Errorf("%w: Parcel", dynago.ErrNotFound)
+	ErrParcelExists                    = fmt.Errorf("%w: Parcel", dynago.ErrExists)
+	ErrParcelShelvePrecondition        = fmt.Errorf("%w: Parcel.Shelve requires state = \"received\"", dynago.ErrPrecondition)
+	ErrParcelSendOutPrecondition       = fmt.Errorf("%w: Parcel.SendOut requires state in [\"received\", \"shelved\"]", dynago.ErrPrecondition)
+	ErrParcelLosePrecondition          = fmt.Errorf("%w: Parcel.Lose requires state != \"lost\"", dynago.ErrPrecondition)
+	ErrParcelAnnotatePrecondition      = fmt.Errorf("%w: Parcel.Annotate requires state != \"lost\"", dynago.ErrPrecondition)
+	ErrParcelShelveSeveralPrecondition = fmt.Errorf("%w: Parcel.ShelveSeveral requires state = \"received\"", dynago.ErrPrecondition)
+	ErrParcelArriveRequiresDepot       = fmt.Errorf("%w: Parcel.Arrive requires any Depot there is to have closed = false", dynago.ErrPrecondition)
+)
+
+const parcelVersion = 1
+
+type parcelItem struct {
+	Parcel
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
+
+	raw     dynamo.Item // as read, for writes to keep attributes this code doesn't know
+	KnownPK string      `dynamo:"KnownPK,omitempty"`
+	KnownSK string      `dynamo:"KnownSK,omitempty"`
+}
+
+// parcelKnown is every attribute this code writes on Parcel items.
+var parcelKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "depotId": true, "parcelId": true, "state": true, "note": true, "fragile": true, "damages": true, "disputes": true, "lastDispute": true, "tags": true, "KnownPK": true, "KnownSK": true}
+
+// parcelToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func parcelToItem(e *Parcel, key dynago.Key, rev int64, created, updated string) *parcelItem {
+	it := &parcelItem{Parcel: *e, PK: key.PK, SK: key.SK, T: "Parcel", V: parcelVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
+	if e.DepotID != "" && e.ParcelID != "" && e.State != ParcelStateLost {
+		it.KnownPK = "KNOWN#" + e.DepotID
+		it.KnownSK = "P#" + e.ParcelID
+	}
+	return it
+}
+
+// ParcelOnSite is a Parcel as seen through the OnSite index: key fields plus the projected fields.
+type ParcelOnSite struct {
+	DepotID  string      `dynamo:"depotId"`
+	ParcelID string      `dynamo:"parcelId"`
+	State    ParcelState `dynamo:"state,omitempty"`
+	Damages  int64       `dynamo:"damages,omitempty"`
+}
+
+type parcelOnSiteCopy struct {
+	ParcelOnSite
+	PK string `dynamo:"PK"`
+	SK string `dynamo:"SK"`
+	T  string `dynamo:"_t"`
+	V  int    `dynamo:"_v"`
+}
+
+// ParcelByTag is a Parcel as seen through the ByTag index: key fields plus the projected fields.
+type ParcelByTag struct {
+	DepotID  string      `dynamo:"depotId"`
+	ParcelID string      `dynamo:"parcelId"`
+	State    ParcelState `dynamo:"state,omitempty"`
+	Tags     []string    `dynamo:"tags,set,omitempty"`
+}
+
+type parcelByTagCopy struct {
+	ParcelByTag
+	PK string `dynamo:"PK"`
+	SK string `dynamo:"SK"`
+	T  string `dynamo:"_t"`
+	V  int    `dynamo:"_v"`
+}
+
+// ParcelKnown is a Parcel as seen through the Known index: key fields plus the projected fields.
+type ParcelKnown struct {
+	DepotID  string `dynamo:"depotId"`
+	ParcelID string `dynamo:"parcelId"`
+}
+
+// DepotParcels is an atomic counter maintained by every Parcel write.
+type DepotParcels struct {
+	// OnSite counts items where state in ["received", "shelved", "returned"].
+	OnSite int64 `dynamo:"onSite"`
+	// Known counts items where state != "lost".
+	Known int64 `dynamo:"known"`
+}
+
+// DepotParcelsKey identifies a DepotParcels counter.
+type DepotParcelsKey struct {
+	DepotID string
+}
+
+// TagCounts is one counter item for each tag on a depot's parcels.
+type TagCounts struct {
+	// Parcels counts items.
+	Parcels int64 `dynamo:"parcels"`
+	// OnSite counts items where state in ["received", "shelved", "returned"].
+	OnSite int64 `dynamo:"onSite"`
+}
+
+// TagCountsKey identifies a TagCounts counter.
+type TagCountsKey struct {
+	DepotID string
+	// TagsElem is one element of tags: each has its own counter item.
+	TagsElem string
+}
+
+// StateCounts is one counter item for each state a depot's parcels are in, read together.
+type StateCounts struct {
+	// Parcels counts items.
+	Parcels int64 `dynamo:"parcels"`
+}
+
+// StateCountsKey identifies a StateCounts counter.
+type StateCountsKey struct {
+	DepotID string
+	State   ParcelState
+}
+
+// TagCountsEntry is one TagCounts counter item, with the key that identifies it.
+type TagCountsEntry struct {
+	Key TagCountsKey
+	TagCounts
+}
+
+// StateCountsEntry is one StateCounts counter item, with the key that identifies it.
+type StateCountsEntry struct {
+	Key StateCountsKey
+	StateCounts
+}
+
+// parcelDerived returns the counter contributions, claims and copies that exist because of e.
+func parcelDerived(e *Parcel, owner dynago.Key) []dynago.Derived {
+	_ = owner // only sharded counters use it
+	var d []dynago.Derived
+	// counter DepotParcels
+	if e.DepotID != "" {
+		k := dynago.Key{PK: "D#" + e.DepotID, SK: "COUNTS"}
+		if e.State == ParcelStateReceived || e.State == ParcelStateShelved || e.State == ParcelStateReturned {
+			d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: "DepotParcels", Attr: "onSite", Amount: 1})
+		}
+		if e.State != ParcelStateLost {
+			d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: "DepotParcels", Attr: "known", Amount: 1})
+		}
+	}
+	// counter TagCounts
+	if e.DepotID != "" {
+		counted := map[dynago.Key]bool{}
+		for _, elem := range e.Tags {
+			k := dynago.Key{PK: "D#" + e.DepotID, SK: "TAG#" + elem}
+			if elem == "" || counted[k] {
+				continue
+			}
+			counted[k] = true
+			d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: "TagCounts", Attr: "parcels", Amount: 1})
+			if e.State == ParcelStateReceived || e.State == ParcelStateShelved || e.State == ParcelStateReturned {
+				d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: "TagCounts", Attr: "onSite", Amount: 1})
+			}
+		}
+	}
+	// counter StateCounts
+	if e.DepotID != "" && e.State != "" {
+		k := dynago.Key{PK: "D#" + e.DepotID, SK: "STATE#" + string(e.State)}
+		d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: "StateCounts", Attr: "parcels", Amount: 1})
+	}
+	// copy index OnSite
+	if e.DepotID != "" && e.ParcelID != "" && e.State == ParcelStateReceived || e.State == ParcelStateShelved || e.State == ParcelStateReturned {
+		k := dynago.Key{PK: "D#" + e.DepotID + "#ONSITE", SK: "P#" + e.ParcelID}
+		d = append(d, dynago.Derived{Kind: dynago.KindCopy, Key: k, Type: "Parcel.OnSite", Item: &parcelOnSiteCopy{ParcelOnSite: ParcelOnSite{DepotID: e.DepotID, ParcelID: e.ParcelID, State: e.State, Damages: e.Damages}, PK: k.PK, SK: k.SK, T: "Parcel.OnSite", V: parcelVersion}, Created: dynago.FmtStamp(e.stamps.Created)})
+	}
+	// copy index ByTag
+	if e.DepotID != "" && e.ParcelID != "" {
+		copied := map[dynago.Key]bool{}
+		for _, elem := range e.Tags {
+			k := dynago.Key{PK: "D#" + e.DepotID + "#TAG#" + dynago.Lower(elem), SK: "TAGGED#" + e.ParcelID}
+			if elem == "" || copied[k] {
+				continue
+			}
+			copied[k] = true
+			d = append(d, dynago.Derived{Kind: dynago.KindCopy, Key: k, Type: "Parcel.ByTag", Item: &parcelByTagCopy{ParcelByTag: ParcelByTag{DepotID: e.DepotID, ParcelID: e.ParcelID, State: e.State, Tags: e.Tags}, PK: k.PK, SK: k.SK, T: "Parcel.ByTag", V: parcelVersion}, Created: dynago.FmtStamp(e.stamps.Created)})
+		}
+	}
+	return d
+}
+
+// ParcelStore reads and writes Parcel items. Only the access patterns declared in the schema
+// exist as methods.
+type ParcelStore struct {
+	db *dynamo.DB
+	t  dynamo.Table
+}
+
+func (s *ParcelStore) load(ctx context.Context, key dynago.Key, consistent bool) (*parcelItem, error) {
+	var raw dynamo.Item
+	found, err := dynago.GetOne(ctx, s.t, key, consistent, &raw)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrParcelNotFound
+	}
+	return parcelDecode(raw)
+}
+
+// parcelDecode decodes a stored item, remembering its state for writes passed dynago.From.
+func parcelDecode(raw dynamo.Item) (*parcelItem, error) {
+	var it parcelItem
+	if err := dynamo.UnmarshalItem(raw, &it); err != nil {
+		return nil, err
+	}
+	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
+	it.loaded = &parcelLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
+	return &it, nil
+}
+
+func parcelDecodeAll(raws []dynamo.Item) ([]Parcel, error) {
+	out := make([]Parcel, 0, len(raws))
+	for _, raw := range raws {
+		it, err := parcelDecode(raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, it.Parcel)
+	}
+	return out, nil
+}
+
+// from returns the entity passed with dynago.From, checked to be this item and read from the
+// store, or nil if none was passed.
+func (s *ParcelStore) from(key dynago.Key, o dynago.WriteOptions) (*Parcel, error) {
+	if o.From == nil {
+		return nil, nil
+	}
+	from, ok := o.From.(*Parcel)
+	if !ok || from == nil || from.loaded == nil {
+		return nil, fmt.Errorf("%w: dynago.From needs a *Parcel read from its own item, not built by hand or read through a copy index", dynago.ErrVersionRequired)
+	}
+	if fk, err := from.Key().dynamoKey(); err != nil || fk != key {
+		return nil, fmt.Errorf("%w: the Parcel passed with dynago.From is a different item", dynago.ErrInvalidKey)
+	}
+	return from, nil
+}
+
+// guard resolves the conditions a single-request write must meet.
+func (s *ParcelStore) guard(key dynago.Key, o dynago.WriteOptions, required bool) (dynago.Guard, error) {
+	expect, err := o.ExpectedRev()
+	if err != nil {
+		return dynago.Guard{}, err
+	}
+	from, err := s.from(key, o)
+	if err != nil {
+		return dynago.Guard{}, err
+	}
+	if from != nil {
+		if expect != 0 && expect != from.loaded.rev {
+			return dynago.Guard{}, dynago.ErrVersionMismatch
+		}
+		expect = from.loaded.rev
+	}
+	if required && expect == 0 {
+		return dynago.Guard{}, dynago.ErrVersionRequired
+	}
+	return dynago.Guard{ExpectRev: expect, NotFound: ErrParcelNotFound}, nil
+}
+
+// start returns the state a read-modify-write starts from: the entity passed with dynago.From
+// (no read), or a consistent read. versioned reports whether the caller named a version, in
+// which case a concurrent change is a mismatch for the caller rather than something to retry.
+func (s *ParcelStore) start(ctx context.Context, key dynago.Key, o dynago.WriteOptions, required bool) (*parcelItem, bool, error) {
+	expect, err := o.ExpectedRev()
+	if err != nil {
+		return nil, false, err
+	}
+	from, err := s.from(key, o)
+	if err != nil {
+		return nil, false, err
+	}
+	if from != nil {
+		if expect != 0 && expect != from.loaded.rev {
+			return nil, false, dynago.ErrVersionMismatch
+		}
+		return &parcelItem{Parcel: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v, raw: from.loaded.raw}, true, nil
+	}
+	if required && expect == 0 {
+		return nil, false, dynago.ErrVersionRequired
+	}
+	it, err := s.load(ctx, key, true)
+	if err != nil {
+		return nil, false, err
+	}
+	if expect != 0 && it.Rev != expect {
+		return nil, false, dynago.ErrVersionMismatch
+	}
+	return it, expect != 0, nil
+}
+
+// Get reads a Parcel by primary key with one eventually consistent GetItem.
+func (s *ParcelStore) Get(ctx context.Context, k ParcelKey) (*Parcel, error) {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return nil, err
+	}
+	it, err := s.load(ctx, key, false)
+	if err != nil {
+		return nil, err
+	}
+	return &it.Parcel, nil
+}
+
+// GetSeveral reads the Parcels with the given keys, with one strongly consistent BatchGetItem per
+// 100 keys. A key with no item is left out, so the result can be shorter than keys; the others come
+// back in the order of keys, and a key given twice is returned once.
+func (s *ParcelStore) GetSeveral(ctx context.Context, keys []ParcelKey) ([]Parcel, error) {
+	ks := make([]dynago.Key, len(keys))
+	for i, k := range keys {
+		key, err := k.dynamoKey()
+		if err != nil {
+			return nil, err
+		}
+		ks[i] = key
+	}
+	raws, err := dynago.GetBatch(ctx, s.t, ks, true)
+	if err != nil {
+		return nil, err
+	}
+	return parcelDecodeAll(raws)
+}
+
+// ParcelStatesQuery selects the partition for Parcel.States.
+type ParcelStatesQuery struct {
+	DepotID string
+}
+
+// States returns one page of the StateCounts counters of a partition, one for each state something
+// has counted, in key order, with exactly one strongly consistent Query (default 50, max 100
+// items). It returns the cursor for the next page, or "" at the end.
+func (s *ParcelStore) States(ctx context.Context, q ParcelStatesQuery, page dynago.Page) ([]StateCountsEntry, string, error) {
+	if q.DepotID == "" {
+		return nil, "", fmt.Errorf("%w: States needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return nil, "", err
+	}
+	pk := "D#" + q.DepotID
+	var rows []struct {
+		SK string `dynamo:"SK"`
+		StateCounts
+	}
+	next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{Scope: "Parcel.States#8e598ab4\x00" + pk, PK: pk, PKAttr: "PK", SKAttr: "SK", Prefix: "STATE#", PageSize: 50, MaxPage: 100, Consistent: true}, page, &rows)
+	if err != nil {
+		return nil, "", err
+	}
+	out := make([]StateCountsEntry, 0, len(rows))
+	for _, row := range rows {
+		// A counter item stores no fields: its sort key says which one it is.
+		parts, ok := dynago.SplitKey(row.SK, "STATE#", "")
+		if !ok {
+			return nil, "", fmt.Errorf("dynago: StateCounts item with sort key %q, which doesn't fit STATE#{state}", row.SK)
+		}
+		out = append(out, StateCountsEntry{Key: StateCountsKey{DepotID: q.DepotID, State: ParcelState(parts[0])}, StateCounts: row.StateCounts})
+	}
+	return out, next, nil
+}
+
+// ParcelTaggedQuery selects the partition for Parcel.Tagged.
+type ParcelTaggedQuery struct {
+	DepotID string
+	// TagsElem is one element of tags: the Parcels that have it are in its partition.
+	TagsElem string
+}
+
+// Tagged returns one page of Parcel items from the ByTag copy items, ascending by
+// "TAGGED#{parcelId}", with exactly one strongly consistent Query (default 50, max 100 items). It
+// returns the cursor for the next page, or "" at the end.
+func (s *ParcelStore) Tagged(ctx context.Context, q ParcelTaggedQuery, page dynago.Page) ([]ParcelByTag, string, error) {
+	if q.DepotID == "" || q.TagsElem == "" {
+		return nil, "", fmt.Errorf("%w: Tagged needs depotId and tags", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return nil, "", err
+	}
+	pk := "D#" + q.DepotID + "#TAG#" + dynago.Lower(q.TagsElem)
+	spec := dynago.QuerySpec{Scope: "Parcel.Tagged#78703a53\x00" + pk, PK: pk, PageSize: 50, MaxPage: 100, PKAttr: "PK", SKAttr: "SK", Prefix: "TAGGED#", Consistent: true}
+	var out []ParcelByTag
+	next, err := dynago.Query(ctx, s.t, spec, page, &out)
+	if err != nil {
+		return nil, "", err
+	}
+	return out, next, nil
+}
+
+// TagCount reads the TagCounts counter (one strongly consistent GetItem). A counter nothing has
+// touched reads as zero.
+func (s *ParcelStore) TagCount(ctx context.Context, k TagCountsKey) (TagCounts, error) {
+	if k.DepotID == "" || k.TagsElem == "" {
+		return TagCounts{}, fmt.Errorf("%w: TagCounts needs depotId and tags", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", k.DepotID, "#"); err != nil {
+		return TagCounts{}, err
+	}
+	var out TagCounts
+	_, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: "D#" + k.DepotID, SK: "TAG#" + k.TagsElem}, true, &out)
+	return out, err
+}
+
+// ParcelTagsQuery selects the partition for Parcel.Tags.
+type ParcelTagsQuery struct {
+	DepotID string
+}
+
+// Tags returns one page of the TagCounts counters of a partition, one for each tags something has
+// counted, in key order, with exactly one strongly consistent Query (default 50, max 100 items). It
+// returns the cursor for the next page, or "" at the end.
+func (s *ParcelStore) Tags(ctx context.Context, q ParcelTagsQuery, page dynago.Page) ([]TagCountsEntry, string, error) {
+	if q.DepotID == "" {
+		return nil, "", fmt.Errorf("%w: Tags needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return nil, "", err
+	}
+	pk := "D#" + q.DepotID
+	var rows []struct {
+		SK string `dynamo:"SK"`
+		TagCounts
+	}
+	next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{Scope: "Parcel.Tags#9d71fb22\x00" + pk, PK: pk, PKAttr: "PK", SKAttr: "SK", Prefix: "TAG#", PageSize: 50, MaxPage: 100, Consistent: true}, page, &rows)
+	if err != nil {
+		return nil, "", err
+	}
+	out := make([]TagCountsEntry, 0, len(rows))
+	for _, row := range rows {
+		// A counter item stores no fields: its sort key says which one it is.
+		parts, ok := dynago.SplitKey(row.SK, "TAG#", "")
+		if !ok {
+			return nil, "", fmt.Errorf("dynago: TagCounts item with sort key %q, which doesn't fit TAG#{tags}", row.SK)
+		}
+		out = append(out, TagCountsEntry{Key: TagCountsKey{DepotID: q.DepotID, TagsElem: parts[0]}, TagCounts: row.TagCounts})
+	}
+	return out, next, nil
+}
+
+// ParcelOnSiteQuery selects the partition for Parcel.OnSite.
+type ParcelOnSiteQuery struct {
+	DepotID string
+}
+
+// OnSite returns one page of Parcel items from the OnSite copy items, ascending by "P#{parcelId}",
+// with exactly one strongly consistent Query (default 50, max 100 items). It returns the cursor for
+// the next page, or "" at the end.
+func (s *ParcelStore) OnSite(ctx context.Context, q ParcelOnSiteQuery, page dynago.Page) ([]ParcelOnSite, string, error) {
+	if q.DepotID == "" {
+		return nil, "", fmt.Errorf("%w: OnSite needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return nil, "", err
+	}
+	pk := "D#" + q.DepotID + "#ONSITE"
+	spec := dynago.QuerySpec{Scope: "Parcel.OnSite#5747a435\x00" + pk, PK: pk, PageSize: 50, MaxPage: 100, PKAttr: "PK", SKAttr: "SK", Prefix: "P#", Consistent: true}
+	var out []ParcelOnSite
+	next, err := dynago.Query(ctx, s.t, spec, page, &out)
+	if err != nil {
+		return nil, "", err
+	}
+	return out, next, nil
+}
+
+// ParcelKnownQuery selects the partition for Parcel.Known.
+type ParcelKnownQuery struct {
+	DepotID string
+}
+
+// Known returns one page of Parcel items from the Known index, ascending by "P#{parcelId}", with
+// exactly one eventually consistent Query (default 50, max 100 items). It returns the cursor for
+// the next page, or "" at the end.
+func (s *ParcelStore) Known(ctx context.Context, q ParcelKnownQuery, page dynago.Page) ([]ParcelKnown, string, error) {
+	if q.DepotID == "" {
+		return nil, "", fmt.Errorf("%w: Known needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return nil, "", err
+	}
+	pk := "KNOWN#" + q.DepotID
+	spec := dynago.QuerySpec{Scope: "Parcel.Known#2fc01109\x00" + pk, PK: pk, PageSize: 50, MaxPage: 100, Index: "Known", PKAttr: "KnownPK", SKAttr: "KnownSK", Prefix: "P#"}
+	var out []ParcelKnown
+	next, err := dynago.Query(ctx, s.t, spec, page, &out)
+	if err != nil {
+		return nil, "", err
+	}
+	return out, next, nil
+}
+
+// Counts reads the DepotParcels counter (one eventually consistent GetItem). A counter nothing has
+// touched reads as zero.
+func (s *ParcelStore) Counts(ctx context.Context, k DepotParcelsKey) (DepotParcels, error) {
+	if k.DepotID == "" {
+		return DepotParcels{}, fmt.Errorf("%w: DepotParcels needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", k.DepotID, "#"); err != nil {
+		return DepotParcels{}, err
+	}
+	var out DepotParcels
+	_, err := dynago.GetOne(ctx, s.t, dynago.Key{PK: "D#" + k.DepotID, SK: "COUNTS"}, false, &out)
+	return out, err
+}
+
+// Receive creates a Parcel, failing with ErrParcelExists if one already exists. It sets state to
+// "received", whatever e holds. In the same transaction it maintains counter DepotParcels, counter
+// TagCounts, counter StateCounts, copy index OnSite, copy index ByTag. Afterwards e.Version()
+// returns the new item's version.
+func (s *ParcelStore) Receive(ctx context.Context, e *Parcel) error {
+	e.State = ParcelStateReceived
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		put := s.t.Put(parcelToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+		ops := []dynago.Op{dynago.CreateOp(key, put, ErrParcelExists, rev)}
+		changes := []dynago.Change{{Owner: key, After: parcelDerived(e, key)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return err
+		}
+		e.loaded = &parcelLoaded{rev: rev, v: parcelVersion, snapshot: e.clone()}
+		return nil
+	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
+}
+
+// Arrive creates a Parcel, failing with ErrParcelExists if one already exists. It sets state to
+// "received", whatever e holds. In the same transaction it requires any Depot there is to have
+// closed = false (else ErrParcelArriveRequiresDepot), and creates the Depot if there is none (with
+// name "unnamed"), and adds 1 to its parcels. In the same transaction it maintains counter
+// DepotParcels, counter TagCounts, counter StateCounts, copy index OnSite, copy index ByTag.
+// Afterwards e.Version() returns the new item's version.
+func (s *ParcelStore) Arrive(ctx context.Context, e *Parcel) error {
+	e.State = ParcelStateReceived
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		err := dynago.ReadIfNeeded(func(read bool) error {
+			put := s.t.Put(parcelToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+			ops := []dynago.Op{dynago.CreateOp(key, put, ErrParcelExists, rev)}
+			changes := []dynago.Change{{Owner: key, After: parcelDerived(e, key)}}
+			// requires Depot
+			if e.DepotID == "" {
+				return fmt.Errorf("%w: Parcel.Arrive requires the Depot, keyed by depotId", dynago.ErrFieldRequired)
+			}
+			depotOps, depotChange, err := s.requireArriveDepot(ctx, e, read)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, depotOps...)
+			changes = append(changes, depotChange)
+			derived, err := dynago.DiffAll(s.t, changes)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, derived...)
+			return dynago.Run(ctx, s.db, ops)
+		})
+		if err != nil {
+			return err
+		}
+		e.loaded = &parcelLoaded{rev: rev, v: parcelVersion, snapshot: e.clone()}
+		return nil
+	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
+}
+
+// Leave creates a Parcel, failing with ErrParcelExists if one already exists. It sets state to
+// "out", whatever e holds. In the same transaction it creates the Depot if there is none. In the
+// same transaction it maintains counter DepotParcels, counter TagCounts, counter StateCounts, copy
+// index OnSite, copy index ByTag. Afterwards e.Version() returns the new item's version.
+func (s *ParcelStore) Leave(ctx context.Context, e *Parcel) error {
+	e.State = ParcelStateOut
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		err := dynago.ReadIfNeeded(func(read bool) error {
+			put := s.t.Put(parcelToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+			ops := []dynago.Op{dynago.CreateOp(key, put, ErrParcelExists, rev)}
+			changes := []dynago.Change{{Owner: key, After: parcelDerived(e, key)}}
+			// requires Depot
+			if e.DepotID == "" {
+				return fmt.Errorf("%w: Parcel.Leave requires the Depot, keyed by depotId", dynago.ErrFieldRequired)
+			}
+			depotOps, depotChange, err := s.requireLeaveDepot(ctx, e, read)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, depotOps...)
+			changes = append(changes, depotChange)
+			derived, err := dynago.DiffAll(s.t, changes)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, derived...)
+			return dynago.Run(ctx, s.db, ops)
+		})
+		if err != nil {
+			return err
+		}
+		e.loaded = &parcelLoaded{rev: rev, v: parcelVersion, snapshot: e.clone()}
+		return nil
+	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
+}
+
+// Shelve updates state of a Parcel when state = "received" (else ErrParcelShelvePrecondition). It
+// reads the item consistently first (not with dynago.From) because the change affects the OnSite
+// index entry, the ByTag index entry, the Known index entry, counter DepotParcels, counter
+// TagCounts, counter StateCounts, then writes everything in one transaction guarded by the item's
+// revision. In the same transaction it maintains counter DepotParcels, counter TagCounts, counter
+// StateCounts, copy index OnSite, copy index ByTag.
+func (s *ParcelStore) Shelve(ctx context.Context, k ParcelKey, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	return dynago.Retry(ctx, func() error {
+		it, versioned, err := s.start(ctx, key, o, false)
+		if err != nil {
+			return err
+		}
+		before := &it.Parcel
+		if before.State != ParcelStateReceived {
+			return ErrParcelShelvePrecondition
+		}
+		after := before.clone()
+		after.State = ParcelStateShelved
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return dynago.StaleAs(versioned, err)
+		}
+		o.Written(it.Rev + 1)
+		return nil
+	})
+}
+
+// SendOut updates state of a Parcel when state in ["received", "shelved"] (else
+// ErrParcelSendOutPrecondition). It reads the item consistently first (not with dynago.From)
+// because the change affects the OnSite index entry, the ByTag index entry, the Known index entry,
+// counter DepotParcels, counter TagCounts, counter StateCounts, then writes everything in one
+// transaction guarded by the item's revision. In the same transaction it maintains counter
+// DepotParcels, counter TagCounts, counter StateCounts, copy index OnSite, copy index ByTag.
+func (s *ParcelStore) SendOut(ctx context.Context, k ParcelKey, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	return dynago.Retry(ctx, func() error {
+		it, versioned, err := s.start(ctx, key, o, false)
+		if err != nil {
+			return err
+		}
+		before := &it.Parcel
+		if before.State != ParcelStateReceived && before.State != ParcelStateShelved {
+			return ErrParcelSendOutPrecondition
+		}
+		after := before.clone()
+		after.State = ParcelStateOut
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return dynago.StaleAs(versioned, err)
+		}
+		o.Written(it.Rev + 1)
+		return nil
+	})
+}
+
+// Lose updates state of a Parcel when state != "lost" (else ErrParcelLosePrecondition). It reads
+// the item consistently first (not with dynago.From) because the change affects the OnSite index
+// entry, the ByTag index entry, the Known index entry, counter DepotParcels, counter TagCounts,
+// counter StateCounts, then writes everything in one transaction guarded by the item's revision. In
+// the same transaction it maintains counter DepotParcels, counter TagCounts, counter StateCounts,
+// copy index OnSite, copy index ByTag.
+func (s *ParcelStore) Lose(ctx context.Context, k ParcelKey, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	return dynago.Retry(ctx, func() error {
+		it, versioned, err := s.start(ctx, key, o, false)
+		if err != nil {
+			return err
+		}
+		before := &it.Parcel
+		if before.State == ParcelStateLost {
+			return ErrParcelLosePrecondition
+		}
+		after := before.clone()
+		after.State = ParcelStateLost
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return dynago.StaleAs(versioned, err)
+		}
+		o.Written(it.Rev + 1)
+		return nil
+	})
+}
+
+// ParcelAnnotate holds the new values for Parcel.Annotate.
+type ParcelAnnotate struct {
+	Note string
+}
+
+// Annotate updates note of a Parcel when state != "lost" (else ErrParcelAnnotatePrecondition) with
+// a single conditional UpdateItem.
+func (s *ParcelStore) Annotate(ctx context.Context, k ParcelKey, v ParcelAnnotate, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	sets := []dynago.Set{
+		{Attr: "note", Value: v.Note, Remove: v.Note == ""},
+	}
+	guard, err := s.guard(key, o, false)
+	if err != nil {
+		return err
+	}
+	return dynago.Retry(ctx, func() error {
+		rev, err := dynago.UpdateFields(ctx, s.t, key, sets, []dynago.Cond{{Attr: "state", Value: ParcelStateLost, Zero: false, Not: true}}, guard, ErrParcelAnnotatePrecondition)
+		if err == nil {
+			o.Written(rev)
+		}
+		return dynago.StaleAs(guard.ExpectRev != 0, err)
+	})
+}
+
+// ParcelRetag holds the new values for Parcel.Retag.
+type ParcelRetag struct {
+	Tags []string
+}
+
+// Retag updates tags of a Parcel. It reads the item consistently first (not with dynago.From)
+// because the change affects the ByTag index entry, counter TagCounts, then writes everything in
+// one transaction guarded by the item's revision. In the same transaction it maintains counter
+// DepotParcels, counter TagCounts, counter StateCounts, copy index OnSite, copy index ByTag.
+func (s *ParcelStore) Retag(ctx context.Context, k ParcelKey, v ParcelRetag, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	return dynago.Retry(ctx, func() error {
+		it, versioned, err := s.start(ctx, key, o, false)
+		if err != nil {
+			return err
+		}
+		before := &it.Parcel
+		after := before.clone()
+		after.Tags = v.Tags
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		changes := []dynago.Change{{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}}
+		derived, err := dynago.DiffAll(s.t, changes)
+		if err != nil {
+			return err
+		}
+		ops = append(ops, derived...)
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return dynago.StaleAs(versioned, err)
+		}
+		o.Written(it.Rev + 1)
+		return nil
+	})
+}
+
+// ShelveSeveral updates state of several Parcels, the same way, each when state = "received". The
+// items are read with one consistent BatchGetItem and written up to 9 to a transaction, each
+// guarded by its revision; a counter item several of them change is updated once per transaction.
+// In the same transaction it maintains counter DepotParcels, counter TagCounts, counter
+// StateCounts, copy index OnSite, copy index ByTag. Each transaction is atomic; the batch is not.
+// It returns nil if every item was written, and otherwise a *dynago.BatchError naming those that
+// were not, by their place in keys, each with its error (ErrParcelNotFound,
+// ErrParcelShelveSeveralPrecondition, or what refused its transaction): the others were written. A
+// key given twice is written once.
+func (s *ParcelStore) ShelveSeveral(ctx context.Context, keys []ParcelKey) error {
+	ks := make([]dynago.Key, len(keys))
+	for i, k := range keys {
+		key, err := k.dynamoKey()
+		if err != nil {
+			return err
+		}
+		ks[i] = key
+	}
+	return dynago.BatchWrite(ctx, s.db, s.t, ks, 9, ErrParcelNotFound, func(key dynago.Key, raw dynamo.Item) (dynago.Op, dynago.Change, error) {
+		it, err := parcelDecode(raw)
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		before := &it.Parcel
+		if before.State != ParcelStateReceived {
+			return dynago.Op{}, dynago.Change{}, ErrParcelShelveSeveralPrecondition
+		}
+		after := before.clone()
+		after.State = ParcelStateShelved
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		return dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), dynago.Change{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}, nil
+	})
+}
+
+// ParcelAnnotateSeveral holds the new values for Parcel.AnnotateSeveral.
+type ParcelAnnotateSeveral struct {
+	Note string
+}
+
+// AnnotateSeveral updates note of several Parcels, the same way. The items are read with one
+// consistent BatchGetItem and written up to 100 to a transaction, each guarded by its revision; a
+// counter item several of them change is updated once per transaction. In the same transaction it
+// maintains counter DepotParcels, counter TagCounts, counter StateCounts, copy index OnSite, copy
+// index ByTag. Each transaction is atomic; the batch is not. It returns nil if every item was
+// written, and otherwise a *dynago.BatchError naming those that were not, by their place in keys,
+// each with its error (ErrParcelNotFound, or what refused its transaction): the others were
+// written. A key given twice is written once.
+func (s *ParcelStore) AnnotateSeveral(ctx context.Context, keys []ParcelKey, v ParcelAnnotateSeveral) error {
+	ks := make([]dynago.Key, len(keys))
+	for i, k := range keys {
+		key, err := k.dynamoKey()
+		if err != nil {
+			return err
+		}
+		ks[i] = key
+	}
+	return dynago.BatchWrite(ctx, s.db, s.t, ks, 100, ErrParcelNotFound, func(key dynago.Key, raw dynamo.Item) (dynago.Op, dynago.Change, error) {
+		it, err := parcelDecode(raw)
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		before := &it.Parcel
+		after := before.clone()
+		after.Note = v.Note
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		return dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), dynago.Change{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}, nil
+	})
+}
+
+// requireArriveDepot returns the writes Parcel.Arrive makes to the Depot: it requires any Depot
+// there is to have closed = false, and creates the Depot if there is none (with name "unnamed"),
+// and adds 1 to its parcels. Unless read is set, it assumes that state without reading the Depot:
+// if the assumption is wrong, the transaction fails with dynago.ErrNeedsRead and the caller runs
+// again with read set.
+func (s *ParcelStore) requireArriveDepot(ctx context.Context, e *Parcel, read bool) ([]dynago.Op, dynago.Change, error) {
+	k := DepotKey{DepotID: e.DepotID}
+	key, err := k.dynamoKey()
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	if !read {
+		before := Depot{DepotID: k.DepotID, Closed: false}
+		after := before.clone()
+		after.Parcels++
+		sets := []dynago.Set{
+			{Attr: "parcels", Value: 1, Add: true},
+		}
+		u := s.t.Update("PK", key.PK).Range("SK", key.SK)
+		dynago.SetFields(u, sets)
+		dynago.GuardUpdate(u, dynago.Guard{}, dynago.Now())
+		dynago.CondUpdate(u, dynago.Cond{Attr: "closed", Value: false, Zero: true})
+		return []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}, dynago.Change{Owner: key, Before: depotDerived(&before, key), After: depotDerived(&after, key)}, nil
+	}
+	it, err := (&DepotStore{db: s.db, t: s.t}).load(ctx, key, true)
+	if err == ErrDepotNotFound {
+		// There is none: create it, unless one appears before the write commits.
+		after := Depot{DepotID: k.DepotID}
+		after.Name = "unnamed"
+		after.Parcels++
+		if err := after.checkKeyParts(); err != nil {
+			return nil, dynago.Change{}, err
+		}
+		rev, stamp := dynago.NewRev(), dynago.NewStamp()
+		after.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+		put := s.t.Put(depotToItem(&after, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+		return []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}, dynago.Change{Owner: key, After: depotDerived(&after, key)}, nil
+	}
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	before := &it.Depot
+	if before.Closed {
+		return nil, dynago.Change{}, ErrParcelArriveRequiresDepot
+	}
+	after := before.clone()
+	after.Parcels++
+	item, err := dynago.KeepUnknown(it.raw, depotKnown, depotToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	return []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}, dynago.Change{Owner: key, Before: depotDerived(before, key), After: depotDerived(&after, key)}, nil
+}
+
+// requireLeaveDepot returns the writes Parcel.Leave makes to the Depot: it creates the Depot if
+// there is none. Unless read is set, it assumes that state without reading the Depot: if the
+// assumption is wrong, the transaction fails with dynago.ErrNeedsRead and the caller runs again
+// with read set.
+func (s *ParcelStore) requireLeaveDepot(ctx context.Context, e *Parcel, read bool) ([]dynago.Op, dynago.Change, error) {
+	k := DepotKey{DepotID: e.DepotID}
+	key, err := k.dynamoKey()
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	if !read {
+		req := dynago.Requirement{Key: key}
+		return []dynago.Op{dynago.CheckOp(key, dynago.CheckRequirement(s.t, req), dynago.ErrNeedsRead)}, dynago.Change{}, nil
+	}
+	_, err = (&DepotStore{db: s.db, t: s.t}).load(ctx, key, true)
+	if err == ErrDepotNotFound {
+		// There is none: create it, unless one appears before the write commits.
+		after := Depot{DepotID: k.DepotID}
+		if err := after.checkKeyParts(); err != nil {
+			return nil, dynago.Change{}, err
+		}
+		rev, stamp := dynago.NewRev(), dynago.NewStamp()
+		after.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+		put := s.t.Put(depotToItem(&after, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+		return []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}, dynago.Change{Owner: key, After: depotDerived(&after, key)}, nil
+	}
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	req := dynago.Requirement{Key: key}
+	return []dynago.Op{dynago.CheckOp(key, dynago.CheckRequirement(s.t, req), dynago.ErrStale)}, dynago.Change{}, nil
+}
+
+// ---- Damage ----
+
+// Damage is stored in the fixture table.
+type Damage struct {
+	DepotID  string `dynamo:"depotId"`
+	ParcelID string `dynamo:"parcelId"`
+	DamageID string `dynamo:"damageId"`
+	Detail   string `dynamo:"detail,omitempty"`
+	Fragile  bool   `dynamo:"fragile,omitempty"`
+
+	loaded *damageLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
+}
+
+// damageLoaded remembers the stored state an entity was read at, so a write passed the entity
+// with dynago.From can start from it without reading again.
+type damageLoaded struct {
+	rev      int64
+	v        int
+	snapshot Damage
+	raw      dynamo.Item // as stored, including attributes this code doesn't know
+}
+
+// Version identifies the stored state e was read at, for optimistic concurrency: pass it back
+// with dynago.IfVersion (e.g. from an ETag) to make a write fail if anything changed since.
+// It is "" for an entity that was not read from the store.
+func (e *Damage) Version() string {
+	if e.loaded == nil {
+		return ""
+	}
+	return dynago.FormatVersion(e.loaded.rev)
+}
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Damage) Timestamps() dynago.Timestamps { return e.stamps }
+
+// clone copies e, including its slices and maps, without its loaded state.
+func (e *Damage) clone() Damage {
+	c := *e
+	c.loaded = nil
+	return c
+}
+
+// checkKeyParts rejects values containing a character their key templates use as a separator.
+func (e *Damage) checkKeyParts() error {
+	if err := dynago.CheckKeyPart("depotId", e.DepotID, "#"); err != nil {
+		return err
+	}
+	if err := dynago.CheckKeyPart("parcelId", e.ParcelID, "#"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// DamageKey identifies a Damage.
+type DamageKey struct {
+	DepotID  string
+	ParcelID string
+	DamageID string
+}
+
+// Key returns the primary key of e.
+func (e *Damage) Key() DamageKey {
+	return DamageKey{DepotID: e.DepotID, ParcelID: e.ParcelID, DamageID: e.DamageID}
+}
+
+func (k DamageKey) dynamoKey() (dynago.Key, error) {
+	if k.DepotID == "" || k.ParcelID == "" || k.DamageID == "" {
+		return dynago.Key{}, fmt.Errorf("%w: Damage needs depotId, parcelId and damageId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", k.DepotID, "#"); err != nil {
+		return dynago.Key{}, err
+	}
+	if err := dynago.CheckKeyPart("parcelId", k.ParcelID, "#"); err != nil {
+		return dynago.Key{}, err
+	}
+	return dynago.Key{PK: "D#" + k.DepotID, SK: "DAMAGE#" + k.ParcelID + "#" + k.DamageID}, nil
+}
+
+// Errors returned by DamageStore. Each wraps the matching dynago sentinel.
+var (
+	ErrDamageNotFound              = fmt.Errorf("%w: Damage", dynago.ErrNotFound)
+	ErrDamageExists                = fmt.Errorf("%w: Damage", dynago.ErrExists)
+	ErrDamageFileRequiresParcel    = fmt.Errorf("%w: Damage.File requires the Parcel to exist with state in [\"received\", \"shelved\", \"returned\"]", dynago.ErrPrecondition)
+	ErrDamageDisputeRequiresParcel = fmt.Errorf("%w: Damage.Dispute requires the Parcel to exist with state != \"lost\"", dynago.ErrPrecondition)
+)
+
+const damageVersion = 1
+
+type damageItem struct {
+	Damage
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
+
+	raw dynamo.Item // as read, for writes to keep attributes this code doesn't know
+}
+
+// damageKnown is every attribute this code writes on Damage items.
+var damageKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "depotId": true, "parcelId": true, "damageId": true, "detail": true, "fragile": true}
+
+// damageToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func damageToItem(e *Damage, key dynago.Key, rev int64, created, updated string) *damageItem {
+	it := &damageItem{Damage: *e, PK: key.PK, SK: key.SK, T: "Damage", V: damageVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
+	return it
+}
+
+// ParcelDamages is one counter item for each parcel with damage reports.
+type ParcelDamages struct {
+	// Reports counts items.
+	Reports int64 `dynamo:"reports"`
+}
+
+// ParcelDamagesKey identifies a ParcelDamages counter.
+type ParcelDamagesKey struct {
+	DepotID  string
+	ParcelID string
+}
+
+// ParcelDamagesEntry is one ParcelDamages counter item, with the key that identifies it.
+type ParcelDamagesEntry struct {
+	Key ParcelDamagesKey
+	ParcelDamages
+}
+
+// damageDerived returns the counter contributions, claims and copies that exist because of e.
+func damageDerived(e *Damage, owner dynago.Key) []dynago.Derived {
+	_ = owner // only sharded counters use it
+	var d []dynago.Derived
+	// counter ParcelDamages
+	if e.DepotID != "" && e.ParcelID != "" {
+		k := dynago.Key{PK: "D#" + e.DepotID, SK: "DAMAGED#" + e.ParcelID}
+		d = append(d, dynago.Derived{Kind: dynago.KindCounter, Key: k, Type: "ParcelDamages", Attr: "reports", Amount: 1})
+	}
+	return d
+}
+
+// DamageStore reads and writes Damage items. Only the access patterns declared in the schema
+// exist as methods.
+type DamageStore struct {
+	db *dynamo.DB
+	t  dynamo.Table
+}
+
+func (s *DamageStore) load(ctx context.Context, key dynago.Key, consistent bool) (*damageItem, error) {
+	var raw dynamo.Item
+	found, err := dynago.GetOne(ctx, s.t, key, consistent, &raw)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrDamageNotFound
+	}
+	return damageDecode(raw)
+}
+
+// damageDecode decodes a stored item, remembering its state for writes passed dynago.From.
+func damageDecode(raw dynamo.Item) (*damageItem, error) {
+	var it damageItem
+	if err := dynamo.UnmarshalItem(raw, &it); err != nil {
+		return nil, err
+	}
+	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
+	it.loaded = &damageLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
+	return &it, nil
+}
+
+func damageDecodeAll(raws []dynamo.Item) ([]Damage, error) {
+	out := make([]Damage, 0, len(raws))
+	for _, raw := range raws {
+		it, err := damageDecode(raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, it.Damage)
+	}
+	return out, nil
+}
+
+// from returns the entity passed with dynago.From, checked to be this item and read from the
+// store, or nil if none was passed.
+func (s *DamageStore) from(key dynago.Key, o dynago.WriteOptions) (*Damage, error) {
+	if o.From == nil {
+		return nil, nil
+	}
+	from, ok := o.From.(*Damage)
+	if !ok || from == nil || from.loaded == nil {
+		return nil, fmt.Errorf("%w: dynago.From needs a *Damage read from its own item, not built by hand or read through a copy index", dynago.ErrVersionRequired)
+	}
+	if fk, err := from.Key().dynamoKey(); err != nil || fk != key {
+		return nil, fmt.Errorf("%w: the Damage passed with dynago.From is a different item", dynago.ErrInvalidKey)
+	}
+	return from, nil
+}
+
+// start returns the state a read-modify-write starts from: the entity passed with dynago.From
+// (no read), or a consistent read. versioned reports whether the caller named a version, in
+// which case a concurrent change is a mismatch for the caller rather than something to retry.
+func (s *DamageStore) start(ctx context.Context, key dynago.Key, o dynago.WriteOptions, required bool) (*damageItem, bool, error) {
+	expect, err := o.ExpectedRev()
+	if err != nil {
+		return nil, false, err
+	}
+	from, err := s.from(key, o)
+	if err != nil {
+		return nil, false, err
+	}
+	if from != nil {
+		if expect != 0 && expect != from.loaded.rev {
+			return nil, false, dynago.ErrVersionMismatch
+		}
+		return &damageItem{Damage: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v, raw: from.loaded.raw}, true, nil
+	}
+	if required && expect == 0 {
+		return nil, false, dynago.ErrVersionRequired
+	}
+	it, err := s.load(ctx, key, true)
+	if err != nil {
+		return nil, false, err
+	}
+	if expect != 0 && it.Rev != expect {
+		return nil, false, dynago.ErrVersionMismatch
+	}
+	return it, expect != 0, nil
+}
+
+// Get reads a Damage by primary key with one eventually consistent GetItem.
+func (s *DamageStore) Get(ctx context.Context, k DamageKey) (*Damage, error) {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return nil, err
+	}
+	it, err := s.load(ctx, key, false)
+	if err != nil {
+		return nil, err
+	}
+	return &it.Damage, nil
+}
+
+// DamageDamagedQuery selects the partition for Damage.Damaged.
+type DamageDamagedQuery struct {
+	DepotID string
+}
+
+// Damaged returns one page of the ParcelDamages counters of a partition, one for each parcelId
+// something has counted, in key order, with exactly one strongly consistent Query (default 2, max
+// 100 items). It returns the cursor for the next page, or "" at the end.
+func (s *DamageStore) Damaged(ctx context.Context, q DamageDamagedQuery, page dynago.Page) ([]ParcelDamagesEntry, string, error) {
+	if q.DepotID == "" {
+		return nil, "", fmt.Errorf("%w: Damaged needs depotId", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", q.DepotID, "#"); err != nil {
+		return nil, "", err
+	}
+	pk := "D#" + q.DepotID
+	var rows []struct {
+		SK string `dynamo:"SK"`
+		ParcelDamages
+	}
+	next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{Scope: "Damage.Damaged#00d6f1aa\x00" + pk, PK: pk, PKAttr: "PK", SKAttr: "SK", Prefix: "DAMAGED#", PageSize: 2, MaxPage: 100, Consistent: true}, page, &rows)
+	if err != nil {
+		return nil, "", err
+	}
+	out := make([]ParcelDamagesEntry, 0, len(rows))
+	for _, row := range rows {
+		// A counter item stores no fields: its sort key says which one it is.
+		parts, ok := dynago.SplitKey(row.SK, "DAMAGED#", "")
+		if !ok {
+			return nil, "", fmt.Errorf("dynago: ParcelDamages item with sort key %q, which doesn't fit DAMAGED#{parcelId}", row.SK)
+		}
+		out = append(out, ParcelDamagesEntry{Key: ParcelDamagesKey{DepotID: q.DepotID, ParcelID: parts[0]}, ParcelDamages: row.ParcelDamages})
+	}
+	return out, next, nil
+}
+
+// File creates a Damage, failing with ErrDamageExists if one already exists. In the same
+// transaction it requires the Parcel to exist with state in ["received", "shelved", "returned"]
+// (else ErrDamageFileRequiresParcel), and sets its fragile to Damage.fragile (if that has a value),
+// and adds 1 to its damages. In the same transaction it maintains counter ParcelDamages. Afterwards
+// e.Version() returns the new item's version.
+func (s *DamageStore) File(ctx context.Context, e *Damage) error {
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		err := dynago.ReadIfNeeded(func(read bool) error {
+			put := s.t.Put(damageToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+			ops := []dynago.Op{dynago.CreateOp(key, put, ErrDamageExists, rev)}
+			changes := []dynago.Change{{Owner: key, After: damageDerived(e, key)}}
+			// requires Parcel
+			if e.DepotID == "" || e.ParcelID == "" {
+				return fmt.Errorf("%w: Damage.File requires the Parcel, keyed by depotId and parcelId", dynago.ErrFieldRequired)
+			}
+			parcelOps, parcelChange, err := s.requireFileParcel(ctx, e, read)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, parcelOps...)
+			changes = append(changes, parcelChange)
+			derived, err := dynago.DiffAll(s.t, changes)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, derived...)
+			return dynago.Run(ctx, s.db, ops)
+		})
+		if err != nil {
+			return err
+		}
+		e.loaded = &damageLoaded{rev: rev, v: damageVersion, snapshot: e.clone()}
+		return nil
+	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
+}
+
+// DamageDispute holds the new values for Damage.Dispute.
+type DamageDispute struct {
+	Detail string
+}
+
+// Dispute updates detail of a Damage. The change to the items it requires is known from the
+// arguments, so it runs without reading the item: conditional writes in one transaction. If the
+// item is not in the state assumed, it falls back to reading it. In the same transaction it
+// maintains counter ParcelDamages. In the same transaction it requires the Parcel to exist with
+// state != "lost" (else ErrDamageDisputeRequiresParcel), and sets its note to "disputed" and
+// lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes.
+func (s *DamageStore) Dispute(ctx context.Context, k DamageKey, v DamageDispute, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	// The derived changes depend only on the key and the state `when` pins, so try without
+	// reading. ReturnVersion and dynago.From need the read path.
+	if o.From == nil && o.NewVersion == nil {
+		expect, err := o.ExpectedRev()
+		if err != nil {
+			return err
+		}
+		err = dynago.Retry(ctx, func() error {
+			before := Damage{DepotID: k.DepotID, ParcelID: k.ParcelID, DamageID: k.DamageID}
+			after := before.clone()
+			after.Detail = v.Detail
+			sets := []dynago.Set{
+				{Attr: "detail", Value: v.Detail, Remove: v.Detail == ""},
+			}
+			u := s.t.Update("PK", key.PK).Range("SK", key.SK)
+			dynago.SetFields(u, sets)
+			dynago.GuardUpdate(u, dynago.Guard{ExpectRev: expect}, dynago.Now())
+			ops := []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}
+			changes := []dynago.Change{{Owner: key, Before: damageDerived(&before, key), After: damageDerived(&after, key)}}
+			// requires Parcel
+			if after.DepotID == "" || after.ParcelID == "" {
+				return fmt.Errorf("%w: Damage.Dispute requires the Parcel, keyed by depotId and parcelId", dynago.ErrFieldRequired)
+			}
+			parcelOps, parcelChange, err := s.requireDisputeParcel(ctx, &after, false)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, parcelOps...)
+			changes = append(changes, parcelChange)
+			derived, err := dynago.DiffAll(s.t, changes)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, derived...)
+			return dynago.Run(ctx, s.db, ops)
+		})
+		if !dynago.NeedsRead(err) {
+			return err
+		}
+		// The item was absent, not in the assumed state, or older: the read path reports which.
+	}
+	return dynago.Retry(ctx, func() error {
+		it, versioned, err := s.start(ctx, key, o, false)
+		if err != nil {
+			return err
+		}
+		before := &it.Damage
+		after := before.clone()
+		after.Detail = v.Detail
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, damageKnown, damageToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		base := ops
+		return dynago.StaleAs(versioned, dynago.ReadIfNeeded(func(read bool) error {
+			ops := append([]dynago.Op(nil), base...)
+			changes := []dynago.Change{{Owner: key, Before: damageDerived(before, key), After: damageDerived(&after, key)}}
+			// requires Parcel
+			if after.DepotID == "" || after.ParcelID == "" {
+				return fmt.Errorf("%w: Damage.Dispute requires the Parcel, keyed by depotId and parcelId", dynago.ErrFieldRequired)
+			}
+			parcelOps, parcelChange, err := s.requireDisputeParcel(ctx, &after, read)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, parcelOps...)
+			changes = append(changes, parcelChange)
+			derived, err := dynago.DiffAll(s.t, changes)
+			if err != nil {
+				return err
+			}
+			ops = append(ops, derived...)
+			if err := dynago.Run(ctx, s.db, ops); err != nil {
+				return err
+			}
+			o.Written(it.Rev + 1)
+			return nil
+		}))
+	})
+}
+
+// requireFileParcel returns the writes Damage.File makes to the Parcel: it requires the Parcel to
+// exist with state in ["received", "shelved", "returned"], and sets its fragile to Damage.fragile
+// (if that has a value), and adds 1 to its damages. It reads the Parcel first, because the change
+// to its derived items depends on more than the state required.
+func (s *DamageStore) requireFileParcel(ctx context.Context, e *Damage, read bool) ([]dynago.Op, dynago.Change, error) {
+	k := ParcelKey{DepotID: e.DepotID, ParcelID: e.ParcelID}
+	key, err := k.dynamoKey()
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	_ = read // the Parcel is always read: see above
+	it, err := (&ParcelStore{db: s.db, t: s.t}).load(ctx, key, true)
+	if err == ErrParcelNotFound {
+		return nil, dynago.Change{}, ErrDamageFileRequiresParcel
+	}
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	before := &it.Parcel
+	if before.State != ParcelStateReceived && before.State != ParcelStateShelved && before.State != ParcelStateReturned {
+		return nil, dynago.Change{}, ErrDamageFileRequiresParcel
+	}
+	after := before.clone()
+	after.Damages++
+	if e.Fragile {
+		after.Fragile = e.Fragile
+	}
+	item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	return []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}, dynago.Change{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}, nil
+}
+
+// requireDisputeParcel returns the writes Damage.Dispute makes to the Parcel: it requires the
+// Parcel to exist with state != "lost", and sets its note to "disputed" and lastDispute to
+// Damage.detail (if that has a value), and adds 1 to its disputes. Unless read is set, it assumes
+// that state without reading the Parcel: if the assumption is wrong, the transaction fails with
+// dynago.ErrNeedsRead and the caller runs again with read set.
+func (s *DamageStore) requireDisputeParcel(ctx context.Context, e *Damage, read bool) ([]dynago.Op, dynago.Change, error) {
+	k := ParcelKey{DepotID: e.DepotID, ParcelID: e.ParcelID}
+	key, err := k.dynamoKey()
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	if !read {
+		before := Parcel{DepotID: k.DepotID, ParcelID: k.ParcelID}
+		after := before.clone()
+		after.Note = "disputed"
+		after.Disputes++
+		if e.Detail != "" {
+			after.LastDispute = e.Detail
+		}
+		sets := []dynago.Set{
+			{Attr: "note", Value: "disputed"},
+			{Attr: "disputes", Value: 1, Add: true},
+		}
+		if e.Detail != "" {
+			sets = append(sets, dynago.Set{Attr: "lastDispute", Value: after.LastDispute, Remove: after.LastDispute == ""})
+		}
+		u := s.t.Update("PK", key.PK).Range("SK", key.SK)
+		dynago.SetFields(u, sets)
+		dynago.GuardUpdate(u, dynago.Guard{}, dynago.Now())
+		dynago.CondUpdate(u, dynago.Cond{Attr: "state", Value: ParcelStateLost, Zero: false, Not: true})
+		return []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}, dynago.Change{Owner: key, Before: parcelDerived(&before, key), After: parcelDerived(&after, key)}, nil
+	}
+	it, err := (&ParcelStore{db: s.db, t: s.t}).load(ctx, key, true)
+	if err == ErrParcelNotFound {
+		return nil, dynago.Change{}, ErrDamageDisputeRequiresParcel
+	}
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	before := &it.Parcel
+	if before.State == ParcelStateLost {
+		return nil, dynago.Change{}, ErrDamageDisputeRequiresParcel
+	}
+	after := before.clone()
+	after.Note = "disputed"
+	after.Disputes++
+	if e.Detail != "" {
+		after.LastDispute = e.Detail
+	}
+	item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+	if err != nil {
+		return nil, dynago.Change{}, err
+	}
+	return []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}, dynago.Change{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}, nil
 }
 
 // ---- migration ----

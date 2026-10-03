@@ -198,6 +198,7 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 	newGen := prevGen != 0 && gen != prevGen
 	var notes []Note
 	var errs []error
+	unversioned := false // a shape changed under the version the lock recorded
 	switch {
 	case prevGen == 0 && gen > 1 && !opts.NewHistory:
 		errs = append(errs, fmt.Errorf("table: it is at generation %d, but the lock file has no history. Restore %s from version control, or run with -new-history to start the history here", gen, m.Output.Lock))
@@ -268,6 +269,7 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 					msg += fmt.Sprintf(", and start a new table generation (`table.generation: %d`), since existing items don't fit: %s", gen+1, strings.Join(misfits, "; "))
 				}
 				errs = append(errs, fmt.Errorf("%s. Changes: %s", msg, strings.Join(texts(dedupeChanges(changes)), "; ")))
+				unversioned = true
 				continue
 			}
 			if len(misfits) > 0 && !newGen {
@@ -283,6 +285,10 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 			}
 			h.Versions = append(h.Versions, Version{e.Version, gen, fp, shape, newGen})
 		}
+	}
+	if unversioned && firstDraft(prev) {
+		// Nothing in the lock says a table was ever changed: it may never have been created.
+		errs = append(errs, fmt.Errorf("or, if no table has been created from this schema yet, delete %s and generate again: there are no stored items to keep track of, and the design is recorded afresh as version 1", m.Output.Lock))
 	}
 	if newGen && len(errs) == 0 {
 		job := "Run the migration job"
@@ -307,6 +313,21 @@ func Apply(m *schema.Model, prev *File, opts Options) (*File, []Note, error) {
 	}
 	m.Previous = previous(m, next)
 	return next, notes, nil
+}
+
+// firstDraft reports whether the lock records only a first design: one generation, and every
+// entity at its first version. A schema still being designed, before any table exists, looks like
+// this; so does a table that has never changed.
+func firstDraft(f *File) bool {
+	if f.Generation > 1 || len(f.Tables) > 1 {
+		return false
+	}
+	for _, h := range f.Entities {
+		if len(h.Versions) != 1 || h.Versions[0].Version != 1 {
+			return false
+		}
+	}
+	return true
 }
 
 // Table returns the record of a generation's table, or nil.
@@ -396,7 +417,14 @@ func ShapeOf(e *schema.Entity, ttlAttr string) Shape {
 func preds(ps []*schema.Pred) []string {
 	var out []string
 	for _, p := range ps {
-		out = append(out, fmt.Sprintf("%s=%v", p.Field.Name, p.Value))
+		switch {
+		case p.In != nil:
+			out = append(out, fmt.Sprintf("%s in %v", p.Field.Name, p.In))
+		case p.Not:
+			out = append(out, fmt.Sprintf("%s!=%v", p.Field.Name, p.Value))
+		default:
+			out = append(out, fmt.Sprintf("%s=%v", p.Field.Name, p.Value))
+		}
 	}
 	return out
 }

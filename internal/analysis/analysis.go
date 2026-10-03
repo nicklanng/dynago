@@ -165,7 +165,7 @@ func (a *analyzer) assumptions() {
 	a.r.Assumptions = append(a.r.Assumptions, horizon, peak,
 		"Items per partition follow the volumes: an entity's items per parent (typical and max), multiplied up the parents. A partition's largest count takes the biggest skew along its path, not every one at once.",
 		"An enum in a partition key splits the items evenly among its values typically; at worst they all share one. A field that refers to another entity (by name, ref or requires) spreads the items evenly over that entity's items, unless volume.by says otherwise. Any other field leaves the count unknown.",
-		"Index entries are counted as if every item had one: `where` and empty key fields only make an index smaller.",
+		"An index with a `where` holds the share of the items its `matches` declares. Without `matches`, every item is counted, so its sizes, traffic and write costs are upper bounds, marked as such. Empty key fields only make an index smaller.",
 		"The busiest partition gets traffic in proportion to its share of the items: its largest count over the entity's total. A write's declared hot_key_rate replaces that estimate for every partition it touches.",
 		fmt.Sprintf("A partition key value takes at most %d WRU and %d RRU per second. Risk is the larger share of either at peak: low under 10%%, medium under 50%%, high above.", cost.PartitionWCU, cost.PartitionRCU),
 	)
@@ -247,8 +247,17 @@ func (a *analyzer) applyPolicy() {
 
 // accept matches the schema's acceptances with findings. An acceptance must name a known rule,
 // match a finding of its subject, and not accept an error: errors are fixed, not accepted.
+//
+// An acceptance on an entity also covers the rule's findings about what the entity declares (its
+// fields, indexes, constraints, counters, reads and writes), so one reason that holds for all of
+// them is given once. One on the object itself takes precedence.
 func (a *analyzer) accept() {
-	for _, acc := range a.m.Accepts {
+	// Entity-wide acceptances first, so that a closer one replaces them on its own finding.
+	accs := slices.Clone(a.m.Accepts)
+	slices.SortStableFunc(accs, func(x, y *schema.Acceptance) int {
+		return cmp.Compare(b2i(x.Subject.Kind != schema.SubjectEntity), b2i(y.Subject.Kind != schema.SubjectEntity))
+	})
+	for _, acc := range accs {
 		where := fmt.Sprintf("%s accept %s", subjectText(acc.Subject), acc.Rule)
 		rule := RuleByID(acc.Rule)
 		if rule == nil {
@@ -258,23 +267,44 @@ func (a *analyzer) accept() {
 		if a.r.Policy.Rules[acc.Rule] == "off" {
 			continue // the policy turned the rule off: nothing to accept
 		}
-		matched := false
+		matched, isError := false, false
 		for i := range a.r.Findings {
 			f := &a.r.Findings[i]
-			if f.Rule != acc.Rule || f.Subject != acc.Subject {
+			if f.Rule != acc.Rule || !covers(acc.Subject, f.Subject) {
 				continue
 			}
 			matched = true
 			if f.Severity == Error {
-				a.add("accept-invalid", Error, acc.Subject, "%s: this finding is an error, which can't be accepted: fix the design, or the assumption behind the estimate", where)
+				isError = true
 				continue
 			}
 			f.Accepted = acc
 		}
-		if !matched {
+		switch {
+		case isError:
+			a.add("accept-invalid", Error, acc.Subject, "%s: this finding is an error, which can't be accepted: fix the design, or the assumption behind the estimate", where)
+		case !matched && acc.Subject.Kind == schema.SubjectEntity:
+			a.add("accept-invalid", Error, acc.Subject, "%s: neither %s nor anything it declares has a %s finding to accept; remove the acceptance", where, subjectText(acc.Subject), acc.Rule)
+		case !matched:
 			a.add("accept-invalid", Error, acc.Subject, "%s: %s has no %s finding to accept; remove the acceptance", where, subjectText(acc.Subject), acc.Rule)
 		}
 	}
+}
+
+// covers reports whether an acceptance on subject acc applies to a finding about f: the same
+// object, or for an entity, anything declared on it.
+func covers(acc, f schema.Subject) bool {
+	if acc == f {
+		return true
+	}
+	return acc.Kind == schema.SubjectEntity && f.Kind != schema.SubjectTable && f.Entity == acc.Entity
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func ruleList() string {

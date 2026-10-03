@@ -74,13 +74,59 @@
     },
     "predicates": {
       "type": "object",
-      "description": "Equality conditions, all of which must hold: {field: value}.",
+      "description": "Constants by field: {field: value}.",
       "minProperties": 1,
       "propertyNames": {
         "$ref": "#/$defs/camelName"
       },
       "additionalProperties": {
         "$ref": "#/$defs/scalar"
+      }
+    },
+    "conditions": {
+      "type": "object",
+      "description": "Conditions on fields, all of which must hold: {field: value} (equal to it), {field: {not: value}} (any other value) or {field: {in: [value, ...]}} (one of them).",
+      "minProperties": 1,
+      "propertyNames": {
+        "$ref": "#/$defs/camelName"
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "$ref": "#/$defs/scalar"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "not": {
+                "$ref": "#/$defs/scalar",
+                "description": "The field holds any value but this one."
+              }
+            },
+            "required": [
+              "not"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "in": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/$defs/scalar"
+                },
+                "minItems": 2,
+                "uniqueItems": true,
+                "description": "The field holds one of these values."
+              }
+            },
+            "required": [
+              "in"
+            ],
+            "additionalProperties": false
+          }
+        ]
       }
     },
     "fieldList": {
@@ -507,7 +553,13 @@
           "$ref": "#/$defs/projection"
         },
         "where": {
-          "$ref": "#/$defs/predicates"
+          "$ref": "#/$defs/conditions"
+        },
+        "matches": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "description": "The share of the entity's items that satisfy where (0.01 is one in a hundred), for sizing the index, its traffic and the writes that maintain it. Without it, every item is counted, as an upper bound."
         },
         "doc": {
           "$ref": "#/$defs/doc"
@@ -627,7 +679,7 @@
               "description": "An int field to sum."
             },
             "where": {
-              "$ref": "#/$defs/predicates"
+              "$ref": "#/$defs/conditions"
             },
             "limit": {
               "oneOf": [
@@ -693,12 +745,31 @@
                 }
               ]
             },
+            "batch": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "With get: key, the read takes several keys and returns the items that exist, with one BatchGetItem per 100 keys. The number is how many keys a call typically passes, which the estimates use."
+            },
             "query": {
               "type": "string",
-              "description": "key (the entity's own partition) or an index name."
+              "description": "key (the entity's own items in its partition), an index name, or partition (every entity listed in of, under this entity's partition key)."
+            },
+            "of": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/pascalName"
+              },
+              "minItems": 1,
+              "uniqueItems": true,
+              "description": "With query: partition, the entities whose items the read returns, each kind in its own field of the result. Every one must have the same partition key template as this entity."
             },
             "counter": {
               "$ref": "#/$defs/pascalName"
+            },
+            "all": {
+              "type": "boolean",
+              "default": false,
+              "description": "With counter, reads every item of the counter in one partition (one for each value of its sort key's own fields) with one Query, a page at a time, instead of the one item a full key names."
             },
             "scan": {
               "const": true,
@@ -812,8 +883,13 @@
               "description": "Fields set to constants. On a create, they override what the caller passed (a new loan is always active)."
             },
             "when": {
-              "$ref": "#/$defs/predicates",
+              "$ref": "#/$defs/conditions",
               "description": "Preconditions that must hold for the update."
+            },
+            "batch": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Makes an update take several keys and apply the same change to each, several items to a transaction, with a counter item they share updated once per transaction. The number is how many items a call typically changes, which the estimates use. Not with requires."
             },
             "versioned": {
               "enum": [
@@ -978,12 +1054,56 @@
           }
         },
         "when": {
-          "$ref": "#/$defs/predicates",
+          "$ref": "#/$defs/conditions",
           "description": "Values the required item must have. For an entity, a value \"{field}\" means this entity's field. For a counter, integers, where a missing value counts as 0."
         },
         "set": {
           "$ref": "#/$defs/predicates",
           "description": "Changes the required entity in the same transaction, maintaining its counters, indexes, claims and copies. Values are constants or \"{field}\" of this entity."
+        },
+        "ensure": {
+          "type": "object",
+          "description": "Creates the required entity when it is absent, in the same transaction, with its key from key, these fields (constants or \"{field}\" of this entity), and set, add and patch applied; its counters, claims and copies are written as a create of it writes them. One that is there is checked and changed as without ensure. May be empty: {}.",
+          "propertyNames": {
+            "$ref": "#/$defs/camelName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/scalar"
+          }
+        },
+        "add": {
+          "type": "object",
+          "description": "Adds to int fields of the required entity in the same transaction: a whole number (negative to subtract) or \"{field}\", an int field of this entity.",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/camelName"
+          },
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "not": {
+                  "const": 0
+                }
+              },
+              {
+                "type": "string",
+                "pattern": "^\\{[a-z][A-Za-z0-9]*\\}$"
+              }
+            ]
+          }
+        },
+        "patch": {
+          "type": "object",
+          "description": "Sets fields of the required entity from this entity's fields (\"{field}\"), each only when that field has a value: an empty one leaves the required entity's field as it is.",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/camelName"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^\\{[a-z][A-Za-z0-9]*\\}$"
+          }
         },
         "optional": {
           "type": "boolean",

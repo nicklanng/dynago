@@ -28,6 +28,22 @@ var awkward = []struct {
 	{"unique fields named like locals", "      claim: string\n      it: string\n      fmt: string\n    unique:\n      U: { fields: [claim, it, fmt] }\n    access:\n      ByU: { get: { unique: U } }\n", ""},
 	{"unique set, lowered and not last in its key", "      emails: string_set\n    unique:\n      Email: { fields: [tenantId, emails], pk: \"E#{emails|lower}#T#{tenantId}\" }\n    access:\n      ByEmail: { get: { unique: Email } }\n", ""},
 	{"scans, one of an expiring entity", "      until: time\n    ttl: until\n    access:\n      All: { scan: true, reason: nightly export, consistent: true }\n      Page: { scan: true, page: 10, max_page: 20, reason: backfill }\n", ""},
+	{"not and in on every type", "      open: bool\n      rank: int\n      mood: { type: enum, values: [calm, cross, glad] }\n" +
+		"    indexes:\n      Live: { pk: \"L#{tenantId}\", sk: \"T#{thingId}\", project: keys, where: { open: { not: false }, rank: { in: [1, 2] }, note: { not: \"\" }, mood: { not: cross } } }\n" +
+		"      Kept: { strategy: copy, pk: \"K#{tenantId}\", sk: \"T#{thingId}\", project: [name], where: { name: { in: [\"a && b\", \"c || d\"] } } }\n" +
+		"    counters:\n      Moods: { pk: \"M#{tenantId}\", sk: \"MOODS\", values: { happy: { count: true, where: { mood: { in: [calm, glad] }, rank: { not: 0 } } } } }\n" +
+		"    access:\n      Get: get\n      Live: { query: Live }\n      Kept: { query: Kept }\n", ""},
+	{"not and in as preconditions", "      W: { update: [name], when: { name: { not: \"x && y\" }, note: { in: [\"\", \"50% || 60%\"] } } }\n", ""},
+	{"batch get of an expiring entity, and counters read together", "      until: time\n      mood: { type: enum, values: [calm, cross] }\n    ttl: until\n" +
+		"    counters:\n      Moods: { pk: \"M#{tenantId}\", sk: \"MOOD#{mood}#N#{name}#END\", values: { key: count, things: count } }\n" +
+		"    access:\n      Several: { get: key, batch: 25 }\n      Moods: { counter: Moods, all: true, page: 10 }\n      Mood: { counter: Moods }\n", ""},
+	{"index and counters keyed by a set's elements", "      labels: { type: string_set, size: 40/100 }\n      open: bool\n" +
+		"    indexes:\n      ByLabel: { pk: \"L#{tenantId}#{labels|lower}\", sk: \"AT#{at}#{thingId}\", project: [name], where: { open: true } }\n" +
+		"      InOrder: { pk: \"O#{tenantId}\", sk: \"O#{labels}#T#{thingId}\", project: all }\n" +
+		"    counters:\n      Labels: { pk: \"C#{tenantId}\", sk: \"LABEL#{labels}\", values: { key: count, open: { count: true, where: { open: true }, limit: 5 } } }\n" +
+		"      Spread: { pk: \"S#{labels}#T#{tenantId}\", sk: \"SPREAD\", shards: 3, values: { things: count } }\n" +
+		"    access:\n      Labelled: { query: ByLabel, range: at }\n      InOrder: { query: InOrder }\n      Label: { counter: Labels }\n      Labels: { counter: Labels, all: true }\n      Spread: { counter: Spread }\n", ""},
+	{"batch writes", "      W: { update: [name, note], patch: [at], when: { note: { not: locked } }, batch: 30 }\n      Clear: { set: { note: \"\" }, batch: 5 }\n      Solo: { update: [name] }\n", ""},
 	{"range query key field named from", "      from: string\n    indexes:\n      ByFrom: { pk: \"F#{from}\", sk: \"AT#{at}\", project: keys }\n    access:\n      L: { query: ByFrom, range: at }\n", "collides with the range bound"},
 }
 
@@ -52,6 +68,34 @@ entities:
 var awkwardEntities = []struct {
 	name, extra, refused string
 }{
+	{"requires with not and in", "  Part:\n    fields:\n      tenantId: string\n      thingId: string\n      partId: string\n      label: string\n" +
+		"    key: { pk: \"T#{tenantId}\", sk: \"PART#{thingId}#{partId}\" }\n    writes:\n" +
+		"      Add: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, when: { name: { not: \"{label}\" }, note: { in: [a, b] } } } } }\n" +
+		"      Mark: { update: [label], requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, when: { note: { not: gone } }, set: { name: \"{label}\" } } } }\n", ""},
+	{"requires with add and patch of every type", "  Box:\n    fields:\n      tenantId: string\n      boxId: string\n      parts: int\n      weight: int\n      name: string\n      at: time\n      note: string\n" +
+		"    key: { pk: \"T#{tenantId}\", sk: \"BOX#{boxId}\" }\n    counters:\n      Weights: { pk: \"T#{tenantId}\", sk: \"WEIGHTS\", values: { total: { sum: weight } } }\n    writes:\n      Make: create\n" +
+		"  Part:\n    fields:\n      tenantId: string\n      boxId: string\n      partId: string\n      weight: int\n      seen: time\n      label: string\n" +
+		"    key: { pk: \"T#{tenantId}\", sk: \"PART#{boxId}#{partId}\" }\n    writes:\n" +
+		"      Add: { create: true, requires: { Box: { key: { tenantId: tenantId, boxId: boxId }, add: { parts: 1, weight: \"{weight}\" }, patch: { name: \"{label}\", at: \"{seen}\" } } } }\n" +
+		"      Drop: { delete: true, requires: { Box: { key: { tenantId: tenantId, boxId: boxId }, add: { parts: -1 }, when: { note: kept } } } }\n", ""},
+	{"partition read of an expiring entity and a singleton", "  Summary:\n    fields:\n      tenantId: string\n      until: time\n    ttl: until\n    key: { pk: \"T#{tenantId}\", sk: \"SUMMARY\" }\n" +
+		"    access:\n      Whole: { query: partition, of: [Thing, Summary], order: desc, page: 10, max_page: 20 }\n      Mine: { query: partition, of: [Summary] }\n", ""},
+	{"requires that create their target", "  Crate:\n    fields:\n      tenantId: string\n      crateId: string\n      label: { type: string, required: true }\n      emails: string_set\n      parts: int\n      until: time\n      mood: { type: enum, values: [calm, cross] }\n" +
+		"    ttl: until\n    key: { pk: \"T#{tenantId}\", sk: \"CRATE#{crateId}\" }\n" +
+		"    indexes:\n      ByLabel: { strategy: copy, pk: \"L#{tenantId}\", sk: \"L#{label}#{crateId}\", project: [parts] }\n" +
+		"    unique:\n      Label: { fields: [tenantId, label] }\n" +
+		"    counters:\n      Crates: { pk: \"T#{tenantId}\", sk: \"CRATES\", values: { n: count, calm: { count: true, where: { mood: calm } } } }\n" +
+		"  Part:\n    fields:\n      tenantId: string\n      crateId: string\n      partId: string\n      label: string\n      seen: time\n" +
+		"    key: { pk: \"T#{tenantId}\", sk: \"PART#{crateId}#{partId}\" }\n    writes:\n" +
+		"      Add: { create: true, requires: { Crate: { key: { tenantId: tenantId, crateId: crateId }, ensure: { label: \"{label}\", mood: calm }, add: { parts: 1 }, patch: { until: \"{seen}\" }, when: { mood: { not: cross } } } } }\n" +
+		"      Move: { update: [label], requires: { Crate: { key: { tenantId: tenantId, crateId: crateId }, ensure: { label: unlabelled } } } }\n" +
+		"      Drop: { delete: true, requires: { Crate: { key: { tenantId: tenantId, crateId: crateId }, ensure: { label: \"{label}\" }, set: { mood: cross } } } }\n", ""},
+	{"batch updates of an expiring entity with derived items", "  Crate:\n    fields:\n      tenantId: string\n      crateId: string\n      until: time\n      label: { type: string, required: true }\n      rank: int\n      tags: string_set\n" +
+		"    ttl: until\n    key: { pk: \"T#{tenantId}\", sk: \"CRATE#{crateId}\" }\n" +
+		"    indexes:\n      ByLabel: { strategy: copy, pk: \"L#{tenantId}\", sk: \"L#{label}#{crateId}\", project: [rank] }\n" +
+		"    unique:\n      Label: { fields: [tenantId, label] }\n" +
+		"    counters:\n      Ranks: { pk: \"T#{tenantId}\", sk: \"RANKS\", values: { total: { sum: rank, limit: 100 }, n: count } }\n" +
+		"    writes:\n      Make: create\n      Relabel: { update: [label, rank], patch: [until, tags], batch: 40 }\n      Zero: { set: { rank: 0 }, when: { rank: { not: 0 } }, batch: 3 }\n", ""},
 	{"entity named like another's store", "  ThingStore:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},
 	{"entities differing in initialism case", "  THING:\n    fields: { id: string }\n    key: { pk: \"U#{id}\", sk: \"U\" }\n", "collides"},
 	{"entity named Store", "  Store:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},

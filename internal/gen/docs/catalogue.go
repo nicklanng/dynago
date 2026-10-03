@@ -45,6 +45,14 @@ func answers(a *schema.Access) string {
 		return firstSentence(a.Doc)
 	}
 	e := a.Entity
+	switch {
+	case a.Of != nil:
+		return fmt.Sprintf("%s under one %s, each kind on its own.", strings.Join(ofNames(a), ", "), join(names(e.PK.Fields)))
+	case a.Batch > 0:
+		return fmt.Sprintf("Several %s, each by %s.", schema.Plural(e.Name), join(names(e.KeyFields())))
+	case a.All:
+		return fmt.Sprintf("Every %s count of a %s: one for each %s.", a.Counter.Name, join(names(a.Counter.PK.Fields)), join(names(a.Counter.ItemFields())))
+	}
 	switch a.Kind {
 	case schema.AccessGet:
 		return fmt.Sprintf("One %s, by %s.", e.Name, join(names(e.KeyFields())))
@@ -75,7 +83,31 @@ func answers(a *schema.Access) string {
 	return fmt.Sprintf("%s with a given %s, by %s (%s).", schema.Plural(e.Name), join(names(pk.Fields)), by, order)
 }
 
+// ofNames names the kinds a partition read returns: "the Thread", "its Messages".
+func ofNames(a *schema.Access) []string {
+	var out []string
+	for i, oe := range a.Of {
+		n := schema.Plural(oe.Name)
+		if oe.Singleton() {
+			n = "the " + oe.Name
+		}
+		if i == 0 {
+			n = strings.ToUpper(n[:1]) + n[1:]
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
 func servedBy(a *schema.Access) string {
+	switch {
+	case a.Of != nil:
+		return "Query of the whole partition, keeping these kinds"
+	case a.Batch > 0:
+		return "BatchGetItem (one per 100 keys)"
+	case a.All:
+		return fmt.Sprintf("Query of counter %s's items", a.Counter.Name)
+	}
 	switch a.Kind {
 	case schema.AccessGet:
 		return "GetItem"
@@ -118,6 +150,12 @@ func freshnessText(a *schema.Access) string {
 // returns says how many items a read returns; for a query, how many are in its partition and how
 // many pages reading them all takes.
 func (d *doc) returns(a *schema.Access) string {
+	switch {
+	case a.Batch > 0:
+		return fmt.Sprintf("the ones that exist: %d keys a call typically", a.Batch)
+	case a.All:
+		return fmt.Sprintf("pages of %d counter items, a page at a time", a.Page)
+	}
 	switch a.Kind {
 	case schema.AccessGet, schema.AccessGetUnique:
 		return "one"
@@ -188,8 +226,14 @@ func (d *doc) writes() {
 			if wc.Transactional {
 				atomic = fmt.Sprintf("transaction, %d items", wc.MaxTxItems)
 			}
-			d.p("| `%s.%s` | %s | %s | %s | %s | %s | %s | %s |", w.Entity.Name, w.Name, escape(does(w)), escape(strings.Join(checks(w), "; ")),
-				strings.Join(wc.Items, "<br>"), reads, atomic, unitsText(wc.WRU), rateText(w.Rate))
+			what, units := does(w), unitsText(wc.WRU)
+			if w.Batch > 0 {
+				what = fmt.Sprintf("For each of several %s (%d a call): %s", schema.Plural(w.Entity.Name), w.Batch, strings.ToLower(what[:1])+what[1:])
+				reads = "yes, together"
+				atomic = fmt.Sprintf("each transaction, not the batch: up to %d %s to one", wc.BatchSize, schema.Plural(w.Entity.Name))
+			}
+			d.p("| `%s.%s` | %s | %s | %s | %s | %s | %s | %s |", w.Entity.Name, w.Name, escape(what), escape(strings.Join(checks(w), "; ")),
+				strings.Join(wc.Items, "<br>"), reads, atomic, units, rateText(w.Rate))
 		}
 	}
 	d.p("")
@@ -236,7 +280,7 @@ func checks(w *schema.Write) []string {
 		out = append(out, schema.PredText(w.When, e.Name))
 	}
 	for _, rq := range w.Requires {
-		if rq.Optional && len(rq.When) == 0 {
+		if !rq.CanFail() {
 			continue
 		}
 		out = append(out, requirement(rq, e.Name))
@@ -288,6 +332,8 @@ func requirement(rq *schema.Require, source string) string {
 			parts = append(parts, fmt.Sprintf("%s = %d", p.Value.Name, p.Equals))
 		}
 		return fmt.Sprintf("counter %s has %s", rq.Counter.Name, strings.Join(parts, " and "))
+	case rq.Ensure:
+		return fmt.Sprintf("any %s there is has %s (none is created)", rq.Name, schema.PredText(rq.When, source))
 	case rq.Optional:
 		return fmt.Sprintf("any %s has %s (none is fine)", rq.Name, schema.PredText(rq.When, source))
 	case len(rq.When) > 0:
@@ -309,6 +355,10 @@ func names(fs []*schema.Field) []string {
 	out := make([]string, len(fs))
 	for i, f := range fs {
 		out[i] = f.Name
+		if f.Type == schema.TypeStringSet {
+			// In a key, a set stands for one of its elements.
+			out[i] = "element of " + f.Name
+		}
 	}
 	return out
 }

@@ -140,9 +140,18 @@ func (a *analyzer) indexRules(e *schema.Entity) {
 	}
 	// A partition key with nothing but constants and enums puts all of an entity's items in a few
 	// partitions.
-	check := func(s schema.Subject, what string, pk schema.Template, many bool) {
+	check := func(s schema.Subject, what string, pk schema.Template, many bool, ix *schema.Index) {
 		if !many {
 			return
+		}
+		// A sparse index takes only the items matching its where; without a declared share, the
+		// numbers below count every item, and say so.
+		items, atMost := e.Name, ""
+		if ix != nil && len(ix.Where) > 0 {
+			items = e.Name + " with " + schema.PredText(ix.Where, e.Name)
+			if ix.Unsized() {
+				atMost = " at most (if every " + e.Name + " matched: declare the share that does, with matches)"
+			}
 		}
 		for _, f := range pk.Fields {
 			if f.Type != schema.TypeEnum && f.Type != schema.TypeBool {
@@ -168,19 +177,22 @@ func (a *analyzer) indexRules(e *schema.Entity) {
 			if p.Grows {
 				grows = " (and grows as long as the table lives)"
 			}
-			a.add("low-cardinality-key", Note, s, "%s partition key %q has no field that varies per item beyond enums: every %s lands in %s. At the declared volumes and rates that's fine: the largest holds %s%s, and its busiest key takes %s of a partition's capacity at peak. Revisit it if the volumes or rates grow by orders of magnitude.",
-				what, pk.Raw, e.Name, where, cost.HumanBytes(p.Size.Max), grows, headroomText(p.Headroom))
+			a.add("low-cardinality-key", Note, s, "%s partition key %q has no field that varies per item beyond enums: every %s lands in %s. At the declared volumes and rates that's fine: the largest holds %s%s%s, and its busiest key takes %s of a partition's capacity at peak. Revisit it if the volumes or rates grow by orders of magnitude.",
+				what, pk.Raw, items, where, cost.HumanBytes(p.Size.Max), atMost, grows, headroomText(p.Headroom))
 			return
 		}
 		unknown := ""
 		if p := a.partitionOf(s); p == nil || p.Risk == RiskUnknown || !p.Size.MaxKnown {
 			unknown = " Declare the volume and rates to see whether that matters here."
 		}
-		a.add("low-cardinality-key", Warning, s, "%s partition key %q has no field that varies per item beyond enums: every %s lands in %s, however many there are. Add an id (a tenant, a parent) to the key.%s", what, pk.Raw, e.Name, where, unknown)
+		if ix != nil && ix.Unsized() && unknown == "" {
+			unknown = " The estimate counts every " + e.Name + ", though only those matching the index's where are in it: declare the share that does (matches) for its real size and traffic."
+		}
+		a.add("low-cardinality-key", Warning, s, "%s partition key %q has no field that varies per item beyond enums: every %s lands in %s, however many there are. Add an id (a tenant, a parent) to the key.%s", what, pk.Raw, items, where, unknown)
 	}
-	check(entitySubject(e), e.Name+"'s", e.PK, len(minus(e.KeyFields(), e.PK.Fields)) > 0)
+	check(entitySubject(e), e.Name+"'s", e.PK, len(minus(e.KeyFields(), e.PK.Fields)) > 0, nil)
 	for _, ix := range e.Indexes {
-		check(indexSubject(ix), ix.Name+"'s", ix.PK, true)
+		check(indexSubject(ix), ix.Name+"'s", ix.PK, true, ix)
 	}
 }
 
@@ -197,11 +209,20 @@ func templateFields(ix *schema.Index) []*schema.Field {
 // doesn't have: the index is sparse on purpose.
 func pinned(ws []*schema.Pred, f *schema.Field) bool {
 	for _, p := range ws {
-		if p.Field == f {
+		// `not` holds for an empty field too, unless the value it excludes is the empty one.
+		if p.Field == f && !p.Matches(zeroOf(f)) {
 			return true
 		}
 	}
 	return false
+}
+
+// zeroOf is the value an empty sparse field holds.
+func zeroOf(f *schema.Field) any {
+	if f.Type == schema.TypeBool {
+		return false
+	}
+	return ""
 }
 
 func (a *analyzer) fieldRules(e *schema.Entity) {

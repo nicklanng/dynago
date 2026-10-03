@@ -409,6 +409,9 @@ func check(path string, o options, w io.Writer) error {
 			if wc.ReadFirst {
 				kind += " + read"
 			}
+			if wc.BatchSize > 0 {
+				kind = fmt.Sprintf("batch of %d, %d to a tx + read", wc.Write.Batch, wc.BatchSize)
+			}
 			monthly := ""
 			if wc.Monthly > 0 {
 				monthly = fmt.Sprintf("$%.2f/month", wc.Monthly)
@@ -425,7 +428,11 @@ func check(path string, o options, w io.Writer) error {
 	for _, p := range result.Partitions {
 		var holds []string
 		for _, mb := range p.Members {
-			holds = append(holds, mb.Label+" "+estimate(mb.Count))
+			h := mb.Label + " " + estimate(mb.Count)
+			if mb.Bound && mb.Count.Known {
+				h += " at most (only those matching its where)"
+			}
+			holds = append(holds, h)
 		}
 		busy, risk := "-", "-"
 		if p.Rated {

@@ -70,14 +70,16 @@ type Field struct {
 
 // Index is one index.
 type Index struct {
-	Name       string   `json:"name"`
-	Strategy   string   `json:"strategy"`
-	Why        string   `json:"why,omitempty"`
-	PK         string   `json:"pk"`
-	SK         string   `json:"sk,omitempty"`
-	Projection string   `json:"projection"`
-	Where      string   `json:"where,omitempty"`
-	ReadBy     []string `json:"readBy,omitempty"`
+	Name       string `json:"name"`
+	Strategy   string `json:"strategy"`
+	Why        string `json:"why,omitempty"`
+	PK         string `json:"pk"`
+	SK         string `json:"sk,omitempty"`
+	Projection string `json:"projection"`
+	Where      string `json:"where,omitempty"`
+	// Matches is the declared share of items its where matches (0: not declared).
+	Matches float64  `json:"matches,omitempty"`
+	ReadBy  []string `json:"readBy,omitempty"`
 }
 
 // Unique is one uniqueness constraint.
@@ -182,6 +184,7 @@ func Build(r *analysis.Result) *Snapshot {
 			}
 			if len(ix.Where) > 0 {
 				si.Where = schema.PredText(ix.Where, e.Name)
+				si.Matches = ix.Matches
 			}
 			for _, a := range e.Access {
 				if a.Index == ix {
@@ -307,6 +310,14 @@ func counterValue(v *schema.CounterValue) string {
 }
 
 func servedBy(a *schema.Access) string {
+	switch {
+	case a.Of != nil:
+		return "Query of the whole partition"
+	case a.Batch > 0:
+		return "BatchGetItem"
+	case a.All:
+		return "Query of counter " + a.Counter.Name + "'s items"
+	}
 	switch a.Kind {
 	case schema.AccessGet:
 		return "GetItem"
@@ -339,6 +350,9 @@ func freshness(a *schema.Access) string {
 // does describes a write in the schema's terms: "create; sets status = \"available\"; requires …".
 func does(w *schema.Write) string {
 	parts := []string{string(w.Kind)}
+	if w.Batch > 0 {
+		parts[0] = "batch " + parts[0]
+	}
 	var sets []string
 	for _, f := range w.Args {
 		sets = append(sets, f.Name)
@@ -356,11 +370,7 @@ func does(w *schema.Write) string {
 		parts = append(parts, "when "+schema.PredText(w.When, w.Entity.Name))
 	}
 	for _, rq := range w.Requires {
-		t := "requires " + rq.Condition(w.Entity.Name)
-		if eff := rq.Effect(w.Entity.Name); eff != "" {
-			t += " and " + eff
-		}
-		parts = append(parts, t)
+		parts = append(parts, rq.Sentence(w.Entity.Name, " and "))
 	}
 	if w.VersionRequired {
 		parts = append(parts, "version required")

@@ -264,14 +264,44 @@ type Set struct {
 	Remove bool
 	// StringSet stores Value as a DynamoDB string set rather than a list.
 	StringSet bool
+	// Add adds the number Value to the attribute (an absent one counts as 0) instead of replacing
+	// it: DynamoDB applies it atomically, so concurrent additions all count.
+	Add bool
 }
 
-// Cond is an equality precondition. Zero marks the field's zero value, which may be stored as an
-// absent attribute.
+// Cond is a precondition on one attribute: that it equals Value; with Not, that it differs from
+// Value; with In, that it equals one of several values. Zero says the value compared with (or one
+// of In) is the field's zero value, which is stored as an absent attribute.
 type Cond struct {
 	Attr  string
 	Value any
 	Zero  bool
+	// Not requires the attribute to differ from Value.
+	Not bool
+	// In, if set, lists the values the attribute may have; Value is unused.
+	In []any
+}
+
+// expr renders the condition with guregu placeholders ($ for names, ? for values), in
+// parentheses when it has more than one term.
+func (c Cond) expr() (string, []any) {
+	switch {
+	case len(c.In) > 0:
+		in := "$ IN (?" + strings.Repeat(", ?", len(c.In)-1) + ")"
+		args := append([]any{c.Attr}, c.In...)
+		if c.Zero {
+			return "(attribute_not_exists($) OR " + in + ")", append([]any{c.Attr}, args...)
+		}
+		return in, args
+	case c.Not && c.Zero:
+		// Anything but the zero value: the attribute is there, and isn't a stored zero.
+		return "(attribute_exists($) AND $ <> ?)", []any{c.Attr, c.Attr, c.Value}
+	case c.Not:
+		return "(attribute_not_exists($) OR $ <> ?)", []any{c.Attr, c.Attr, c.Value}
+	case c.Zero:
+		return "(attribute_not_exists($) OR $ = ?)", []any{c.Attr, c.Attr, c.Value}
+	}
+	return "$ = ?", []any{c.Attr, c.Value}
 }
 
 // Guard is the conditions every write to an existing item carries.
@@ -316,6 +346,8 @@ func SetFields(u *dynamo.Update, sets []Set) {
 		switch {
 		case s.Remove:
 			u.Remove(Path(s.Attr))
+		case s.Add:
+			u.Add(Path(s.Attr), s.Value)
 		case s.StringSet:
 			u.SetSet(Path(s.Attr), s.Value)
 		default:
@@ -360,13 +392,9 @@ func (r Requirement) condition(now int64) (string, []any) {
 	var match []string
 	var args []any
 	for _, c := range r.When {
-		if c.Zero {
-			match = append(match, "(attribute_not_exists($) OR $ = ?)")
-			args = append(args, c.Attr, c.Attr, c.Value)
-		} else {
-			match = append(match, "$ = ?")
-			args = append(args, c.Attr, c.Value)
-		}
+		expr, cargs := c.expr()
+		match = append(match, expr)
+		args = append(args, cargs...)
 	}
 	if r.Optional {
 		if len(match) == 0 {
@@ -423,11 +451,8 @@ func CheckAbsent(t dynamo.Table, key Key, ttlAttr string) *dynamo.ConditionCheck
 func CheckCounter(t dynamo.Table, key Key, values []Cond) *dynamo.ConditionCheck {
 	c := t.Check(AttrPK, key.PK).Range(AttrSK, key.SK)
 	for _, v := range values {
-		if v.Zero {
-			c.If("attribute_not_exists($) OR $ = ?", v.Attr, v.Attr, v.Value)
-		} else {
-			c.If("$ = ?", v.Attr, v.Value)
-		}
+		expr, args := v.expr()
+		c.If(expr, args...)
 	}
 	return c
 }
@@ -457,13 +482,10 @@ func GuardUpdate(u *dynamo.Update, g Guard, now int64) {
 	}
 }
 
-// CondUpdate adds an equality precondition to an update.
+// CondUpdate adds a precondition to an update.
 func CondUpdate(u *dynamo.Update, c Cond) {
-	if c.Zero {
-		u.If("attribute_not_exists($) OR $ = ?", c.Attr, c.Attr, c.Value)
-	} else {
-		u.If("$ = ?", c.Attr, c.Value)
-	}
+	expr, args := c.expr()
+	u.If(expr, args...)
 }
 
 // DeleteIfExists deletes an item that has no derived items, returning the Guard's errors if it is

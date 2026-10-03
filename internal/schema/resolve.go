@@ -461,6 +461,24 @@ func (r *resolver) template(e *Entity, where, raw string, required bool, multi .
 	return t, ok
 }
 
+// setFields returns the string_set fields of e that the key templates name, in order. Templates
+// that don't parse name none: their own resolution reports why.
+func setFields(e *Entity, templates ...string) []*Field {
+	var out []*Field
+	for _, raw := range templates {
+		kt, err := keytmpl.Parse(raw)
+		if err != nil {
+			continue
+		}
+		for _, name := range kt.Fields() {
+			if f := e.Field(name); f != nil && f.Type == TypeStringSet && !slices.Contains(out, f) {
+				out = append(out, f)
+			}
+		}
+	}
+	return out
+}
+
 func (r *resolver) preds(e *Entity, where string, raw Ordered[any]) []*Pred {
 	var out []*Pred
 	for _, p := range raw {
@@ -469,14 +487,77 @@ func (r *resolver) preds(e *Entity, where string, raw Ordered[any]) []*Pred {
 			r.errorf("%s: %s is not a field of %s", where, p.Key, e.Name)
 			continue
 		}
-		v, err := coerce(f, p.Value)
+		pr, err := pred(f, p.Value)
 		if err != nil {
 			r.errorf("%s: %s: %v", where, p.Key, err)
 			continue
 		}
-		out = append(out, &Pred{Field: f, Value: v})
+		out = append(out, pr)
 	}
 	return out
+}
+
+// pred resolves one predicate on field f: a constant (equal to it), `{ not: <constant> }` or
+// `{ in: [<constant>, ...] }`.
+func pred(f *Field, raw any) (*Pred, error) {
+	form, ok := raw.(map[string]any)
+	if !ok {
+		v, err := coerce(f, raw)
+		if err != nil {
+			return nil, err
+		}
+		return &Pred{Field: f, Value: v}, nil
+	}
+	if len(form) != 1 {
+		return nil, fmt.Errorf("want a value, { not: <value> } or { in: [<value>, ...] }")
+	}
+	for op, arg := range form {
+		switch op {
+		case "not":
+			v, err := coerce(f, arg)
+			if err != nil {
+				return nil, fmt.Errorf("not: %v", err)
+			}
+			return &Pred{Field: f, Value: v, Not: true}, nil
+		case "in":
+			list, ok := arg.([]any)
+			if !ok || len(list) == 0 {
+				return nil, fmt.Errorf("in: want a list of values")
+			}
+			pr := &Pred{Field: f, In: []any{}}
+			for _, x := range list {
+				v, err := coerce(f, x)
+				if err != nil {
+					return nil, fmt.Errorf("in: %v", err)
+				}
+				if pr.Matches(v) {
+					return nil, fmt.Errorf("in: %v is listed twice", x)
+				}
+				pr.In = append(pr.In, v)
+			}
+			if len(pr.In) == 1 {
+				return nil, fmt.Errorf("in: one value is an equality; write %s: %v", f.Name, list[0])
+			}
+			if allowed, listable := pr.Allowed(); listable && len(allowed) == len(domainOf(f)) {
+				return nil, fmt.Errorf("in: every value of %s is listed, so the condition always holds; remove it", f.Name)
+			}
+			return pr, nil
+		default:
+			return nil, fmt.Errorf("unknown form %q: want a value, { not: <value> } or { in: [<value>, ...] }", op)
+		}
+	}
+	return nil, nil
+}
+
+// domainOf lists every value an enum or bool field can hold.
+func domainOf(f *Field) []string {
+	switch f.Type {
+	case TypeEnum:
+		return f.Enum
+	case TypeBool:
+		return []string{"false", "true"}
+	}
+	return nil
 }
 
 // coerce checks a YAML scalar against a field type and returns it in canonical Go form.
@@ -523,12 +604,18 @@ func (r *resolver) index(e *Entity, name string, raw RawIndex, fresh []string) *
 		return nil
 	}
 	ix := &Index{Name: name, GoName: name, Entity: e, Doc: raw.Doc}
+	// A key holding a string_set renders one key per element, which only copies can have: a GSI
+	// entry is the item itself, under one key.
+	sets := setFields(e, raw.PK, raw.SK)
 	strategy := raw.Strategy
 	if strategy == "" {
 		ix.StrategyInferred = true
 		strategy = string(StrategyGSI)
 		ix.StrategyReason = "no read through it needs immediate freshness"
-		if len(fresh) > 0 {
+		if len(sets) > 0 {
+			strategy = string(StrategyCopy)
+			ix.StrategyReason = fmt.Sprintf("it is keyed by each element of %s, and a GSI holds an item under one key", sets[0].Name)
+		} else if len(fresh) > 0 {
 			strategy = string(StrategyCopy)
 			verb := "needs"
 			if len(fresh) > 1 {
@@ -549,12 +636,22 @@ func (r *resolver) index(e *Entity, name string, raw RawIndex, fresh []string) *
 		r.errorf("%s: strategy must be gsi or copy", where)
 		return nil
 	}
+	switch {
+	case len(sets) > 1:
+		r.errorf("%s: %s and %s are both sets; an index can be keyed by the elements of one", where, sets[0].Name, sets[1].Name)
+		return nil
+	case len(sets) == 1 && ix.Strategy == StrategyGSI:
+		r.errorf("%s: its keys hold %s, a string_set: the entity would need an entry for each element, and a GSI holds an item under one key. Make it a copy (strategy: copy, or leave strategy out)", where, sets[0].Name)
+		return nil
+	case len(sets) == 1:
+		ix.Set = sets[0]
+	}
 	var ok bool
-	if ix.PK, ok = r.template(e, where+" pk", raw.PK, true); !ok {
+	if ix.PK, ok = r.template(e, where+" pk", raw.PK, true, sets...); !ok {
 		return nil
 	}
 	if raw.SK != "" {
-		if ix.SK, ok = r.template(e, where+" sk", raw.SK, true); !ok {
+		if ix.SK, ok = r.template(e, where+" sk", raw.SK, true, sets...); !ok {
 			return nil
 		}
 		ix.HasSK = true
@@ -604,6 +701,16 @@ func (r *resolver) index(e *Entity, name string, raw RawIndex, fresh []string) *
 		r.errorf("%s: project must be all, keys, or a list of fields", where)
 	}
 	ix.Where = r.preds(e, where+" where", raw.Where)
+	if m := raw.Matches; m != nil {
+		switch {
+		case len(raw.Where) == 0:
+			r.errorf("%s: matches is the share of items that satisfy where; this index has no where, so every item is in it", where)
+		case *m <= 0 || *m > 1:
+			r.errorf("%s: matches is a share of the entity's items: more than 0, at most 1 (0.01 is one in a hundred)", where)
+		default:
+			ix.Matches = *m
+		}
+	}
 	if !ix.ReturnsEntity() {
 		r.claimType(e.GoName+ix.GoName, where)
 	}
@@ -690,11 +797,19 @@ func (r *resolver) counter(e *Entity, name string, raw RawCounter) *Counter {
 	if c.Shards < 1 || c.Shards > 100 {
 		r.errorf("%s: shards must be between 1 and 100", where)
 	}
+	sets := setFields(e, raw.PK, raw.SK)
+	switch {
+	case len(sets) > 1:
+		r.errorf("%s: %s and %s are both sets; a counter can be keyed by the elements of one", where, sets[0].Name, sets[1].Name)
+		return nil
+	case len(sets) == 1:
+		c.Set = sets[0]
+	}
 	var ok bool
-	if c.PK, ok = r.template(e, where+" pk", raw.PK, true); !ok {
+	if c.PK, ok = r.template(e, where+" pk", raw.PK, true, sets...); !ok {
 		return nil
 	}
-	if c.SK, ok = r.template(e, where+" sk", raw.SK, true); !ok {
+	if c.SK, ok = r.template(e, where+" sk", raw.SK, true, sets...); !ok {
 		return nil
 	}
 	if c.SK.LiteralPrefix() == "" {
@@ -800,6 +915,14 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 		a.Page, a.MaxPage = r.pageSize(where, raw)
 	case raw.Get != nil && raw.Get.Key:
 		a.Kind = AccessGet
+		if raw.Batch != nil {
+			n, ok := raw.Batch.(int)
+			if !ok || n < 1 {
+				r.errorf("%s: batch is the typical number of keys a call reads (batch: 40), which the estimates use", where)
+			} else {
+				a.Batch = n
+			}
+		}
 	case raw.Get != nil:
 		a.Kind = AccessGetUnique
 		for _, u := range e.Uniques {
@@ -818,7 +941,18 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 		a.counterRaw = raw.Counter
 	default:
 		a.Kind = AccessQuery
-		if raw.Query != "key" {
+		if raw.Query == "partition" {
+			// Resolved in crossRefs: the read returns several entities' items.
+			if len(raw.Of) == 0 {
+				r.errorf("%s: query: partition reads every kind of item the partition holds; list the entities it returns (of: [%s, ...])", where, e.Name)
+				return nil
+			}
+			a.ofRaw = raw.Of
+			if raw.Range != "" || raw.Project.Set {
+				r.errorf("%s: range and project apply to a query of one entity's items; a partition read returns several kinds whole", where)
+			}
+			r.claimType(e.GoName+a.GoName, where)
+		} else if raw.Query != "key" {
 			for _, ix := range e.Indexes {
 				if ix.Name == raw.Query {
 					a.Index = ix
@@ -852,6 +986,8 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 			switch {
 			case f == nil:
 				r.errorf("%s: range field %s is not a field of %s", where, raw.Range, e.Name)
+			case !f.KeyCapable():
+				r.errorf("%s: range field %s is a %s; a range bounds a single value", where, f.Name, f.Type)
 			case !ok || rangeSegment(sk) != f.Name:
 				r.errorf("%s: range field %s must be the first placeholder of the sort key, directly after its literal prefix", where, f.Name)
 			default:
@@ -888,10 +1024,26 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 			}
 		}
 	}
+	if len(raw.Of) > 0 && raw.Query != "partition" {
+		r.errorf("%s: of lists the entities a partition read returns; it goes with query: partition", where)
+	}
+	if raw.Batch != nil && a.Kind != AccessGet {
+		r.errorf("%s: batch applies to get: key (a read of several items by their keys)", where)
+	}
+	if raw.All {
+		if a.Kind != AccessCounter {
+			r.errorf("%s: all applies to a counter read: every item of the counter in one partition", where)
+		} else {
+			a.All = true
+			a.Page, a.MaxPage = r.pageSize(where, raw)
+		}
+	}
 	switch {
 	case a.Kind == AccessScan && (raw.Order != "" || raw.Range != "" || raw.Project.Set):
 		r.errorf("%s: order, range and project apply to queries; a scan takes page and max_page", where)
-	case a.Kind != AccessQuery && a.Kind != AccessScan && (raw.Order != "" || raw.Page != 0 || raw.MaxPage != 0 || raw.Range != "" || raw.Project.Set):
+	case a.All && (raw.Order != "" || raw.Range != "" || raw.Project.Set):
+		r.errorf("%s: order, range and project apply to queries; a read of all of a counter's items takes page and max_page", where)
+	case a.Kind != AccessQuery && a.Kind != AccessScan && !a.All && (raw.Order != "" || raw.Page != 0 || raw.MaxPage != 0 || raw.Range != "" || raw.Project.Set):
 		r.errorf("%s: order, page, max_page, range and project only apply to queries", where)
 	}
 	switch a.Freshness {
@@ -1033,6 +1185,21 @@ func (r *resolver) write(e *Entity, name string, raw RawWrite) *Write {
 			r.claimType(e.GoName+w.GoName, where)
 		}
 	}
+	if raw.Batch != nil {
+		n, ok := raw.Batch.(int)
+		switch {
+		case !ok || n < 1:
+			r.errorf("%s: batch is the typical number of items a call changes (batch: 50), which the estimates use", where)
+		case w.Kind != WriteUpdate:
+			r.errorf("%s: batch applies to updates: the same change to several items", where)
+		case len(raw.Requires) > 0:
+			r.errorf("%s: a batch write can't have requires: several of its items could require the same item, which a transaction may touch only once", where)
+		case w.VersionRequired:
+			r.errorf("%s: a batch write takes keys, not versions; versioned: required applies to a write of one item", where)
+		default:
+			w.Batch = n
+		}
+	}
 	w.rawRequires = raw.Requires
 	return w
 }
@@ -1068,6 +1235,7 @@ func (r *resolver) crossRefs(m *Model) {
 		}
 		return nil, nil
 	}
+	entries := map[*Counter]bool{}
 	for _, e := range m.Entities {
 		for _, f := range e.Fields {
 			if f.copyOfRaw != "" {
@@ -1083,12 +1251,19 @@ func (r *resolver) crossRefs(m *Model) {
 			}
 		}
 		for _, a := range e.Access {
+			if a.ofRaw != nil {
+				r.partitionRead(e, a, byName)
+			}
 			if a.Kind != AccessCounter {
 				continue
 			}
 			a.Counter = counters[a.counterRaw]
 			if a.Counter == nil {
 				r.errorf("entity %s access %s: %s is not a counter of this table", e.Name, a.Name, a.counterRaw)
+				continue
+			}
+			if a.All {
+				r.counterAll(e, a, entries)
 			}
 		}
 		for _, w := range e.Writes {
@@ -1100,6 +1275,90 @@ func (r *resolver) crossRefs(m *Model) {
 			r.sameItemTwice(w)
 			r.planWrite(w)
 		}
+	}
+}
+
+// partitionRead resolves the entities a partition read returns. Each must key its items under
+// the same partition key as the reading entity, so that one Query of that key finds them.
+func (r *resolver) partitionRead(e *Entity, a *Access, byName map[string]*Entity) {
+	where := fmt.Sprintf("entity %s access %s", e.Name, a.Name)
+	names := map[string]string{}
+	for _, name := range a.ofRaw {
+		oe := byName[name]
+		switch {
+		case oe == nil:
+			r.errorf("%s: of: %s is not an entity of this table", where, name)
+			continue
+		case slices.Contains(a.Of, oe):
+			r.errorf("%s: of: %s is listed twice", where, name)
+			continue
+		case oe.PK.Raw != e.PK.Raw:
+			r.errorf("%s: of: %s's items are under partition key %q, not %s's %q, so one Query can't read both. A partition read returns entities whose partition key templates are the same", where, name, oe.PK.Raw, e.Name, e.PK.Raw)
+			continue
+		}
+		same := true
+		for i, f := range oe.PK.Fields {
+			if f.Type != e.PK.Fields[i].Type {
+				r.errorf("%s: of: %s.%s is a %s, but %s.%s is a %s: the two render different partition keys", where, name, f.Name, f.Type, e.Name, f.Name, e.PK.Fields[i].Type)
+				same = false
+			}
+		}
+		if !same {
+			continue
+		}
+		field := Plural(oe.GoName)
+		if oe.Singleton() {
+			field = oe.GoName
+		}
+		if prev, ok := names[field]; ok {
+			r.errorf("%s: of: %s and %s would both be the field %s of the generated %s%s; rename one of the entities", where, prev, name, field, e.GoName, a.GoName)
+			continue
+		}
+		names[field] = name
+		a.Of = append(a.Of, oe)
+	}
+	if a.Of == nil {
+		a.Of = []*Entity{}
+	}
+}
+
+// counterAll checks a read of every item of a counter in one partition: the items must be several
+// (the sort key has fields of its own), on one partition key (not sharded), and their keys must
+// be readable back from the sort key, since a counter item stores nothing else to say which it is.
+func (r *resolver) counterAll(e *Entity, a *Access, entries map[*Counter]bool) {
+	c := a.Counter
+	where := fmt.Sprintf("entity %s access %s", e.Name, a.Name)
+	own := c.ItemFields()
+	switch {
+	case c.Shards > 1:
+		r.errorf("%s: %s is sharded: its items are spread over %d partition keys, which one Query can't read", where, c.Name, c.Shards)
+		return
+	case len(own) == 0:
+		r.errorf("%s: %s has one item per partition key (its sort key %q has no field of its own); read it with counter alone", where, c.Name, c.SK.Raw)
+		return
+	}
+	segs := c.SK.Segments
+	for i, sg := range segs {
+		if !sg.IsField() {
+			continue
+		}
+		f := c.Entity.Field(sg.Field)
+		switch {
+		case sg.Transform != "":
+			r.errorf("%s: %s's sort key holds {%s|%s}, which can't be read back into %s; a counter read with all needs its sort key fields as they are", where, c.Name, sg.Field, sg.Transform, sg.Field)
+			return
+		case f.Type != TypeString && f.Type != TypeEnum && f.Type != TypeStringSet:
+			r.errorf("%s: %s's sort key holds %s, a %s; a counter read with all needs string or enum fields there, to read each item's key back", where, c.Name, f.Name, f.Type)
+			return
+		case i+1 < len(segs) && segs[i+1].IsField():
+			r.errorf("%s: %s's sort key puts {%s} directly before {%s}, so the two can't be told apart when read back; put literal text between them", where, c.Name, sg.Field, segs[i+1].Field)
+			return
+		}
+	}
+	r.claimType(e.GoName+a.GoName+"Query", where)
+	if !entries[c] {
+		entries[c] = true
+		r.claimType(c.GoName+"Entry", "counter "+c.Name+" (read with all)")
 	}
 }
 
@@ -1119,7 +1378,11 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 		if c.Shards > 1 {
 			r.errorf("%s: %s is sharded, so no single item holds its values to check", where, target)
 		}
-		if len(raw.Set) > 0 || raw.Optional || raw.Consume {
+		if c.Set != nil {
+			r.errorf("%s: %s has an item for each element of %s; requiring one of them isn't supported", where, target, c.Set.Name)
+			return nil
+		}
+		if len(raw.Set)+len(raw.Add)+len(raw.Patch) > 0 || raw.Optional || raw.Consume || raw.Ensure != nil {
 			r.errorf("%s: a counter can only be checked with when (an absent value counts as 0)", where)
 		}
 	default:
@@ -1175,18 +1438,27 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 			r.errorf("%s when: %s is not a field of %s", where, p.Key, te.Name)
 			continue
 		}
-		if ref, ok := fieldRef(p.Value); ok {
+		// A reference to the writing entity's field: "{memberId}", or { not: "{memberId}" }.
+		raw, not := p.Value, false
+		if form, ok := raw.(map[string]any); ok && len(form) == 1 {
+			if arg, ok := form["not"]; ok {
+				if _, isRef := fieldRef(arg); isRef {
+					raw, not = arg, true
+				}
+			}
+		}
+		if ref, ok := fieldRef(raw); ok {
 			if sf := r.source(e, where+" when "+p.Key, ref, te, f); sf != nil {
-				req.When = append(req.When, &Pred{Field: f, Source: sf})
+				req.When = append(req.When, &Pred{Field: f, Source: sf, Not: not})
 			}
 			continue
 		}
-		v, err := coerce(f, p.Value)
+		pr, err := pred(f, p.Value)
 		if err != nil {
 			r.errorf("%s when: %s: %v", where, p.Key, err)
 			continue
 		}
-		req.When = append(req.When, &Pred{Field: f, Value: v})
+		req.When = append(req.When, pr)
 	}
 	for _, sc := range raw.Set {
 		f := te.Field(sc.Key)
@@ -1214,11 +1486,116 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 		}
 		req.Sets = append(req.Sets, SetConst{Field: f, Value: v})
 	}
+	// changes resolves the target field of an add or a patch, which may name each field once
+	// across set, add and patch.
+	changes := func(kind, name string) *Field {
+		f := te.Field(name)
+		switch {
+		case f == nil:
+			r.errorf("%s %s: %s is not a field of %s", where, kind, name, te.Name)
+			return nil
+		case f.Key:
+			r.errorf("%s %s: %s is part of %s's primary key and cannot be changed", where, kind, name, te.Name)
+			return nil
+		}
+		for _, s := range req.Sets {
+			if s.Field == f {
+				r.errorf("%s: %s is given more than once across set, add, patch and ensure", where, name)
+				return nil
+			}
+		}
+		return f
+	}
+	for _, ad := range raw.Add {
+		f := changes("add", ad.Key)
+		if f == nil {
+			continue
+		}
+		if f.Type != TypeInt {
+			r.errorf("%s add: %s.%s is a %s; add applies to int fields", where, te.Name, ad.Key, f.Type)
+			continue
+		}
+		if ref, ok := fieldRef(ad.Value); ok {
+			if sf := r.source(e, where+" add "+ad.Key, ref, te, f); sf != nil {
+				req.Sets = append(req.Sets, SetConst{Field: f, Source: sf, Add: true})
+			}
+			continue
+		}
+		n, ok := ad.Value.(int)
+		if !ok || n == 0 {
+			r.errorf("%s add: %s: want a whole number other than 0 (negative to subtract), or \"{field}\" for an int field of %s", where, ad.Key, e.Name)
+			continue
+		}
+		req.Sets = append(req.Sets, SetConst{Field: f, Value: int64(n), Add: true})
+	}
+	for _, pt := range raw.Patch {
+		f := changes("patch", pt.Key)
+		if f == nil {
+			continue
+		}
+		ref, ok := fieldRef(pt.Value)
+		if !ok {
+			r.errorf("%s patch: %s: want \"{field}\", a field of %s: the %s's %s is set to it when it has a value, and left alone when it doesn't. A constant goes in set", where, pt.Key, e.Name, te.Name, pt.Key)
+			continue
+		}
+		if sf := r.source(e, where+" patch "+pt.Key, ref, te, f); sf != nil {
+			req.Sets = append(req.Sets, SetConst{Field: f, Source: sf, IfSet: true})
+		}
+	}
+	if raw.Ensure != nil {
+		req.Ensure = true
+		for _, en := range *raw.Ensure {
+			f := changes("ensure", en.Key)
+			if f == nil {
+				continue
+			}
+			if ref, ok := fieldRef(en.Value); ok {
+				if sf := r.source(e, where+" ensure "+en.Key, ref, te, f); sf != nil {
+					req.EnsureSets = append(req.EnsureSets, SetConst{Field: f, Source: sf})
+				}
+				continue
+			}
+			v, err := coerce(f, en.Value)
+			if err != nil {
+				r.errorf("%s ensure: %s: %v", where, en.Key, err)
+				continue
+			}
+			req.EnsureSets = append(req.EnsureSets, SetConst{Field: f, Value: v})
+		}
+		switch {
+		case req.Optional:
+			r.errorf("%s: ensure creates the %s when it is absent, and optional lets the write go ahead without one: choose one", where, te.Name)
+		case req.Consume:
+			r.errorf("%s: ensure creates the %s when it is absent, and consume deletes it: choose one", where, te.Name)
+		}
+		// A new item needs its required fields: what gives none of them a value can never create it.
+		given := map[*Field]SetConst{}
+		for _, s := range append(append([]SetConst{}, req.EnsureSets...), req.Sets...) {
+			given[s.Field] = s
+		}
+		for _, f := range te.Fields {
+			s, ok := given[f]
+			switch {
+			case !f.Required || f.Key:
+			case !ok:
+				r.errorf("%s: %s.%s is required, so a %s this write creates needs it: give it in ensure (%s: \"{field}\" or a constant)", where, te.Name, f.Name, te.Name, f.Name)
+			case s.Fixes() && isZero(s.Value):
+				r.errorf("%s ensure: %s.%s is required, so it cannot be given its zero value", where, te.Name, f.Name)
+			}
+		}
+		for _, c := range te.Counters {
+			for _, v := range c.Values {
+				if v.LimitArg && CanGrow(req.TargetCreate(), v, true) {
+					r.errorf("%s: creating a %s can grow %s.%s, whose limit callers supply; only %s's own writes can take it", where, te.Name, c.Name, v.Name, te.Name)
+				}
+			}
+		}
+	}
 	if req.Optional && len(req.When) == 0 && !req.Writes() {
 		r.errorf("%s: optional with no when, set or consume checks nothing", where)
 	}
 	if len(req.Sets) > 0 && req.Consume {
-		r.errorf("%s: set and consume are exclusive: the item is either changed or deleted", where)
+		r.errorf("%s: set, add and patch are exclusive with consume: the item is either changed or deleted", where)
 	}
 	if len(req.Sets) > 0 {
 		// The change to the target behaves like an update of it declared with this set and when.
@@ -1235,6 +1612,10 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 			}
 		}
 		req.Fast = !req.Optional && transitionable(te, tw, changed)
+	}
+	if req.Ensure && len(req.Sets) == 0 {
+		// Nothing to change on one that is there: a check, which finds out if it isn't.
+		req.Fast = true
 	}
 	if req.Consume {
 		req.Fast = !te.HasDerived()
@@ -1311,6 +1692,12 @@ func (rq *Require) TargetWrite() *Write {
 	return &Write{Name: "requires", Entity: rq.Target, Kind: WriteUpdate, Sets: rq.Sets, When: rq.When}
 }
 
+// TargetCreate describes the creation a requirement with ensure makes when its target is absent,
+// as a create of it.
+func (rq *Require) TargetCreate() *Write {
+	return &Write{Name: "requires", Entity: rq.Target, Kind: WriteCreate, Sets: append(append([]SetConst{}, rq.EnsureSets...), rq.Sets...)}
+}
+
 // source resolves a field of the writing entity e that supplies a value for field tf of another
 // entity (or counter owner), checking the types match.
 func (r *resolver) source(e *Entity, where, name string, owner *Entity, tf *Field) *Field {
@@ -1372,6 +1759,14 @@ func (r *resolver) planWrite(w *Write) {
 				if v.LimitArg && CanGrow(w, v, false) {
 					w.Limits = append(w.Limits, v)
 				}
+			}
+		}
+		if w.Batch > 0 {
+			// Its items are read together, and each written under the revision read.
+			w.ReadFirst, w.Transition = true, false
+			if len(w.Limits) > 0 {
+				r.errorf("entity %s write %s: a batch write can't grow %s.%s, whose limit callers supply for one item at a time", e.Name, w.Name, w.Limits[0].Counter.Name, w.Limits[0].Name)
+				w.Limits = nil
 			}
 		}
 	}
@@ -1570,7 +1965,9 @@ func requiresKnown(w *Write) bool {
 		known[f] = true
 	}
 	for _, p := range w.When {
-		known[p.Field] = true
+		if p.Pins() {
+			known[p.Field] = true
+		}
 	}
 	for _, f := range w.Args {
 		known[f] = true
@@ -1599,7 +1996,10 @@ func transitionable(e *Entity, w *Write, changed map[string]bool) bool {
 		known[f] = true
 	}
 	for _, p := range w.When {
-		known[p.Field] = true
+		// `not` and `in` leave several values possible: the field isn't known.
+		if p.Pins() {
+			known[p.Field] = true
+		}
 	}
 	touches := func(fs ...*Field) bool {
 		for _, f := range fs {
@@ -1683,7 +2083,7 @@ func transitionable(e *Entity, w *Write, changed map[string]bool) bool {
 func CanGrow(w *Write, v *CounterValue, anyChange bool) bool {
 	for _, p := range v.Where {
 		for _, s := range w.Sets {
-			if s.Field == p.Field && fmt.Sprint(s.Value) != fmt.Sprint(p.Value) {
+			if s.Field == p.Field && s.Fixes() && !p.Matches(s.Value) {
 				return false // the result never matches, so never contributes
 			}
 		}

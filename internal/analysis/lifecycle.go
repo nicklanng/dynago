@@ -55,12 +55,14 @@ func (a *analyzer) lifecycles() {
 				case schema.WriteDelete:
 					lc.Deleted = append(lc.Deleted, w.Name)
 				case schema.WriteUpdate:
-					if t, ok := transition(w.Sets, w.When, f, w.Name); ok {
-						lc.Transitions = append(lc.Transitions, t)
+					if ts := transitions(w.Sets, w.When, f, w.Name); len(ts) > 0 {
+						lc.Transitions = append(lc.Transitions, ts...)
 						changes = true
 					}
 					if slices.Contains(w.Args, f) || slices.Contains(w.Patch, f) {
-						lc.Transitions = append(lc.Transitions, Transition{From: whenValue(w.When, f), To: Any, By: w.Name})
+						for _, from := range whenValues(w.When, f) {
+							lc.Transitions = append(lc.Transitions, Transition{From: from, To: Any, By: w.Name})
+						}
 						changes = true
 					}
 				}
@@ -75,8 +77,16 @@ func (a *analyzer) lifecycles() {
 							lc.Deleted = append(lc.Deleted, oe.Name+"."+w.Name)
 							continue
 						}
-						if t, ok := transition(rq.Sets, rq.When, f, oe.Name+"."+w.Name); ok {
-							lc.Transitions = append(lc.Transitions, t)
+						if rq.Ensure {
+							// It may create the item: with the value it gives, or the caller's.
+							to := Any
+							if v, ok := setValue(rq.TargetCreate().Sets, f); ok {
+								to = v
+							}
+							lc.Transitions = append(lc.Transitions, Transition{To: to, By: oe.Name + "." + w.Name})
+						}
+						if ts := transitions(rq.Sets, rq.When, f, oe.Name+"."+w.Name); len(ts) > 0 {
+							lc.Transitions = append(lc.Transitions, ts...)
 							changes = true
 						}
 					}
@@ -100,7 +110,9 @@ func (a *analyzer) lifecycles() {
 	}
 }
 
-func transition(sets []schema.SetConst, when []*schema.Pred, f *schema.Field, by string) (Transition, bool) {
+// transitions returns the moves a write's set makes to the field: one from each value its when
+// allows.
+func transitions(sets []schema.SetConst, when []*schema.Pred, f *schema.Field, by string) []Transition {
 	for _, s := range sets {
 		if s.Field != f {
 			continue
@@ -109,9 +121,13 @@ func transition(sets []schema.SetConst, when []*schema.Pred, f *schema.Field, by
 		if s.Source == nil {
 			to = fmt.Sprint(s.Value)
 		}
-		return Transition{From: whenValue(when, f), To: to, By: by}, true
+		var out []Transition
+		for _, from := range whenValues(when, f) {
+			out = append(out, Transition{From: from, To: to, By: by})
+		}
+		return out
 	}
-	return Transition{}, false
+	return nil
 }
 
 func setValue(sets []schema.SetConst, f *schema.Field) (string, bool) {
@@ -123,13 +139,18 @@ func setValue(sets []schema.SetConst, f *schema.Field) (string, bool) {
 	return "", false
 }
 
-func whenValue(when []*schema.Pred, f *schema.Field) string {
+// whenValues returns the values of the field a write's when allows it to start from: the one it
+// pins, those `in` lists or `not` leaves, or Any when it doesn't constrain the field.
+func whenValues(when []*schema.Pred, f *schema.Field) []string {
 	for _, p := range when {
-		if p.Field == f && p.Source == nil {
-			return fmt.Sprint(p.Value)
+		if p.Field != f {
+			continue
+		}
+		if vs, ok := p.Allowed(); ok && len(vs) > 0 {
+			return vs
 		}
 	}
-	return Any
+	return []string{Any}
 }
 
 // Guarantee is a rule the generated code enforces, in words.
@@ -175,16 +196,8 @@ func (a *analyzer) guarantees() {
 		for _, w := range e.Writes {
 			var parts []string
 			for _, rq := range w.Requires {
-				eff := rq.Effect(e.Name)
-				if rq.Optional && len(rq.When) == 0 {
-					parts = append(parts, eff) // it checks nothing: only the effect matters
-					continue
-				}
-				t := "requires " + rq.Condition(e.Name)
-				if eff != "" {
-					t += ", and " + eff
-				}
-				parts = append(parts, t)
+				// One that checks nothing says only what it does.
+				parts = append(parts, rq.Sentence(e.Name, ", and "))
 			}
 			if len(parts) > 0 {
 				a.r.Guarantees = append(a.r.Guarantees, Guarantee{e, "requires", fmt.Sprintf("%s %s, in one transaction.", w.Name, strings.Join(parts, "; ")), e.Name + "." + w.Name})

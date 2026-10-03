@@ -207,6 +207,20 @@ func TestUnversionedMisfitNamesEveryFix(t *testing.T) {
 	}
 }
 
+// While the lock records only a first design, the table may not exist yet: the error says how to
+// redesign freely. Once a version or a generation has gone by, it doesn't.
+func TestFirstDraftCanStartAgain(t *testing.T) {
+	const hint = "delete things.dynago.lock and generate again"
+	l1 := apply(t, model(t, 1, 1, "", ""), empty())
+	if _, _, err := Apply(model(t, 1, 1, "", counter), l1, Options{}); err == nil || !strings.Contains(err.Error(), hint) {
+		t.Fatalf("a first design changed: %v", err)
+	}
+	l2 := apply(t, model(t, 1, 2, "      note: string\n", ""), l1)
+	if _, _, err := Apply(model(t, 1, 2, "      note: string\n", counter), l2, Options{}); err == nil || strings.Contains(err.Error(), hint) {
+		t.Fatalf("a schema with a history: %v", err)
+	}
+}
+
 func TestRetainNeedsARecordedTable(t *testing.T) {
 	src := strings.Replace(v1, "generation: %g }", "generation: %g, retain: [1] }", 1)
 	m, err := schema.Parse([]byte(strings.NewReplacer("%g", "2", "%d", "1", "%f", "", "%s", "").Replace(src)))

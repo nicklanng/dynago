@@ -135,11 +135,19 @@ func (d *doc) summary() {
 	d.p("| Indexes | %s |", idx)
 	d.p("| Uniqueness claims, counters | %d, %d |", claims, counters)
 	d.p("| Workload | %s |", workloadText(m))
-	if big := largestPartition(a); big != nil {
-		d.p("| Largest partition | `%s` (%s): %s typical, %s at most |", escape(big.PK), big.Space(), bytesText(big.Size.Typical, big.Size.Known), bytesText(big.Size.Max, big.Size.MaxKnown))
+	// A sparse index whose share of items isn't declared is counted as if every item were in it:
+	// an upper bound, which mustn't stand as the design's largest or busiest partition.
+	unsized := func(p *analysis.Partition) string {
+		if p == nil {
+			return ""
+		}
+		return fmt.Sprintf(" `%s` (%s) could be more, but only if every item matched its index's `where`: declare `matches` to size it.", escape(p.PK), p.Space())
 	}
-	if busy := busiestPartition(a); busy != nil {
-		d.p("| Busiest partition at peak | `%s` (%s): %s%% of a partition's capacity, risk **%s** |", escape(busy.PK), busy.Space(), load(busy.Headroom*100), busy.Risk)
+	if big, bound := largestPartition(a); big != nil {
+		d.p("| Largest partition | `%s` (%s): %s typical, %s at most.%s |", escape(big.PK), big.Space(), bytesText(big.Size.Typical, big.Size.Known), bytesText(big.Size.Max, big.Size.MaxKnown), unsized(bound))
+	}
+	if busy, bound := busiestPartition(a); busy != nil {
+		d.p("| Busiest partition at peak | `%s` (%s): %s%% of a partition's capacity, risk **%s**.%s |", escape(busy.PK), busy.Space(), load(busy.Headroom*100), busy.Risk, unsized(bound))
 	}
 	if d.r.StorageBytes > 0 {
 		d.p("| Storage | %s at the declared volumes |", cost.HumanBytes(d.r.StorageBytes))
@@ -185,14 +193,41 @@ func workloadText(m *schema.Model) string {
 	return capital(strings.Join(parts, "; "))
 }
 
-func largestPartition(a *analysis.Result) *analysis.Partition {
-	var best *analysis.Partition
+// largestPartition returns the partition with the largest size, and, if a partition sized only as
+// an upper bound (see Partition.Bound) would be larger still, that one too. If every sized
+// partition is a bound, the largest of them is returned as the first.
+func largestPartition(a *analysis.Result) (best, bound *analysis.Partition) {
+	return pick(a, func(p *analysis.Partition) (float64, bool) { return p.Size.Max, p.Size.MaxKnown && !bookkeeping(p) })
+}
+
+// pick returns the partition with the highest measure among those it applies to, preferring
+// partitions whose numbers aren't upper bounds; bound is a bound partition that measures higher.
+func pick(a *analysis.Result, measure func(*analysis.Partition) (float64, bool)) (best, bound *analysis.Partition) {
 	for _, p := range a.Partitions {
-		if p.Size.MaxKnown && !bookkeeping(p) && (best == nil || p.Size.Max > best.Size.Max) {
-			best = p
+		v, ok := measure(p)
+		if !ok {
+			continue
+		}
+		cur := &best
+		if p.Bound() {
+			cur = &bound
+		}
+		if o := *cur; o == nil {
+			*cur = p
+		} else if ov, _ := measure(o); v > ov {
+			*cur = p
 		}
 	}
-	return best
+	if best == nil {
+		return bound, nil
+	}
+	if bound != nil {
+		bv, _ := measure(bound)
+		if v, _ := measure(best); bv <= v {
+			bound = nil
+		}
+	}
+	return best, bound
 }
 
 // bookkeeping reports whether a partition holds only claims and counters.
@@ -205,14 +240,9 @@ func bookkeeping(p *analysis.Partition) bool {
 	return true
 }
 
-func busiestPartition(a *analysis.Result) *analysis.Partition {
-	var best *analysis.Partition
-	for _, p := range a.Partitions {
-		if p.Rated && (best == nil || p.Headroom > best.Headroom) {
-			best = p
-		}
-	}
-	return best
+// busiestPartition is largestPartition for load at peak.
+func busiestPartition(a *analysis.Result) (best, bound *analysis.Partition) {
+	return pick(a, func(p *analysis.Partition) (float64, bool) { return p.Headroom, p.Rated })
 }
 
 // ---- domain ----
@@ -486,8 +516,26 @@ func (d *doc) risks() {
 		d.p("")
 		d.p("| Rule | About | Finding | Reason |")
 		d.p("|---|---|---|---|")
+		// One row per acceptance: an entity's may cover several findings, for one reason.
+		var order []*schema.Acceptance
+		covered := map[*schema.Acceptance][]analysis.Finding{}
 		for _, f := range accepted {
-			d.p("| `%s` | %s | %s | %s |", f.Rule, analysis.SubjectText(f.Subject), escape(f.Message), escape(f.Accepted.Reason))
+			if covered[f.Accepted] == nil {
+				order = append(order, f.Accepted)
+			}
+			covered[f.Accepted] = append(covered[f.Accepted], f)
+		}
+		for _, acc := range order {
+			fs := covered[acc]
+			if len(fs) == 1 && fs[0].Subject == acc.Subject {
+				d.p("| `%s` | %s | %s | %s |", acc.Rule, analysis.SubjectText(acc.Subject), escape(fs[0].Message), escape(acc.Reason))
+				continue
+			}
+			msgs := make([]string, len(fs))
+			for i, f := range fs {
+				msgs[i] = "**" + analysis.SubjectText(f.Subject) + "** " + escape(f.Message)
+			}
+			d.p("| `%s` | %s | %s | %s |", acc.Rule, analysis.SubjectText(acc.Subject), strings.Join(msgs, "<br>"), escape(acc.Reason))
 		}
 		d.p("")
 	}

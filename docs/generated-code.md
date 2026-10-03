@@ -45,7 +45,9 @@ For an entity `Loan`:
 | `LoanOverdue` | an index `Overdue` without `project: all` | What a query through the index returns: key fields plus projected fields. |
 | `LoanHistoryItem` | a `query: key` access `History` with `project` | What the projected query returns. |
 | `MemberLoans`, `MemberLoansKey` | a counter `MemberLoans` | The counter's values (`int64` fields) and the fields that address it. |
-| `Loan<Access>Query` | a `query` access pattern | Its partition key fields, plus `From, To *T` when it has a `range`. |
+| `MemberLoansEntry` | a `counter` access with `all` | One counter item of a partition: its values, and its `Key`. |
+| `Depot<Access>` | a `query: partition` access | One page of the partition: a field per entity in `of`. |
+| `Loan<Access>Query` | a `query` access pattern, or a `counter` access with `all` | Its partition key fields, plus `From, To *T` when it has a `range`. |
 | `Loan<Write>` | an update with `update:` or `patch:` fields | The values the caller supplies; `patch` fields are pointers. |
 | `Loan<Write>Limits` | a write that can grow a `limit: arg` counter value | One `dynago.Limit` per value, named `<Counter><Value>`. |
 
@@ -102,6 +104,17 @@ func (s *ToolStore) Get(ctx context.Context, k ToolKey) (*Tool, error)
 
 One GetItem (strongly consistent with `consistent: true`). Returns `ErrToolNotFound` if absent.
 The entity carries its version.
+
+### `get: key` with `batch`
+
+```go
+func (s *ParcelStore) GetSeveral(ctx context.Context, keys []ParcelKey) ([]Parcel, error)
+```
+
+One BatchGetItem per 100 keys (DynamoDB may return some keys unprocessed, which are fetched
+again). It returns the items that exist, in the order of `keys`: a key with no item, or an expired
+one, is left out, so match results to keys by `Key()`, not by position. A key given twice is read
+and returned once. Each entity carries its version, as from `Get`.
 
 ### `get: { unique: Name }`
 
@@ -176,6 +189,40 @@ some keys unprocessed, which are fetched again). A counter that
 nothing has written reads as zero. The method can live on any entity's store (here the library
 reads the member counts).
 
+### `query: partition`
+
+```go
+type DepotEverything struct {
+    Depot   *Depot      // at most one per partition: nil if this page doesn't hold it
+    Parcels []Parcel
+    Damages []Damage
+}
+
+func (s *DepotStore) Everything(ctx context.Context, q DepotEverythingQuery, page dynago.Page) (DepotEverything, string, error)
+```
+
+Exactly one Query of the partition `q` names, in sort key order (so one kind after another, in the
+order of their sort key prefixes), keeping the kinds listed in `of`. A page evaluates up to its
+size of the partition's items, of every kind, so it can hold fewer than its size and still have a
+next cursor, and a kind's items can continue on the next page: append each page's slices until the
+cursor is `""`. Entities carry their versions, as from `Get`. Expired items are left out.
+
+### `counter` with `all`
+
+```go
+type StateCountsEntry struct {
+    Key StateCountsKey
+    StateCounts
+}
+
+func (s *ParcelStore) States(ctx context.Context, q ParcelStatesQuery, page dynago.Page) ([]StateCountsEntry, string, error)
+```
+
+One Query of the counter's items under one partition key: `q` holds the counter's partition key
+fields, and each entry is one counter item with the key its sort key holds. Pages and cursors work
+as for queries. Only items something has counted exist, and one whose counts have all returned to
+zero is still there, reading zero.
+
 ## Writes
 
 Every write is atomic: either all of its items change or none do. The request shape of each write is
@@ -228,6 +275,41 @@ supplied, in which case it returns `dynago.ErrVersionMismatch`.
 
 `when` preconditions fail with `Err<Entity><Write>Precondition`, and a `required` field set to
 its zero value with `dynago.ErrFieldRequired`.
+
+### update with `batch`
+
+```go
+func (s *ParcelStore) ShelveSeveral(ctx context.Context, keys []ParcelKey) error
+func (s *ParcelStore) AnnotateSeveral(ctx context.Context, keys []ParcelKey, v ParcelAnnotateSeveral) error
+```
+
+The same change to several items. They are read with one consistent BatchGetItem per transaction
+and written several to a transaction, each as the read-first shape writes one: guarded by the
+revision read, with its derived items' changes. The generator fits as many items in a transaction
+as DynamoDB's 100-item limit allows, counting the most each one's change can touch. What the
+items of a transaction share is written once: fifty parcels of one depot moving between states
+update the depot's counter items once per transaction, where fifty single writes would update
+them fifty times, each a chance to conflict with the others.
+
+Each transaction is atomic; the batch is not. The method returns `nil` when every item was written.
+Otherwise it returns a `*dynago.BatchError`, and every item it doesn't name was written:
+
+```go
+var be *dynago.BatchError
+if errors.As(err, &be) {
+    for _, f := range be.Failed {
+        // keys[f.Index] was not written: f.Err is ErrParcelNotFound, the write's precondition
+        // error, or whatever refused it.
+    }
+}
+```
+
+An absent (or expired) item and one that fails the write's `when` are left out of their
+transaction, and the rest of it goes ahead. If an item changes between the read and the write, its
+transaction is read and built again, under the retry policy. A transaction refused for another
+reason (a unique value taken, a counter's limit) is split in two and each half tried again, down
+to single items, so the item at fault is the only one not written. A key given twice is written
+once. There are no write options: a batch doesn't take versions.
 
 ### requires
 

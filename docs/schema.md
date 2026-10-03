@@ -102,7 +102,7 @@ entities:
 | `access` | no | | The reads the store offers. See [Access patterns](#access). |
 | `writes` | no | | The writes the store offers. See [Writes](#writes). |
 | `volume` | no | | How many items to expect: a total, or typical and max per parent. See [Volume](#volume). |
-| `accept` | no | | Findings about the entity recorded as deliberate. See [Accepting findings](#accept). |
+| `accept` | no | | Findings about the entity, or about anything it declares, recorded as deliberate. See [Accepting findings](#accept). |
 
 Every item also stores bookkeeping attributes: `_t` (entity name), `_v` (schema version it was
 written at), `_rev` (revision, used for optimistic concurrency), and `_created` and `_updated`
@@ -180,7 +180,8 @@ key:
 **Key templates** are literal text with `{field}` placeholders. Rules:
 
 - Every placeholder names a field of the entity, of a type allowed in keys (`string`, `enum`,
-  `int`, `time`, `bool`).
+  `int`, `time`, `bool`). An index's, a counter's and a unique constraint's templates may also
+  name one `string_set`, which renders a key for each of its elements; an entity's own key can't.
 - Two placeholders must be separated by literal text (`{a}#{b}`, not `{a}{b}`).
 - A `string` or `enum` placeholder can apply a transform: `{name|lower}` puts the lower-cased value
   in the key while the attribute keeps its case. Use it to sort case-insensitively (`"adam"` before
@@ -227,6 +228,7 @@ An index is another key for the same entity. Index names are PascalCase.
 | `sk` | gsi: no; copy: yes | | Sort key template. A copy's `sk` must start with literal text. |
 | `project` | yes | | What the index holds: `all` (every field), `keys` (key fields only), or a list of fields. Key fields are always included. |
 | `where` | no | | Only index the entity while these [predicates](#predicates) hold (a sparse index). |
+| `matches` | no | | With `where`: the share of the entity's items that satisfy it, from just above 0 to 1 (`0.01` is one in a hundred). The analysis sizes the index, its partitions' traffic and the cost of the writes that maintain it with this share. Without it every item is counted, which is the most the index can hold: the results are marked as upper bounds, and left out of the summary's largest and busiest partition. |
 | `doc` | no | | Shown in the model document and on the generated method. |
 | `accept` | no | | Findings about the index recorded as deliberate. See [Accepting findings](#accept). |
 
@@ -248,6 +250,24 @@ Behaviour:
   count in each `INCLUDE` GSI. A field's `attr` can't be a GSI's key attribute (`ByCategoryPK`).
 - **Results.** A query through an index with `project: all` returns entities; otherwise it returns
   a generated `<Entity><Index>` struct holding the projected fields.
+- **Keyed by a set's elements.** A key template may name one `string_set` field: the entity then
+  has an entry for **each element** of the set, so a thread with three labels is in three label
+  lists:
+
+  ```yaml
+  ByLabel:
+    pk: "USER#{userId}#LABEL#{labelIds}"      # labelIds is a string_set
+    sk: "L#{lastMessageAt}#{threadId}"
+    project: [subject, snippet, unread]
+  ```
+
+  Such an index is always a copy (a GSI holds an item under one key), written in the write's
+  transaction like any copy. A write that changes the set adds the copies of new elements and
+  deletes those of dropped ones; a write that changes anything else the copies hold rewrites every
+  one, so its cost and its transaction grow with the set: declare the set's `size`, from which
+  dynago estimates the number of elements, at 20 bytes each. A query through the index takes one
+  element (`LabelIDsElem`) where it would take the field. Elements that render the same key
+  (`{labelIds|lower}`) share one copy.
 
 Limits: 20 GSIs per table (a default quota AWS can raise), and 100 attributes in `INCLUDE`
 projections across a table's indexes (a fixed limit).
@@ -334,6 +354,23 @@ Each value is `count` (short form) or a mapping:
 Use exactly one of `count` and `sum`. The counter item is only touched while every `string`, `enum`
 and `time` field in its templates is non-empty (a sparse counter). See [Counters](guides/counters.md).
 
+A counter's key templates may name one `string_set` field, as an index's may: the entity then
+counts towards **one counter item for each element** of the set.
+
+```yaml
+LabelCounts:
+  pk: "USER#{userId}"
+  sk: "COUNTS#LABEL#{labelIds}"                 # one item per label
+  values:
+    total: count
+    unread: { count: true, where: { unread: true } }
+```
+
+A thread with three labels adds to three items, in the write's transaction; changing the set moves
+its contribution from the labels dropped to the labels added. The counter's key type holds one
+element (`LabelCountsKey.LabelIDsElem`), and `{ counter: LabelCounts, all: true }` reads every
+label's item in one Query. A `requires` can't check such a counter.
+
 ## Access
 
 ```yaml
@@ -346,6 +383,9 @@ access:
   MyLoans: { query: ByMember, freshness: immediate }
   ActiveLoans: { counter: MemberLoans }
   Export: { scan: true, reason: "The nightly warehouse export reads every loan." }
+  GetSeveral: { get: key, batch: 40 }             # several loans by key, one BatchGetItem
+  Open: { query: partition, of: [Thread, Message, Draft] }   # entities that share a partition, one Query
+  LabelCounts: { counter: LabelCounts, all: true } # every item of a counter in a partition, one Query
 ```
 
 Access patterns are the **only** reads the generated store offers: one method each. Names are
@@ -355,14 +395,17 @@ PascalCase and must be unique across `access` and `writes`. Declare exactly one 
 | Key | Applies to | Default | Meaning |
 |---|---|---|---|
 | `get` | | | `key`: one GetItem by primary key (short form: `Name: get`). `{ unique: Name }`: find the entity holding a unique value — a consistent read of the claim, then of the item. |
-| `query` | | | `key`: query the entity's own partition (items matched by its sort key prefix). An index name: query that index. Exactly one Query request per page. |
+| `batch` | `get: key` | | Makes the read take several keys: `GetSeveral: { get: key, batch: 40 }` returns the items that exist, in the order of the keys, with one BatchGetItem per 100 keys. The number is how many keys a call typically passes, which the cost estimate and the partition analysis use; a call may pass any number. Each item is billed as a GetItem of it would be. |
+| `query` | | | `key`: query the entity's own partition (items matched by its sort key prefix). An index name: query that index. `partition`: read several entities' items under one partition key, listed in `of`. Exactly one Query request per page. |
+| `of` | `query: partition` | | The entities whose items the read returns: `Open: { query: partition, of: [Thread, Message, Draft] }`. Every one must have the same partition key template as this entity, which is what puts their items side by side. The method takes the partition key fields and returns a generated `<Entity><Access>` value with a field per entity: a slice of each kind, or a pointer for an entity with at most one item per partition (a sort key with no field of its own). One Query reads the partition in sort key order and keeps these kinds, so the items the partition holds of other kinds (other entities, counters, copies, claims) are read and billed too, a page can hold few items and still have a next cursor, and one kind's items can span pages. Takes `order`, `page` and `max_page`. |
 | `counter` | | | Read a counter: one GetItem, or a BatchGetItem over its shards. The counter may belong to any entity of the table, so a library can offer its member counts. |
+| `all` | `counter` | `false` | Read every item of the counter in one partition, with one Query a page: `AllCounts: { counter: LabelCounts, all: true }` returns each label's counts for a user, where the counter's sort key is `COUNTS#LABEL#{labelId}`. The method takes the counter's partition key fields and returns `<Counter>Entry` values: the counts, and the key each item's sort key holds. The sort key's own fields must be `string` or `enum`, untransformed and separated by literal text, so they can be read back; the counter can't be sharded. Takes `page` and `max_page`. |
 | `scan` | | | `true`: read every item of the entity, one page of the **whole table** per call (a Scan filtered to the entity's items, so a page can hold few or none and still have a next cursor). A declared exception for exports and backfills, never for a request path: `dynago check` notes its full-pass cost, and a policy can forbid it. Needs `reason`. |
 | `reason` | scan | | Why a scan is needed. Shown in the model document and on the method. |
 | `freshness` | all | | What the reader needs. `immediate`: it must see writes that just happened (read-your-writes), so the read is strongly consistent, and an index it reads without a declared `strategy` becomes a copy; through a GSI it's an error. `eventual`: a moment's lag is fine, and the read is eventually consistent (half the cost). Left out, the read is as `consistent` says, and the model document marks it "not stated". |
 | `order` | query | `asc` | `asc` or `desc`, by sort key. |
-| `page` | query, scan | `50` | Default page size (items evaluated per request). |
-| `max_page` | query, scan | `max(100, page)` | Largest page a caller may ask for (≤ 1000). |
+| `page` | query, scan, counter with `all` | `50` | Default page size (items evaluated per request). For a partition read, size it for the whole partition if one call should return it all. |
+| `max_page` | query, scan, counter with `all` | `max(100, page)` | Largest page a caller may ask for (≤ 1000). |
 | `range` | query | | A field that directly follows the sort key's literal prefix. Adds optional inclusive `From` / `To` bounds to the query. |
 | `consistent` | get, query, counter, scan | `false`; `true` for a query through a `copy` index | Strongly consistent read (twice the cost). Not allowed on a `gsi` index. A copy index is read consistently unless it says `consistent: false` or `freshness: eventual`: read-your-writes is why it's a copy. Prefer `freshness`, which states the need rather than the mechanism; the two may not contradict each other. |
 | `project` | `query: key` | all fields | Read only these fields (plus key fields): `[name, status]`, or `keys`. Returns a generated `<Entity><Access>Item` type. Saves bandwidth and keeps other fields (secrets, large text) from callers; **DynamoDB still bills the whole item**, so for cheaper lists use an index with a narrow projection. |
@@ -402,6 +445,7 @@ Declare exactly one kind:
 | `versioned` | update, delete | `optional` (default) or `required`. Required writes refuse to run without a version from `dynago.From` or `dynago.IfVersion`. See [Concurrency](guides/concurrency.md). |
 | `doc` | all | Shown in the model document and on the method. |
 | `rate` | all | Average calls per second, for the monthly cost estimate and the partition analysis. |
+| `batch` | update | Makes the write take several keys and apply the same change to each: `Archive: { set: { mailbox: archived }, batch: 50 }` generates `Archive(ctx, keys []ThreadKey) error`. The items are read together and written several to a transaction (as many as fit in DynamoDB's 100 items, counting what each one's change touches), each guarded by its revision, and **a counter item several of them change is updated once per transaction**, so fifty changes to one user's threads touch the user's counter a handful of times, not fifty. Each transaction is atomic; the batch is not: it returns a `*dynago.BatchError` naming the items not written (absent, failing `when`, or refused), and the rest are written. The number is how many items a call typically changes, for the estimates. Not with `requires`, `versioned: required`, or a counter value whose limit callers supply. |
 | `hot_key_rate` | all | Peak calls per second against one partition key. Without it, the analysis estimates each partition's share of `rate` from the volumes; with it, this number is used for every partition the write touches. |
 | `accept` | all | Findings about the write recorded as deliberate. See [Accepting findings](#accept). |
 
@@ -456,9 +500,12 @@ write, and no crash can leave the write half done.
 |---|---|
 | `key` | Maps every key field of the target (for a counter, every field of its key templates) to the field of this entity holding its value. Types must match. |
 | `when` | Values the target must have ([predicates](#predicates)). For an entity, a value `"{field}"` means this entity's field: `memberId: "{memberId}"` requires the hold to be the borrower's. For a counter, integers; a missing value counts as 0, so `active: 0` also passes before anything was counted. |
-| `set` | Entities only. Changes the target in the same transaction: its revision, counters, claims, copies and index keys are maintained as by an update of it declared with this `set` and `when`. Values are constants or `"{field}"`. Not key fields; not a counter value whose limit the target's callers supply. |
+| `set` | Entities only. Changes the target in the same transaction: its revision, counters, claims, copies and index keys are maintained as by an update of it declared with this `set` and `when`. Values are constants or `"{field}"`. Not key fields; not a counter value whose limit the target's callers supply. The same holds for `add` and `patch`, and a field is changed by one of the three. |
+| `add` | Entities only. Adds to `int` fields of the target: `add: { messageCount: 1 }`. A whole number (negative to subtract) or `"{field}"`, an int field of this entity. Concurrent writes all count: the addition is DynamoDB's atomic `ADD` when the target isn't read, and guarded by the target's revision (and retried) when it is. |
+| `patch` | Entities only. Sets fields of the target from this entity's fields, each only when that field has a value: `patch: { hasAttachments: "{hasAttachments}" }` marks the thread when a message with attachments arrives, and leaves the mark alone when one without arrives. Use `set` to assign whatever the field holds, empty or not. |
+| `ensure` | Entities only. Creates the target when it is absent (or expired), in the same transaction: `ensure: { subject: "{subject}" }`, or `ensure: {}`. The new item has its key from `key`, the fields `ensure` gives (constants or `"{field}"`), then `set`, `add` and `patch` applied, and its counters, claims, copies and index keys are written as a create of it writes them. A target that is there is checked against `when` and changed as without `ensure`; `when` says nothing about one the write creates. Every `required` field of the target must be given by `ensure` or `set`. Exclusive with `optional` and `consume`. See [a parent and its first child](#a-parent-and-its-first-child). |
 | `optional` | Entities only. The write goes ahead if the target is absent or has expired; `when` applies only to one that is there. |
-| `consume` | Entities only. Deletes the target in the same transaction, releasing what it contributed. Exclusive with `set`. |
+| `consume` | Entities only. Deletes the target in the same transaction, releasing what it contributed. Exclusive with `set`, `add` and `patch`. |
 
 The write fails with `Err<Entity><Write>Requires<Target>`, and writes nothing, unless the target
 meets the requirement: it exists (unless `optional`), has not expired, and meets `when`.
@@ -478,10 +525,36 @@ first, unless they are read-free and every field the requirements use is known f
 
 The model document shows which writes read first and why, and what each changes.
 
+#### A parent and its first child
+
+A conversation is a thread and its first message; later messages change the thread through
+`requires`. With `ensure`, the first message creates it, so the two are never written apart:
+
+```yaml
+Message:
+  writes:
+    Deliver:
+      create: true
+      requires:
+        Thread:
+          key: { userId: userId, threadId: threadId }
+          ensure: { subject: "{subject}" }          # given only to a thread this write creates
+          set: { lastMessageAt: "{date}", snippet: "{snippet}", unread: true, mailbox: inbox }
+          add: { messageCount: 1 }
+```
+
+If no thread is at the key, the write creates one with the message's subject, the `set` values and
+a count of 1. If one is there, it is changed as before, and `ensure`'s fields are left alone. When
+two first messages race, one creates the thread and the other finds it: the loser's transaction
+fails its "no thread yet" condition and runs again.
+
+The target is read to find out which case it is, unless the change can be written without reading
+it: then the write tries the change first, and reads only when no target turns out to be there.
+
 ## Predicates
 
 `where`, `when`, `set` and a require's `when` and `set` take a mapping of field to constant (a
-require's may also name a field of the writing entity, `"{field}"`):
+require's may also name a field of the writing entity, `"{field}"`), which the field must equal:
 
 ```yaml
 where: { status: active, role: steward }
@@ -491,6 +564,26 @@ All conditions must hold (AND). Values must match the field's type: `true`/`fals
 integer for `int`, a number for `float`, a string for `string`, one of the declared values for
 `enum`. Fields of other types cannot be compared. A condition on a zero value (`false`, `0`, `""`)
 also matches an absent attribute, since zero values are not stored.
+
+A condition (`where`, `when`, and a require's `when`; not `set`) can also exclude a value, or list
+several:
+
+```yaml
+where: { hasSent: true, mailbox: { not: trash } }      # every mailbox but the trash
+when:  { mailbox: { in: [inbox, archived, sent] } }     # one of these
+```
+
+| Form | Holds when |
+|---|---|
+| `field: value` | the field equals the value |
+| `field: { not: value }` | the field holds anything else. An empty field counts as holding its zero value, so `{ not: trash }` holds for an item with no mailbox, and `{ not: "" }` holds only for one that has a value. In a require's `when`, the value may be `"{field}"` of the writing entity. |
+| `field: { in: [a, b] }` | the field equals one of the values (two or more, and not every value of an enum) |
+
+A `when` that names one value tells dynago the state the write starts from, which is what lets a
+write that moves a counter run [read-free](#writes). `not` and `in` leave several states possible,
+so a write whose `when` uses one for a field that feeds a counter, an index or a claim reads the
+item first. Where nothing derived depends on the field, the condition goes on the single
+UpdateItem as any other does.
 
 ## Volume
 
@@ -561,6 +654,9 @@ is listed with its reason in the model document and doesn't fail the build.
   or the assumption behind the estimate.
 - An acceptance must match a finding: naming an unknown rule, or a finding the object doesn't have
   (it was fixed, or moved), is an error, so acceptances don't outlive their reasons.
+- An acceptance on an entity also covers the rule's findings about everything the entity declares
+  (fields, indexes, constraints, counters, reads, writes), so a reason shared by six copied fields
+  is written once. One on the object itself takes precedence.
 - A policy can turn a rule off, or make it an error, for every schema at once. See
   [Analysis](guides/analysis.md) for every rule and the policy file.
 
@@ -573,8 +669,8 @@ is listed with its reason in the model document and doesn't fail the build.
 
 Go names are built by splitting on case changes, `_` and `-`, capitalising each word, and
 upper-casing common initialisms (`id`, `url`, `uri`, `http`, `html`, `api`, `uid`, `uuid`, `ulid`,
-`json`, `ttl`, `sku`, `ip`, `sql`, `css`, `xml`, `sms`): `libraryId` → `LibraryID`,
-`manualUrl` → `ManualURL`, enum value `on_loan` → `OnLoan`.
+`json`, `ttl`, `sku`, `ip`, `sql`, `css`, `xml`, `sms`, `https`) and their plurals: `libraryId` →
+`LibraryID`, `manualUrl` → `ManualURL`, `labelIds` → `LabelIDs`, enum value `on_loan` → `OnLoan`.
 
 Generated type names must not collide (for example an entity `MemberLoans` and a counter
 `MemberLoans`); dynago reports collisions. [Generated code](generated-code.md) lists every name.

@@ -211,12 +211,14 @@ entities:
         pk: "LIB#{libraryId}#MEMBER#{memberId}"
         sk: "MYLOAN#{dueAt}#{toolId}#{loanId}"
         where: { status: active }
+        matches: 0.02   # a tool has about 20 loans in its history, and at most one of them is active
         project: [toolName, dueAt]
       Overdue:
         doc: Active loans by due date, for the steward's reminder run. Returned loans drop out.
         pk: "LIB#{libraryId}#DUE"
         sk: "{dueAt}#{loanId}"
         where: { status: active }
+        matches: 0.02
         project: [memberId, toolName]
     counters:
       MemberLoans:

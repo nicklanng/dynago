@@ -52,13 +52,32 @@ type Count struct {
 	// Spread says the items are on different partition keys (a key moved, or one claim per
 	// element), so each key takes one of them rather than all.
 	Spread bool
+	// Chance is the share of calls that touch the items at all, when it is less than every call:
+	// entries of a sparse index exist only for the items that match its where. 0 means every call.
+	Chance float64
+}
+
+// chance is the share of calls that touch the items.
+func (c Count) chance() float64 {
+	if c.Chance > 0 {
+		return c.Chance
+	}
+	return 1
+}
+
+// maybe returns the count for a share of the calls.
+func (c Count) maybe(chance float64) Count {
+	if chance < 1 {
+		c.Chance = chance
+	}
+	return c
 }
 
 var (
-	once  = Count{1, 1, false}
-	twice = Count{2, 2, false}
+	once  = Count{P50: 1, P99: 1}
+	twice = Count{P50: 2, P99: 2}
 	// apart is two items on two partition keys: an entry or counter whose partition key moved.
-	apart = Count{2, 2, true}
+	apart = Count{P50: 2, P99: 2, Spread: true}
 )
 
 // TargetKind is a kind of stored item.
@@ -124,7 +143,10 @@ type WriteCost struct {
 	Touches       []Touch
 	ReadFirst     bool
 	Transactional bool
-	MaxTxItems    int
+	// BatchSize is, for a batch write, how many of its items go in one transaction; the costs
+	// are then those of a call with the declared number of items. 0 for a write of one item.
+	BatchSize  int
+	MaxTxItems int
 	// TxBytes is the p99 size of everything the write's own request writes.
 	TxBytes int
 	WRU     Units
@@ -273,7 +295,7 @@ func CounterSize(c *schema.Counter) Size {
 func analyzeEntity(r *Report, m *schema.Model, e *schema.Entity) *EntityReport {
 	er := EntitySizes(m, e)
 	for _, a := range e.Access {
-		rc := ReadCostOf(a, er)
+		rc := ReadCostOf(m, a, er)
 		if a.Rate > 0 {
 			rc.Monthly = (rc.RRU.P50 * a.Rate * secondsPerMonth / 1e6) * r.Prices.RRUPerMillion
 		}
@@ -290,10 +312,16 @@ func analyzeEntity(r *Report, m *schema.Model, e *schema.Entity) *EntityReport {
 		bytes := n * float64(er.Item.P50+IndexOverhead)
 		er.BaseBytes, er.BaseItems = n*float64(er.Item.P50), n
 		for _, ix := range e.Indexes {
-			bytes += n * float64(er.Indexes[ix.Name].P50+IndexOverhead)
+			// A sparse index holds the share of the items its where matches, when declared; an
+			// index keyed by a set's elements holds a copy for each.
+			in := n * ix.Share()
+			if ix.Set != nil {
+				in *= float64(setElements(ix.Set).P50)
+			}
+			bytes += in * float64(er.Indexes[ix.Name].P50+IndexOverhead)
 			if ix.Strategy == schema.StrategyCopy {
-				er.BaseBytes += n * float64(er.Indexes[ix.Name].P50)
-				er.BaseItems += n
+				er.BaseBytes += in * float64(er.Indexes[ix.Name].P50)
+				er.BaseItems += in
 			}
 		}
 		for _, u := range e.Uniques {
@@ -320,7 +348,7 @@ func readFactor(a *schema.Access) float64 {
 }
 
 // ReadCostOf estimates one call of an access pattern.
-func ReadCostOf(a *schema.Access, er *EntityReport) ReadCost {
+func ReadCostOf(m *schema.Model, a *schema.Access, er *EntityReport) ReadCost {
 	rc := ReadCost{Access: a, RoundTrips: 1}
 	factor := readFactor(a)
 	e := a.Entity
@@ -328,6 +356,12 @@ func ReadCostOf(a *schema.Access, er *EntityReport) ReadCost {
 	case schema.AccessGet:
 		rc.Requests = "GetItem"
 		rc.RRU = Units{rru(er.Item.P50, factor), rru(er.Item.P99, factor)}
+		if a.Batch > 0 {
+			// Each item of a batch is charged as a GetItem of it would be.
+			rc.Requests = fmt.Sprintf("BatchGetItem (%d keys)", a.Batch)
+			rc.RoundTrips = (a.Batch + 99) / 100
+			rc.RRU = Units{rc.RRU.P50 * float64(a.Batch), rc.RRU.P99 * float64(a.Batch)}
+		}
 		rc.Reads = []Target{{Kind: TargetItem, Entity: e}}
 	case schema.AccessGetUnique:
 		rc.Requests = "GetItem (claim) → GetItem"
@@ -335,6 +369,20 @@ func ReadCostOf(a *schema.Access, er *EntityReport) ReadCost {
 		rc.RRU = Units{1 + rru(er.Item.P50, 1), 1 + rru(er.Item.P99, 1)}
 		rc.Reads = []Target{{Kind: TargetClaim, Entity: e, Unique: a.Unique}, {Kind: TargetItem, Entity: e}}
 	case schema.AccessQuery:
+		if a.Of != nil {
+			// A page of several kinds: sized as an even mix of them at the median, and as a page
+			// of the largest at worst. Items of other kinds the partition holds are read too.
+			var mix, worst int
+			for _, oe := range a.Of {
+				s := ItemSize(m, oe)
+				mix += s.P50
+				worst = max(worst, s.P99)
+				rc.Reads = append(rc.Reads, Target{Kind: TargetItem, Entity: oe})
+			}
+			rc.Requests = "Query"
+			rc.RRU = Units{rru(mix*a.Page/max(1, len(a.Of)), factor), rru(worst*a.Page, factor)}
+			break
+		}
 		entry := er.Item
 		t := Target{Kind: TargetItem, Entity: e}
 		if a.Index != nil {
@@ -352,6 +400,13 @@ func ReadCostOf(a *schema.Access, er *EntityReport) ReadCost {
 		rc.RRU = Units{rru(er.Item.P50*a.Page, factor), rru(er.Item.P99*a.Page, factor)}
 		rc.Reads = []Target{{Kind: TargetItem, Entity: e}}
 	case schema.AccessCounter:
+		if a.All {
+			size := CounterSize(a.Counter)
+			rc.Requests = "Query"
+			rc.RRU = Units{rru(size.P50*a.Page, factor), rru(size.P99*a.Page, factor)}
+			rc.Reads = []Target{{Kind: TargetCounter, Entity: a.Counter.Entity, Counter: a.Counter}}
+			break
+		}
 		if a.Counter.Shards > 1 {
 			rc.Requests = fmt.Sprintf("BatchGetItem (%d shards)", a.Counter.Shards)
 		} else {
@@ -367,6 +422,14 @@ func ReadCostOf(a *schema.Access, er *EntityReport) ReadCost {
 // WriteCostOf estimates one call of a write of e (which may be a variant of w.Entity with other
 // indexes, for comparing designs). readFirst says whether the write reads the item first.
 func WriteCostOf(m *schema.Model, e *schema.Entity, w *schema.Write, readFirst bool, er *EntityReport) WriteCost {
+	if w.Batch > 0 {
+		// A call changes several items, each read and then written as a write of one would be.
+		one := *w
+		one.Batch = 0
+		wc := WriteCostOf(m, e, &one, true, er)
+		wc.Write = w
+		return batchCost(wc, w.Batch)
+	}
 	wc := WriteCost{Write: w, ReadFirst: readFirst}
 	// gsi holds index entries DynamoDB writes asynchronously, outside any transaction. own holds
 	// the items the write itself puts, updates, deletes or checks.
@@ -382,7 +445,8 @@ func WriteCostOf(m *schema.Model, e *schema.Entity, w *schema.Write, readFirst b
 				wc.TxBytes += n.P99 * s.P99
 			}
 		}
-		u := Units{float64(n.P50) * wru(s.P50), float64(n.P99) * wru(s.P99)}
+		// Typically, only the calls that touch the items pay for them; at worst, every one does.
+		u := Units{float64(n.P50) * wru(s.P50) * n.chance(), float64(n.P99) * wru(s.P99)}
 		*dst = dst.add(u)
 		wc.Items = append(wc.Items, name)
 		wc.Touches = append(wc.Touches, Touch{Target: t, Label: name, Check: check, Async: async, Size: s, Count: n, Units: u})
@@ -401,8 +465,12 @@ func WriteCostOf(m *schema.Model, e *schema.Entity, w *schema.Write, readFirst b
 			ter := EntitySizes(m, rq.Target)
 			tw := rq.TargetWrite()
 			label := rq.Name + " (" + rq.Effect(e.Name) + ")"
-			if rq.Consume {
+			switch {
+			case rq.Consume:
 				tw = &schema.Write{Name: "requires", Entity: rq.Target, Kind: schema.WriteDelete}
+			case rq.Ensure:
+				// Costed as the creation: the most the requirement writes.
+				tw = rq.TargetCreate()
 			}
 			write(Target{Kind: TargetItem, Entity: rq.Target}, false, false, label, ter.Item, once)
 			derivedWrites(rq.Target, tw, ter, rq.Name+"'s ", write)
@@ -422,6 +490,44 @@ func WriteCostOf(m *schema.Model, e *schema.Entity, w *schema.Write, readFirst b
 	return wc
 }
 
+// BatchItems is the most items a write of one item of a batch touches, which decides how many
+// items go in one transaction.
+func BatchItems(m *schema.Model, w *schema.Write) int {
+	one := *w
+	one.Batch = 0
+	return WriteCostOf(m, w.Entity, &one, true, EntitySizes(m, w.Entity)).MaxTxItems
+}
+
+// batchCost turns the cost of a write of one item into that of a batch call changing n items:
+// each is read and written, several to a transaction. It counts every item's derived writes in
+// full, although a counter item that several of a transaction's items change is updated once:
+// an upper bound.
+func batchCost(wc WriteCost, n int) WriteCost {
+	per := max(1, wc.MaxTxItems)
+	size := schema.BatchSize(per)
+	in := min(n, size) // items in one transaction
+	wc.BatchSize = size
+	wc.Transactional = in*per > 1
+	var own, gsi Units
+	for i := range wc.Touches {
+		t := &wc.Touches[i]
+		t.Units = Units{t.Units.P50 * float64(n), t.Units.P99 * float64(n)}
+		if t.Async {
+			gsi = gsi.add(t.Units)
+		} else {
+			own = own.add(t.Units)
+		}
+	}
+	if wc.Transactional {
+		own = own.add(own)
+	}
+	wc.WRU = own.add(gsi)
+	wc.RRU *= float64(n)
+	wc.MaxTxItems = in * per
+	wc.TxBytes *= in
+	return wc
+}
+
 // writeFunc records one family of items a write touches: check marks condition checks, async
 // marks GSI entries, which DynamoDB writes outside the transaction.
 type writeFunc func(t Target, check, async bool, name string, s Size, n Count)
@@ -433,7 +539,7 @@ const setElementBytes = 20
 // setElements estimates the number of elements of a string set field.
 func setElements(f *schema.Field) Count {
 	n := func(size int) int { return max(1, (size+setElementBytes-1)/setElementBytes) }
-	return Count{n(f.SizeP50), n(f.SizeP99), true}
+	return Count{P50: n(f.SizeP50), P99: n(f.SizeP99), Spread: true}
 }
 
 // derivedWrites records the index entries, copies, counters and claims a write of e changes. A
@@ -455,34 +561,66 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 	}
 	all := w.Kind != schema.WriteUpdate
 	for _, ix := range e.Indexes {
-		keyFields := append(append([]*schema.Field{}, ix.PK.Fields...), ix.SK.Fields...)
-		keyFields = append(keyFields, predFields(ix.Where)...)
-		moved, projected := touches(keyFields), ix.Projection == schema.ProjectAll || touches(ix.ProjectedFields())
+		keys := append(append([]*schema.Field{}, ix.PK.Fields...), ix.SK.Fields...)
+		projected := ix.Projection == schema.ProjectAll || touches(ix.ProjectedFields())
 		size := er.Indexes[ix.Name]
-		movedN := twice
-		if touches(ix.PK.Fields) {
-			movedN = apart
-		}
+		t, entry, moved, async := Target{Kind: TargetCopy, Entity: e, Index: ix}, owner+"copy "+ix.Name, " (moved: put + delete)", false
 		if ix.Strategy == schema.StrategyGSI {
-			t := Target{Kind: TargetGSI, Entity: e, Index: ix}
+			t, entry, moved, async = Target{Kind: TargetGSI, Entity: e, Index: ix}, owner+"GSI "+ix.Name+" entry", " (moved: delete + put)", true
+		}
+		// A sparse index has an entry only while the item matches its where: the write's `when`
+		// and `set` may say whether it does, and otherwise the declared share of items does.
+		before, after := ix.Members(w)
+		chance := func(m schema.Membership) float64 {
+			if m == schema.Maybe {
+				return ix.Share()
+			}
+			return 1
+		}
+		if ix.Set != nil {
+			// One copy for each element of the set. A change to the set adds and drops copies:
+			// typically one of each, at worst all of them. A change to anything else the copies
+			// hold, or to their keys, rewrites every one.
+			n := setElements(ix.Set)
+			each := fmt.Sprintf("%s (one per %s element)", entry, ix.Set.Name)
 			switch {
+			case before == schema.No && after == schema.No:
 			case all:
-				write(t, false, true, owner+"GSI "+ix.Name+" entry", size, once)
-			case moved:
-				write(t, false, true, owner+"GSI "+ix.Name+" entry (moved: delete + put)", size, movedN)
-			case projected:
-				write(t, false, true, owner+"GSI "+ix.Name+" entry", size, once)
+				write(t, false, async, each, size, n.maybe(max(chance(before), chance(after))))
+			case touches(keys) && !touches(minusField(keys, ix.Set)) && !projectedBeyond(ix, changed):
+				write(t, false, async, fmt.Sprintf("%s (added and dropped %s elements)", entry, ix.Set.Name), size, Count{P50: 2, P99: 2 * n.P99, Spread: true}.maybe(chance(before)))
+			case touches(keys):
+				write(t, false, async, each+moved, size, Count{P50: 2 * n.P50, P99: 2 * n.P99, Spread: true}.maybe((chance(before)+chance(after))/2))
+			case touches(predFields(ix.Where)) || projected:
+				write(t, false, async, each, size, n.maybe(max(chance(before), chance(after))))
 			}
 			continue
 		}
-		t := Target{Kind: TargetCopy, Entity: e, Index: ix}
 		switch {
-		case all:
-			write(t, false, false, owner+"copy "+ix.Name, size, once)
-		case moved:
-			write(t, false, false, owner+"copy "+ix.Name+" (moved: put + delete)", size, movedN)
+		case before == schema.No && after == schema.No:
+			// Never in the index: nothing to write.
+		case before == schema.No:
+			if all {
+				write(t, false, async, entry, size, once.maybe(chance(after)))
+			} else {
+				write(t, false, async, entry+" (added)", size, once.maybe(chance(after)))
+			}
+		case after == schema.No:
+			if all {
+				write(t, false, async, entry, size, once.maybe(chance(before)))
+			} else {
+				write(t, false, async, entry+" (removed)", size, once.maybe(chance(before)))
+			}
+		case touches(keys) || (touches(predFields(ix.Where)) && (before == schema.Maybe || after == schema.Maybe)):
+			// Its keys change, or it may enter or leave the index: the old entry goes and the
+			// new one is written, each only if the item matches at that moment.
+			n := twice
+			if touches(ix.PK.Fields) {
+				n = apart
+			}
+			write(t, false, async, entry+moved, size, n.maybe((chance(before)+chance(after))/2))
 		case projected:
-			write(t, false, false, owner+"copy "+ix.Name, size, once)
+			write(t, false, async, entry, size, once.maybe(chance(before)))
 		}
 	}
 	for _, c := range e.Counters {
@@ -495,6 +633,22 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 			}
 		}
 		size := CounterSize(c)
+		if c.Set != nil {
+			// One counter item for each element of the set.
+			n := setElements(c.Set)
+			each := fmt.Sprintf("%scounter %s (one item per %s element)", owner, c.Name, c.Set.Name)
+			switch {
+			case all:
+				write(t, false, false, each, size, n)
+			case changed[c.Set] && !touches(minusField(c.KeyFields(), c.Set)):
+				write(t, false, false, fmt.Sprintf("%scounter %s (added and dropped %s elements)", owner, c.Name, c.Set.Name), size, Count{P50: 2, P99: 2 * n.P99, Spread: true})
+			case touches(c.KeyFields()):
+				write(t, false, false, each+" (moved: two counter items each)", size, Count{P50: 2 * n.P50, P99: 2 * n.P99, Spread: true})
+			case touches(in...):
+				write(t, false, false, each, size, n)
+			}
+			continue
+		}
 		switch {
 		case all:
 			write(t, false, false, owner+"counter "+c.Name, size, once)
@@ -518,7 +672,7 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 			case all:
 				write(t, false, false, fmt.Sprintf("%sclaims %s (one per %s element)", owner, u.Name, u.Set.Name), claimSize, n)
 			case touches(u.Fields):
-				write(t, false, false, fmt.Sprintf("%sclaims %s (added and dropped %s elements)", owner, u.Name, u.Set.Name), claimSize, Count{2, 2 * n.P99, true})
+				write(t, false, false, fmt.Sprintf("%sclaims %s (added and dropped %s elements)", owner, u.Name, u.Set.Name), claimSize, Count{P50: 2, P99: 2 * n.P99, Spread: true})
 			}
 			continue
 		}
@@ -531,6 +685,28 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 			write(t, false, false, owner+"claim "+u.Name+" (moved: put + delete)", claimSize, apart)
 		}
 	}
+}
+
+// minusField returns fields without f.
+func minusField(fields []*schema.Field, f *schema.Field) []*schema.Field {
+	var out []*schema.Field
+	for _, x := range fields {
+		if x != f {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// projectedBeyond reports whether a write changes a field the index's copies hold, other than
+// the set that keys them.
+func projectedBeyond(ix *schema.Index, changed map[*schema.Field]bool) bool {
+	for _, f := range ix.ProjectedFields() {
+		if f != ix.Set && changed[f] {
+			return true
+		}
+	}
+	return false
 }
 
 // ClaimSize is the size of one uniqueness claim item: its keys, type, owner's key and timestamps.
@@ -604,6 +780,9 @@ func templateSize(t schema.Template) Size {
 		}
 		f := fields[seg.Field]
 		switch f.Type {
+		case schema.TypeStringSet:
+			// One element of the set: the key is rendered once for each.
+			s = s.add(Size{setElementBytes, setElementBytes})
 		case schema.TypeTime:
 			s = s.add(Size{30, 30})
 		case schema.TypeInt:

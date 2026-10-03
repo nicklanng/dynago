@@ -26,10 +26,32 @@
           {
             "name": "SK",
             "type": "S"
+          },
+          {
+            "name": "KnownPK",
+            "type": "S"
+          },
+          {
+            "name": "KnownSK",
+            "type": "S"
           }
         ],
         "billing_mode": "PAY_PER_REQUEST",
         "deletion_protection_enabled": true,
+        "global_secondary_index": [
+          {
+            "hash_key": "KnownPK",
+            "name": "Known",
+            "non_key_attributes": [
+              "_t",
+              "_v",
+              "depotId",
+              "parcelId"
+            ],
+            "projection_type": "INCLUDE",
+            "range_key": "KnownSK"
+          }
+        ],
         "hash_key": "PK",
         "name": "${var.fixture_table_name}-g1",
         "point_in_time_recovery": {

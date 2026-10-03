@@ -280,13 +280,71 @@ type Template struct {
 	Fields []*Field
 }
 
-// Pred is an equality predicate on a field: equal to a constant Value, or, in a write's
-// `requires`, to the writing entity's Source field ("{memberId}").
+// Pred is a predicate on a field: equal to a constant Value, or, in a write's `requires`, to the
+// writing entity's Source field ("{memberId}"). With Not it holds when the field differs from
+// that value; with In, when the field equals one of several constants.
 type Pred struct {
 	Field  *Field
 	Value  any
 	Source *Field
+	// Not inverts the comparison with Value (or Source): `{ not: trash }`.
+	Not bool
+	// In lists the constants the field may equal: `{ in: [inbox, archived] }`. Value is unused.
+	In []any
 }
+
+// Pins reports whether the predicate fixes the field to one value: when it holds, the field's
+// value is known without reading the item.
+func (p *Pred) Pins() bool { return !p.Not && p.In == nil }
+
+// Matches reports whether a field holding the constant v satisfies the predicate. A predicate
+// that compares with another entity's field (Source) can't be judged, and reports false.
+func (p *Pred) Matches(v any) bool {
+	if p.Source != nil {
+		return false
+	}
+	if p.In != nil {
+		for _, x := range p.In {
+			if sameValue(x, v) {
+				return true
+			}
+		}
+		return false
+	}
+	return sameValue(p.Value, v) != p.Not
+}
+
+// Allowed returns the values of an enum or bool field that satisfy the predicate, as the schema
+// writes them ("trash", "true"), and whether they can be listed: a predicate on any other type,
+// or one comparing with another entity's field, admits values that can't be enumerated.
+func (p *Pred) Allowed() ([]string, bool) {
+	if p.Source != nil {
+		return nil, false
+	}
+	var domain []any
+	switch p.Field.Type {
+	case TypeEnum:
+		for _, v := range p.Field.Enum {
+			domain = append(domain, v)
+		}
+	case TypeBool:
+		domain = []any{false, true}
+	default:
+		if p.Pins() {
+			return []string{fmt.Sprint(p.Value)}, true
+		}
+		return nil, false
+	}
+	var out []string
+	for _, v := range domain {
+		if p.Matches(v) {
+			out = append(out, fmt.Sprint(v))
+		}
+	}
+	return out, true
+}
+
+func sameValue(a, b any) bool { return fmt.Sprint(a) == fmt.Sprint(b) }
 
 // Entity is a domain type stored as items in the table.
 type Entity struct {
@@ -315,6 +373,21 @@ type Entity struct {
 
 // Field returns the named field, or nil.
 func (e *Entity) Field(name string) *Field { return e.fieldsByName[name] }
+
+// Singleton reports whether a partition key value holds at most one item of the entity: its sort
+// key has no field the partition key doesn't.
+func (e *Entity) Singleton() bool {
+	in := map[*Field]bool{}
+	for _, f := range e.PK.Fields {
+		in[f] = true
+	}
+	for _, f := range e.SK.Fields {
+		if !in[f] {
+			return false
+		}
+	}
+	return true
+}
 
 // KeyFields returns the fields of the primary key in template order.
 func (e *Entity) KeyFields() []*Field {
@@ -410,8 +483,14 @@ type Index struct {
 	Projection string
 	Project    []*Field
 	Where      []*Pred
-	Doc        string
-	GSI        *GSI
+	// Set, if not nil, is the one string_set field in the index's keys: the entity has a copy for
+	// each of its elements.
+	Set *Field
+	// Matches is the declared share of the entity's items that satisfy Where (0 < share <= 1), or
+	// 0 when the schema doesn't say: the analysis then counts every item, as an upper bound.
+	Matches float64
+	Doc     string
+	GSI     *GSI
 	// StrategyInferred is true when the schema left strategy out and dynago chose it from the
 	// freshness its reads need; StrategyReason says why.
 	StrategyInferred bool
@@ -439,6 +518,111 @@ func (ix *Index) ProjectedFields() []*Field {
 	for _, f := range ix.Entity.Fields {
 		if set[f] {
 			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// Share is the fraction of the entity's items counted in the index: the declared Matches, or all
+// of them.
+func (ix *Index) Share() float64 {
+	if ix.Matches > 0 {
+		return ix.Matches
+	}
+	return 1
+}
+
+// Unsized reports whether the index holds only some of the entity's items (it has a where) and
+// nothing says how many: its sizes and traffic are then upper bounds.
+func (ix *Index) Unsized() bool { return len(ix.Where) > 0 && ix.Matches == 0 }
+
+// Membership says whether an item is in a sparse index.
+type Membership int
+
+// Memberships.
+const (
+	// Maybe: nothing the write says decides it.
+	Maybe Membership = iota
+	Yes
+	No
+)
+
+// Members reports whether the item a write touches satisfies the index's where before the write
+// and after it, as far as the write itself says: its `when` fixes values before, its `set` fixes
+// values after. A create has no item before, a delete none after.
+func (ix *Index) Members(w *Write) (before, after Membership) {
+	if len(ix.Where) == 0 {
+		before, after = Yes, Yes
+	} else {
+		var b, a []Membership
+		for _, p := range ix.Where {
+			was := Maybe
+			for _, q := range w.When {
+				if q.Field == p.Field {
+					was = implies(q, p)
+				}
+			}
+			is := was
+			for _, f := range append(append([]*Field{}, w.Args...), w.Patch...) {
+				if f == p.Field {
+					is = Maybe
+				}
+			}
+			for _, s := range w.Sets {
+				if s.Field != p.Field {
+					continue
+				}
+				switch {
+				case !s.Fixes():
+					is = Maybe
+				case p.Matches(s.Value):
+					is = Yes
+				default:
+					is = No
+				}
+			}
+			b, a = append(b, was), append(a, is)
+		}
+		before, after = all(b), all(a)
+	}
+	switch w.Kind {
+	case WriteCreate:
+		before = No
+	case WriteDelete:
+		after = No
+	}
+	return before, after
+}
+
+// implies reports whether a field satisfying q satisfies p.
+func implies(q, p *Pred) Membership {
+	vs, ok := q.Allowed()
+	if !ok || p.Source != nil {
+		return Maybe
+	}
+	n := 0
+	for _, v := range vs {
+		if p.Matches(v) {
+			n++
+		}
+	}
+	switch n {
+	case len(vs):
+		return Yes
+	case 0:
+		return No
+	}
+	return Maybe
+}
+
+func all(ms []Membership) Membership {
+	out := Yes
+	for _, m := range ms {
+		switch m {
+		case No:
+			return No
+		case Maybe:
+			out = Maybe
 		}
 	}
 	return out
@@ -480,10 +664,29 @@ type Counter struct {
 	Shards int
 	Values []*CounterValue
 	Doc    string
+	// Set, if not nil, is the one string_set field in the counter's keys: the entity counts
+	// towards one counter item for each of its elements.
+	Set *Field
 }
 
 // KeyFields returns the fields that address the counter item.
 func (c *Counter) KeyFields() []*Field { return mergeFields(c.PK.Fields, c.SK.Fields) }
+
+// ItemFields returns the key fields that tell one partition's counter items apart: those in the
+// sort key and not in the partition key. A counter without any has one item per partition.
+func (c *Counter) ItemFields() []*Field {
+	var out []*Field
+	for _, f := range c.SK.Fields {
+		in := false
+		for _, pf := range c.PK.Fields {
+			in = in || pf == f
+		}
+		if !in {
+			out = append(out, f)
+		}
+	}
+	return mergeFields(out)
+}
 
 // CounterValue is one attribute of a counter.
 type CounterValue struct {
@@ -533,13 +736,24 @@ const (
 
 // Access is a declared read.
 type Access struct {
-	Name       string
-	GoName     string
-	Entity     *Entity
-	Kind       AccessKind
-	Unique     *Unique
-	Index      *Index // nil for a query on the entity's own partition
-	Counter    *Counter
+	Name    string
+	GoName  string
+	Entity  *Entity
+	Kind    AccessKind
+	Unique  *Unique
+	Index   *Index // nil for a query on the entity's own partition
+	Counter *Counter
+	// Of, on a query of the entity's partition (query: partition), lists the entities whose items
+	// the read returns, each kind on its own: every one keys its items under the same partition
+	// key. nil for any other read.
+	Of    []*Entity
+	ofRaw []string
+	// Batch, on a get by key, makes the read take several keys in one BatchGetItem: the typical
+	// number of keys per call, which the estimates use. 0 for a read of one key.
+	Batch int
+	// All, on a counter read, returns every item of the counter in one partition (one per value
+	// of the sort key's own fields) with a Query, a page at a time.
+	All        bool
 	Desc       bool
 	Page       int
 	MaxPage    int
@@ -599,12 +813,20 @@ const (
 )
 
 // SetConst is a field set by a write to a constant Value, or, in a write's `requires`, to the
-// writing entity's Source field.
+// writing entity's Source field. A requirement can also add to the field (Add), or set it only
+// when the writer's field has a value (IfSet).
 type SetConst struct {
 	Field  *Field
 	Value  any
 	Source *Field
+	// Add adds the int Value (or Source) to the field instead of replacing it.
+	Add bool
+	// IfSet leaves the field as it is when Source holds its zero value.
+	IfSet bool
 }
+
+// Fixes reports whether the change gives the field a constant, known without reading anything.
+func (s SetConst) Fixes() bool { return s.Source == nil && !s.Add }
 
 // Write is a declared write.
 type Write struct {
@@ -632,7 +854,18 @@ type Write struct {
 	VersionRequired bool
 	// Limits are counter values with caller-supplied limits this write can increase.
 	Limits []*CounterValue
+	// Batch makes an update take several keys and apply the same change to each, several items
+	// to a transaction: the typical number of keys per call, which the estimates use. 0 for a
+	// write of one item.
+	Batch int
 }
+
+// MaxTxItems is DynamoDB's limit on the items of one transaction.
+const MaxTxItems = 100
+
+// BatchSize is how many items of a batch write go in one transaction, given the most items a
+// write of one of them touches.
+func BatchSize(perItem int) int { return max(1, MaxTxItems/max(1, perItem)) }
 
 // Require is a condition on another item, checked in the same transaction as the write: an
 // entity (Target), which the write may also change (Sets) or delete (Consume), or a counter
@@ -650,6 +883,10 @@ type Require struct {
 	// Optional lets the write go ahead when the target is absent or expired.
 	Optional bool
 	Consume  bool
+	// Ensure makes the write create the target when it is absent, with EnsureSets and then Sets
+	// applied to a new item; When and Sets apply to one that is there, as without it.
+	Ensure     bool
+	EnsureSets []SetConst
 	// Fast is true when the change to the target can be written without reading it first: its
 	// derived changes are known from its key and the state `when` pins. Otherwise it is read.
 	Fast    bool
@@ -657,7 +894,7 @@ type Require struct {
 }
 
 // Writes reports whether the requirement changes its target, rather than only checking it.
-func (rq *Require) Writes() bool { return len(rq.Sets) > 0 || rq.Consume }
+func (rq *Require) Writes() bool { return len(rq.Sets) > 0 || rq.Consume || rq.Ensure }
 
 // Sources returns the fields of the writing entity the requirement reads: its key and references.
 func (rq *Require) Sources() []*Field {
@@ -670,7 +907,7 @@ func (rq *Require) Sources() []*Field {
 			out = append(out, p.Source)
 		}
 	}
-	for _, s := range rq.Sets {
+	for _, s := range append(append([]SetConst{}, rq.Sets...), rq.EnsureSets...) {
 		if s.Source != nil {
 			out = append(out, s.Source)
 		}

@@ -108,14 +108,26 @@ func (g *gen) requirementFields(rq *schema.Require, recv string) string {
 	return b.String()
 }
 
-// condLit renders a dynago.Cond for a predicate on another entity's field, whose value is a
-// constant or a field of the writing entity read from recv.
+// condLit renders a dynago.Cond for a predicate on a field of te, whose value is a constant or a
+// field of the writing entity read from recv.
 func condLit(te *schema.Entity, p *schema.Pred, recv string) string {
-	if p.Source != nil {
-		x := recv + "." + p.Source.GoName
-		return fmt.Sprintf("{Attr: %q, Value: %s, Zero: %s}", p.Field.Attr, x, zeroCond(p.Source, x))
+	not := ""
+	if p.Not {
+		not = ", Not: true"
 	}
-	return fmt.Sprintf("{Attr: %q, Value: %s, Zero: %t}", p.Field.Attr, literal(te, p.Field, p.Value), isZeroValue(p.Value))
+	switch {
+	case p.Source != nil:
+		x := recv + "." + p.Source.GoName
+		return fmt.Sprintf("{Attr: %q, Value: %s, Zero: %s%s}", p.Field.Attr, x, zeroCond(p.Source, x), not)
+	case p.In != nil:
+		vals, zero := make([]string, len(p.In)), false
+		for i, v := range p.In {
+			vals[i] = literal(te, p.Field, v)
+			zero = zero || isZeroValue(v)
+		}
+		return fmt.Sprintf("{Attr: %q, In: []any{%s}, Zero: %t}", p.Field.Attr, strings.Join(vals, ", "), zero)
+	}
+	return fmt.Sprintf("{Attr: %q, Value: %s, Zero: %t%s}", p.Field.Attr, literal(te, p.Field, p.Value), isZeroValue(p.Value), not)
 }
 
 // sourceValue renders the value a requirement gives field tf of te: a constant, or the writing
@@ -183,16 +195,23 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		g.p("_ = read // the %s is always read: see above", te.Name)
 	} else {
 		g.p("if !read {")
-		if rq.Consume {
+		switch {
+		case rq.Consume:
 			g.p("req := dynago.Requirement{Key: key%s}", g.requirementFields(rq, "e"))
 			g.p("return []dynago.Op{dynago.DeleteOp(key, dynago.ConsumeRequirement(s.t, req), dynago.ErrNeedsRead)}, dynago.Change{}, nil")
-		} else {
+		case len(rq.Sets) == 0:
+			// ensure alone: one that is there is only checked.
+			g.p("req := dynago.Requirement{Key: key%s}", g.requirementFields(rq, "e"))
+			g.p("return []dynago.Op{dynago.CheckOp(key, dynago.CheckRequirement(s.t, req), dynago.ErrNeedsRead)}, dynago.Change{}, nil")
+		default:
 			known := []string{}
 			for _, f := range te.KeyFields() {
 				known = append(known, fmt.Sprintf("%s: k.%s", f.GoName, f.GoName))
 			}
 			for _, p := range rq.When {
-				known = append(known, fmt.Sprintf("%s: %s", p.Field.GoName, sourceValue(e, te, p.Field, p.Source, p.Value, "e")))
+				if p.Pins() {
+					known = append(known, fmt.Sprintf("%s: %s", p.Field.GoName, sourceValue(e, te, p.Field, p.Source, p.Value, "e")))
+				}
 			}
 			g.p("before := %s{%s}", te.GoName, strings.Join(known, ", "))
 			g.p("after := before.clone()")
@@ -211,29 +230,44 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		}
 		g.p("}")
 	}
-	g.p("it, err := (&%sStore{db: s.db, t: s.t}).load(ctx, key, true)", te.GoName)
+	if !rq.Consume && len(rq.Sets) == 0 && len(rq.When) == 0 {
+		// ensure alone, of anything that is there: only whether it is matters.
+		g.p("_, err = (&%sStore{db: s.db, t: s.t}).load(ctx, key, true)", te.GoName)
+	} else {
+		g.p("it, err := (&%sStore{db: s.db, t: s.t}).load(ctx, key, true)", te.GoName)
+	}
 	g.p("if err == Err%sNotFound {", te.GoName)
-	if rq.Optional {
+	switch {
+	case rq.Ensure:
+		g.ensureTarget(e, rq, limits)
+	case rq.Optional:
 		g.p("// Nothing to change, as long as one doesn't appear before the write commits.")
 		g.p("return []dynago.Op{dynago.CheckOp(key, dynago.CheckAbsent(s.t, key, %q), dynago.ErrStale)}, dynago.Change{}, nil", ttl)
-	} else {
+	default:
 		g.p("return nil, dynago.Change{}, %s", rq.ErrName)
 	}
 	g.p("}")
 	g.p("if err != nil {")
 	g.p("return nil, dynago.Change{}, err")
 	g.p("}")
-	if len(rq.When) > 0 || te.HasDerived() || !rq.Consume {
+	if len(rq.When) > 0 || len(rq.Sets) > 0 || (rq.Consume && te.HasDerived()) {
 		g.p("before := &it.%s", te.GoName)
 	}
 	if len(rq.When) > 0 {
-		var conds []string
-		for _, p := range rq.When {
-			conds = append(conds, fmt.Sprintf("before.%s == %s", p.Field.GoName, sourceValue(e, te, p.Field, p.Source, p.Value, "e")))
-		}
-		g.p("if %s {", negate(strings.Join(conds, " && ")))
+		g.p("if %s {", predsExpr(rq.When, true, func(p *schema.Pred) (string, func(any) string) {
+			return "before." + p.Field.GoName, func(v any) string { return sourceValue(e, te, p.Field, p.Source, v, "e") }
+		}))
 		g.p("return nil, dynago.Change{}, %s", rq.ErrName)
 		g.p("}")
+	}
+	if !rq.Consume && len(rq.Sets) == 0 {
+		// ensure alone: there is one, and nothing to change on it. It must still be there, as
+		// read, when the write commits.
+		g.p("req := dynago.Requirement{Key: key%s}", g.requirementFields(rq, "e"))
+		g.p("return []dynago.Op{dynago.CheckOp(key, dynago.CheckRequirement(s.t, req), dynago.ErrStale)}, dynago.Change{}, nil")
+		g.p("}")
+		g.p("")
+		return
 	}
 	guard := `.If("$ = ?", "_rev", it.Rev)`
 	ch := "dynago.Change{}"
@@ -244,12 +278,16 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		g.p("return []dynago.Op{dynago.DeleteOp(key, s.t.Delete(\"PK\", key.PK).Range(\"SK\", key.SK)%s, dynago.ErrStale)}, %s, nil", guard, ch)
 	} else {
 		g.p("after := before.clone()")
-		var changed []*schema.Field
+		var changed, checked []*schema.Field
 		for _, s := range rq.Sets {
-			g.p("after.%s = %s", s.Field.GoName, sourceValue(e, te, s.Field, s.Source, s.Value, "e"))
+			g.targetAssign(e, te, s)
 			changed = append(changed, s.Field)
+			if !s.IfSet {
+				// A patch either leaves the field as it was or gives it a value.
+				checked = append(checked, s.Field)
+			}
 		}
-		g.requiredChecks(te, changed, "after", "return nil, dynago.Change{}, err")
+		g.requiredChecks(te, checked, "after", "return nil, dynago.Change{}, err")
 		g.keyPartChecks(changed, func(f *schema.Field) string { return "after." + f.GoName }, "return nil, dynago.Change{}, err")
 		if te.HasDerived() {
 			ch = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(before, key%s), After: %sDerived(&after, key%s)}", tlo, limits, tlo, limits)
@@ -264,32 +302,121 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 	g.p("")
 }
 
-// targetSets emits after's changes and the matching sets list for a requirement's set.
+// ensureTarget emits the creation of a requirement's target that isn't there: a new item with the
+// key the requirement names, the fields `ensure` gives and the requirement's changes applied, and
+// everything derived from it, as a create of the entity writes.
+func (g *gen) ensureTarget(e *schema.Entity, rq *schema.Require, limits string) {
+	te := rq.Target
+	tlo := lowerFirst(te.GoName)
+	var kv []string
+	for _, f := range te.KeyFields() {
+		kv = append(kv, fmt.Sprintf("%s: k.%s", f.GoName, f.GoName))
+	}
+	g.p("// There is none: create it, unless one appears before the write commits.")
+	g.p("after := %s{%s}", te.GoName, strings.Join(kv, ", "))
+	for _, s := range rq.EnsureSets {
+		g.targetAssign(e, te, s)
+	}
+	for _, s := range rq.Sets {
+		g.targetAssign(e, te, s)
+	}
+	g.requiredChecks(te, te.Fields, "after", "return nil, dynago.Change{}, err")
+	g.p("if err := after.checkKeyParts(); err != nil {")
+	g.p("return nil, dynago.Change{}, err")
+	g.p("}")
+	g.p("rev, stamp := dynago.NewRev(), dynago.NewStamp()")
+	g.p("after.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}")
+	if te.TTL != nil {
+		g.p("put := s.t.Put(%sToItem(&after, key, rev, stamp, stamp)).If(\"attribute_not_exists($) OR $ <= ?\", \"PK\", %q, dynago.Now())", tlo, g.m.Table.TTLAttr)
+	} else {
+		g.p("put := s.t.Put(%sToItem(&after, key, rev, stamp, stamp)).If(\"attribute_not_exists($)\", \"PK\")", tlo)
+	}
+	ch := "dynago.Change{}"
+	if te.HasDerived() {
+		ch = fmt.Sprintf("dynago.Change{Owner: key, After: %sDerived(&after, key%s)}", tlo, limits)
+	}
+	g.p("return []dynago.Op{dynago.PutOp(key, put, dynago.ErrStale)}, %s, nil", ch)
+}
+
+// targetAssign emits one change of a requirement to after, the target's state: an assignment, an
+// addition, or (patch) an assignment made only when the writing entity's field has a value.
+func (g *gen) targetAssign(e, te *schema.Entity, s schema.SetConst) {
+	v := sourceValue(e, te, s.Field, s.Source, s.Value, "e")
+	switch {
+	case s.Add && s.Source == nil && s.Value == int64(1):
+		g.p("after.%s++", s.Field.GoName)
+	case s.Add && s.Source == nil && s.Value == int64(-1):
+		g.p("after.%s--", s.Field.GoName)
+	case s.Add:
+		g.p("after.%s += %s", s.Field.GoName, v)
+	case s.IfSet:
+		g.p("if %s {", nonZeroCond(s.Source, "e."+s.Source.GoName))
+		g.p("after.%s = %s", s.Field.GoName, v)
+		g.p("}")
+	default:
+		g.p("after.%s = %s", s.Field.GoName, v)
+	}
+}
+
+// nonZeroCond returns a Go condition true when val, of f's type, holds a value.
+func nonZeroCond(f *schema.Field, val string) string {
+	switch f.Type {
+	case schema.TypeString, schema.TypeEnum:
+		return val + ` != ""`
+	case schema.TypeInt, schema.TypeFloat:
+		return val + " != 0"
+	case schema.TypeBool:
+		return val
+	case schema.TypeTime:
+		return "!" + val + ".IsZero()"
+	}
+	return "len(" + val + ") > 0"
+}
+
+// targetSets emits after's changes and the matching sets list for a requirement's changes, for the
+// update made without reading the target: what it doesn't change it doesn't know.
 func (g *gen) targetSets(e *schema.Entity, rq *schema.Require) {
 	te := rq.Target
+	var changed, checked []*schema.Field
 	for _, s := range rq.Sets {
-		g.p("after.%s = %s", s.Field.GoName, sourceValue(e, te, s.Field, s.Source, s.Value, "e"))
-	}
-	var changed []*schema.Field
-	for _, s := range rq.Sets {
+		g.targetAssign(e, te, s)
 		changed = append(changed, s.Field)
+		if !s.IfSet && !s.Add {
+			// The value before an addition isn't known here, and a patch leaves a field alone or
+			// gives it a value: neither can be checked for emptiness.
+			checked = append(checked, s.Field)
+		}
 	}
-	g.requiredChecks(te, changed, "after", "return nil, dynago.Change{}, err")
+	g.requiredChecks(te, checked, "after", "return nil, dynago.Change{}, err")
 	g.keyPartChecks(changed, func(f *schema.Field) string { return "after." + f.GoName }, "return nil, dynago.Change{}, err")
+	ttlSet := func(s schema.SetConst) {
+		if s.Field == te.TTL {
+			x := "after." + s.Field.GoName
+			g.p("sets = append(sets, dynago.Set{Attr: %q, Value: dynago.UnixTTL(%s), Remove: %s.IsZero()})", g.m.Table.TTLAttr, x, x)
+		}
+	}
 	g.p("sets := []dynago.Set{")
 	for _, s := range rq.Sets {
-		if s.Source == nil {
+		switch {
+		case s.IfSet:
+		case s.Add:
+			g.p("{Attr: %q, Value: %s, Add: true},", s.Field.Attr, sourceValue(e, te, s.Field, s.Source, s.Value, "e"))
+		case s.Source == nil:
 			g.p("%s,", constSetLit(te, s.Field, s.Value))
-		} else {
+		default:
 			g.p("%s,", setLit(s.Field, "after."+s.Field.GoName))
 		}
 	}
 	g.p("}")
 	for _, s := range rq.Sets {
-		if s.Field == te.TTL {
-			x := "after." + s.Field.GoName
-			g.p("sets = append(sets, dynago.Set{Attr: %q, Value: dynago.UnixTTL(%s), Remove: %s.IsZero()})", g.m.Table.TTLAttr, x, x)
+		if s.IfSet {
+			g.p("if %s {", nonZeroCond(s.Source, "e."+s.Source.GoName))
+			g.p("sets = append(sets, dynago.Set%s)", setLit(s.Field, "after."+s.Field.GoName))
+			ttlSet(s)
+			g.p("}")
+			continue
 		}
+		ttlSet(s)
 	}
 }
 

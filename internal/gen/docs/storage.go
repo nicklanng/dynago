@@ -86,6 +86,9 @@ func (d *doc) otherKind(ix *schema.Index) string {
 		return ""
 	}
 	if !alt.Feasible {
+		if alt.Strategy == schema.StrategyGSI {
+			return "Can't be a GSI: " + alt.Why + "."
+		}
 		return "Can't be a copy: " + alt.Why + "."
 	}
 	var parts []string
@@ -203,7 +206,11 @@ func (d *doc) partitionTable() {
 	for _, p := range ps {
 		var holds []string
 		for _, mb := range p.Members {
-			holds = append(holds, mb.Label+": "+countText(mb.Count))
+			h := mb.Label + ": " + countText(mb.Count)
+			if mb.Bound && mb.Count.Known {
+				h += " at most (only those matching its `where`)"
+			}
+			holds = append(holds, h)
 		}
 		grows := "no"
 		if p.Grows {

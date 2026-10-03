@@ -60,7 +60,8 @@ func yamlToJSON(t *testing.T, src []byte) any {
 func TestExamplesMatchJSONSchema(t *testing.T) {
 	s := compileJSONSchema(t)
 	paths, _ := filepath.Glob("../../examples/*/*.dynago.yaml")
-	for _, p := range paths {
+	fixtures, _ := filepath.Glob("../e2e/*/*.dynago.yaml")
+	for _, p := range append(paths, fixtures...) {
 		src, err := os.ReadFile(p)
 		if err != nil {
 			t.Fatal(err)
@@ -74,14 +75,16 @@ func TestExamplesMatchJSONSchema(t *testing.T) {
 func TestJSONSchemaRejectsMistakes(t *testing.T) {
 	s := compileJSONSchema(t)
 	for name, extra := range map[string]string{
-		"typo":             "    acess: {}\n",
-		"bad type":         "      bad: widget\n",
-		"enum no values":   "      e: { type: enum }\n",
-		"sk no prefix":     "    counters:\n      C: { pk: \"C\", sk: \"{thingId}\", values: { n: count } }\n",
-		"two kinds":        "    writes:\n      W: { create: true, delete: true }\n",
-		"access no kind":   "    access:\n      A: { order: asc }\n",
-		"bad limit":        "    counters:\n      C: { pk: \"C\", sk: \"C\", values: { n: { count: true, limit: lots } } }\n",
-		"create versioned": "    writes:\n      W: { create: true, versioned: required }\n",
+		"typo":              "    acess: {}\n",
+		"bad type":          "      bad: widget\n",
+		"enum no values":    "      e: { type: enum }\n",
+		"sk no prefix":      "    counters:\n      C: { pk: \"C\", sk: \"{thingId}\", values: { n: count } }\n",
+		"two kinds":         "    writes:\n      W: { create: true, delete: true }\n",
+		"access no kind":    "    access:\n      A: { order: asc }\n",
+		"bad limit":         "    counters:\n      C: { pk: \"C\", sk: \"C\", values: { n: { count: true, limit: lots } } }\n",
+		"create versioned":  "    writes:\n      W: { create: true, versioned: required }\n",
+		"unknown condition": "    writes:\n      W: { update: [name], when: { name: { neq: x } } }\n",
+		"in with one value": "    writes:\n      W: { update: [name], when: { name: { in: [x] } } }\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			src := base
