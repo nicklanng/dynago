@@ -24,6 +24,10 @@ format, the generated code and the runtime API; the changelog says how to move.
   refused with `dynago.ErrInvalidKey` by every read and write, before any request is made. It used
   to come back as DynamoDB's `ValidationException`, which callers matching `ErrInvalidKey` for bad
   input didn't catch. Index key attributes are not checked yet.
+- `EnsureTable` looks before it changes anything (`DescribeTable`, `DescribeTimeToLive`), so calling
+  it at every start makes no failing request once the table exists. It used to send `CreateTable`
+  and `UpdateTimeToLive` every time and ignore their errors, and against DynamoDB Local each of
+  those errors made the AWS SDK log a warning.
 
 ## [0.1.0] - 2026-09-30
 
