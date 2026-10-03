@@ -59,6 +59,12 @@ format, the generated code and the runtime API; the changelog says how to move.
   yet: delete the lock file and generate again. The schema-changes guide and getting-started say
   when that is right.
 
+- A `string_set` field can declare `ref`: each element is that entity's key field. `volume.by` for
+  that entity then says how many items carry each element, which sizes the partitions of an index
+  or counter keyed by the set's elements; they were reported as unknown. Without `by`, the items
+  are spread evenly over the entity's items. A counter with sort key fields of its own is counted
+  too where the schema says how many items it has: one per enum value, or one per item of the
+  entity its key refers to.
 - Sets change by element: `AddLabel: { add_to: { labelIds: arg } }` and
   `RemoveLabel: { remove_from: { labelIds: arg } }` add and remove elements without replacing the
   set, so the caller no longer reads, edits and writes back under a version. Where nothing is

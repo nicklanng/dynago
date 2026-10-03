@@ -1005,7 +1005,7 @@ type Parcel struct {
 	Damages     int64  `dynamo:"damages,omitempty"`
 	Disputes    int64  `dynamo:"disputes,omitempty"`
 	LastDispute string `dynamo:"lastDispute,omitempty"`
-	// Handling tags. A parcel is listed, and counted, under each of them.
+	// Handling tags, each a Tag of the depot. A parcel is listed, and counted, under each of them.
 	Tags []string `dynamo:"tags,set,omitempty"`
 
 	loaded *parcelLoaded // set when the store returns the entity

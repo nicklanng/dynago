@@ -93,7 +93,7 @@ entities:
       damages: { type: int, doc: How many damage reports name the parcel. Listed with the parcels on site. }
       disputes: int
       lastDispute: string
-      tags: { type: string_set, size: 20/60, doc: "Handling tags. A parcel is listed, and counted, under each of them." }
+      tags: { type: string_set, ref: Tag, size: 20/60, doc: "Handling tags, each a Tag of the depot. A parcel is listed, and counted, under each of them." }
     key:
       pk: "D#{depotId}"
       sk: "PARCEL#{parcelId}"

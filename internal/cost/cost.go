@@ -547,6 +547,10 @@ func setElements(f *schema.Field) Count {
 	return Count{P50: n(f.SizeP50), P99: n(f.SizeP99), Spread: true}
 }
 
+// SetElements estimates how many elements a string set field holds, typically, from its declared
+// size.
+func SetElements(f *schema.Field) float64 { return float64(setElements(f).P50) }
+
 // derivedWrites records the index entries, copies, counters and claims a write of e changes. A
 // create or delete touches everything the entity has; an update only what its fields feed.
 func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner string, write writeFunc) {

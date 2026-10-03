@@ -38,6 +38,7 @@ erDiagram
   Depot ||--o{ Parcel : "contains"
   Depot ||--o{ Tag : "contains"
   Parcel ||--o{ Damage : "contains"
+  Tag }o--o{ Parcel : "referenced by"
 ```
 
 | Entity | Related to | How |
@@ -45,6 +46,7 @@ erDiagram
 | Parcel | Depot | Lives in (or under) its Depot's partition, and holds its Depot's key in `depotId`; Arrive, Leave require it. |
 | Tag | Depot | Lives in (or under) its Depot's partition, and holds its Depot's key in `depotId`. |
 | Damage | Parcel | Lives in (or under) its Parcel's partition, and holds its Parcel's key in `depotId`, `parcelId`; File, Dispute require it. |
+| Parcel | Tag | Holds its Tag's key in `depotId`, each element of `tags` (a Tag's `tag`); `tags` is declared `ref: Tag`. |
 
 ### Guarantees
 
@@ -123,7 +125,7 @@ Every read the code can make. A read that isn't listed has no method, so a new w
 | `Depot.Newest` | Damages, Parcels under one depotId, each kind on its own. | Query of the whole partition, keeping these kinds | eventual | pages of 50, a page at a time (volume not declared) | 2.5 / 5 | — |
 | `Parcel.Get` | One Parcel, by depotId and parcelId. | GetItem | eventual (not stated) | one | 0.5 | — |
 | `Parcel.GetSeveral` | Several Parcels, each by depotId and parcelId. | BatchGetItem (one per 100 keys) | immediate | the ones that exist: 10 keys a call typically | 10 | — |
-| `Parcel.States` | Every StateCounts count of a depotId: one for each state. | Query of counter StateCounts's items | immediate | pages of 50 counter items, a page at a time | 2 / 3 | — |
+| `Parcel.States` | Every StateCounts count of a depotId: one for each state. | Query of counter StateCounts's items | immediate | pages of 50 counter items, a page at a time | 1 | — |
 | `Parcel.Tagged` | Parcels with a given depotId and element of tags, by parcelId (ascending). | Query of copy ByTag | strong (not stated) | pages of 50, a page at a time (volume not declared) | 4 / 6 | — |
 | `Parcel.TagCount` | The TagCounts counts for a depotId and element of tags. | counter TagCounts (GetItem) | immediate | the counts | 1 | — |
 | `Parcel.Tags` | Every TagCounts count of a depotId: one for each element of tags. | Query of counter TagCounts's items | immediate | pages of 50 counter items, a page at a time | 3 | — |
@@ -207,7 +209,7 @@ flowchart LR
     p2m1["Parcel"]
     p2m2["counter DepotParcels"]
     p2m3["counter TagCounts"]
-    p2m4["counter StateCounts"]
+    p2m4["counter StateCounts ×5"]
     p2m5["Tag"]
     p2m6["Damage"]
     p2m7["counter ParcelDamages"]
@@ -255,13 +257,13 @@ Each row is every partition key value one key pattern renders: *Keys* is how man
 |---|---|---|---|---|---|---|---|
 | `T#{tenantId}` | base table | unknown | Account: unknown<br>counter TenantCounts: 1 | unknown / unknown | yes: Account never removed | no rates declared | — |
 | `R#{region}` | base table | unknown | counter RegionCounts: 1 | 136 B / 136 B | no | no rates declared | — |
-| `D#{depotId}` | base table | unknown | Depot: 1<br>Parcel: unknown<br>counter DepotParcels: 1<br>counter TagCounts: unknown<br>counter StateCounts: unknown<br>Tag: unknown<br>Damage: unknown<br>counter ParcelDamages: unknown | unknown / unknown | yes: Parcel, Damage never removed | no rates declared | — |
+| `D#{depotId}` | base table | unknown | Depot: 1<br>Parcel: unknown<br>counter DepotParcels: 1<br>counter TagCounts: unknown<br>counter StateCounts: 5<br>Tag: unknown<br>Damage: unknown<br>counter ParcelDamages: unknown | unknown / unknown | yes: Parcel, Damage never removed | no rates declared | — |
 | `DEPOTS` | base table | unknown | counter DepotTotals: 1 | 119 B / 119 B | no | no rates declared | — |
 | `D#{depotId}#ONSITE` | base table | unknown | Parcel OnSite copy: unknown | unknown / unknown | no | no rates declared | — |
 | `D#{depotId}#TAG#{tags\|lower}` | base table | unknown | Parcel ByTag copy: unknown | unknown / unknown | yes: Parcel never removed | no rates declared | — |
 | `KNOWN#{depotId}` | GSI Known | unknown | Parcel Known entry: unknown | unknown / unknown | no | no rates declared | — |
 
-Unknown counts: nothing declares how many items share a value of `tenantId` in `T#{tenantId}`, `region` in `R#{region}`, `tags` in `D#{depotId}#TAG#{tags\|lower}`. For a field that identifies another entity, name it (`ref:`, or a matching field name) and give the spread (`volume.by`).
+Unknown counts: nothing declares how many items share a value of `tenantId` in `T#{tenantId}`, `region` in `R#{region}`. For a field that identifies another entity, name it (`ref:`, or a matching field name) and give the spread (`volume.by`).
 
 ## Risks and costs
 
@@ -528,7 +530,7 @@ Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB
 | `damages` | int | `damages` | 8 / 11 B | How many damage reports name the parcel. Listed with the parcels on site. |
 | `disputes` | int | `disputes` | 8 / 11 B |  |
 | `lastDispute` | string | `lastDispute` | 20 / 64 B |  |
-| `tags` | string_set | `tags` | 20 / 60 B | Handling tags. A parcel is listed, and counted, under each of them. |
+| `tags` | string_set | `tags` | 20 / 60 B | holds a Tag's key; Handling tags, each a Tag of the depot. A parcel is listed, and counted, under each of them. |
 
 #### Stored items
 
@@ -567,7 +569,7 @@ Every item that exists because of a Parcel, and what keeps it up to date.
 |---|---|---|---|---|---|
 | `Get` | item by key | `PK = D#{depotId}`, `SK = PARCEL#{parcelId}` | eventual | GetItem | 0.5 |
 | `GetSeveral` | items by key, 10 a call typically | `PK = D#{depotId}`, `SK = PARCEL#{parcelId}` | strong | BatchGetItem (10 keys) | 10 |
-| `States` | every item of counter `StateCounts` in a partition, page 50 (max 100) | `PK = D#{depotId}`, `begins_with(SK, "STATE#")` | strong | Query | 2 / 3 |
+| `States` | every item of counter `StateCounts` in a partition, page 50 (max 100) | `PK = D#{depotId}`, `begins_with(SK, "STATE#")` | strong | Query | 1 |
 | `Tagged` | copies `ByTag`, page 50 (max 100) | `PK = D#{depotId}#TAG#{tags\|lower}`, `begins_with(SK, "TAGGED#")`, ascending | strong | Query | 4 / 6 |
 | `TagCount` | counter `TagCounts` | `PK = D#{depotId}`, `SK = TAG#{tags}` | strong | GetItem | 1 |
 | `Tags` | every item of counter `TagCounts` in a partition, page 50 (max 100) | `PK = D#{depotId}`, `begins_with(SK, "TAG#")` | strong | Query | 3 |
