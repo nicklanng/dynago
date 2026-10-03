@@ -20,6 +20,11 @@ format, the generated code and the runtime API; the changelog says how to move.
   regenerating, rename the uses of the affected names in your code; the compiler finds them.
   Stored attribute names don't change.
 
+- When a shape changes under the version the lock recorded, and the lock holds only a first design
+  (generation 1, every entity at version 1), the error also says what to do if no table exists
+  yet: delete the lock file and generate again. The schema-changes guide and getting-started say
+  when that is right.
+
 ### Fixed
 
 - A `volume.by` naming an entity further up the parent chain (a draft's spread `by: User`, where
