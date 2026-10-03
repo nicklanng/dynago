@@ -461,7 +461,11 @@ func WriteCostOf(m *schema.Model, e *schema.Entity, w *schema.Write, readFirst b
 		switch {
 		case rq.Counter != nil:
 			// A condition check on another item is billed as a transactional write of that item.
-			write(Target{Kind: TargetCounter, Entity: rq.Counter.Entity, Counter: rq.Counter}, true, false, "check counter "+rq.Counter.Name, CounterSize(rq.Counter), once)
+			label := "check counter " + rq.Counter.Name
+			if rq.Consume {
+				label = "delete counter " + rq.Counter.Name + "'s item"
+			}
+			write(Target{Kind: TargetCounter, Entity: rq.Counter.Entity, Counter: rq.Counter}, !rq.Consume, false, label, CounterSize(rq.Counter), once)
 		case rq.Writes():
 			ter := EntitySizes(m, rq.Target)
 			tw := rq.TargetWrite()

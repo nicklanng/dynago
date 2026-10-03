@@ -457,6 +457,17 @@ func CheckCounter(t dynamo.Table, key Key, values []Cond) *dynamo.ConditionCheck
 	return c
 }
 
+// ConsumeCounter builds the deletion of a counter item whose values meet the conditions: a counter
+// that has returned to zero, removed with the thing it counted for. A missing item passes.
+func ConsumeCounter(t dynamo.Table, key Key, values []Cond) *dynamo.Delete {
+	d := t.Delete(AttrPK, key.PK).Range(AttrSK, key.SK)
+	for _, v := range values {
+		expr, args := v.expr()
+		d.If(expr, args...)
+	}
+	return d
+}
+
 // ReadIfNeeded runs a write that also changes other items. It first builds the changes assuming
 // those items are in the state the schema requires, without reading them; if that assumption
 // fails (ErrNeedsRead), it runs again reading them, which reports precisely what was wrong.

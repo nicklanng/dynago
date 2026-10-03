@@ -221,7 +221,7 @@ func (s *ParcelStore) States(ctx context.Context, q ParcelStatesQuery, page dyna
 One Query of the counter's items under one partition key: `q` holds the counter's partition key
 fields, and each entry is one counter item with the key its sort key holds. Pages and cursors work
 as for queries. Only items something has counted exist, and one whose counts have all returned to
-zero is still there, reading zero.
+zero is still there, reading zero, until a write's `requires` deletes it with `consume`.
 
 ## Writes
 

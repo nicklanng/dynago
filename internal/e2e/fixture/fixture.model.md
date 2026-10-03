@@ -10,12 +10,12 @@ Table generation **1**: `fixture-g1`.
 
 | | |
 |---|---|
-| Entities | 4: Account, Depot, Parcel, Damage |
-| Reads | 19: 5 by key, 5 queries, 8 counters, 1 scan |
-| Writes | 17: 15 in a transaction, 8 reading the item first |
+| Entities | 5: Account, Depot, Parcel, Tag, Damage |
+| Reads | 20: 6 by key, 5 queries, 8 counters, 1 scan |
+| Writes | 20: 17 in a transaction, 9 reading the item first |
 | Indexes | 1 GSI, 2 copy indexes (Known, Parcel.OnSite, Parcel.ByTag) |
 | Uniqueness claims, counters | 0, 7 |
-| Workload | No peak factor declared (peaks taken as the averages); volumes declared for 0 of 4 entities |
+| Workload | No peak factor declared (peaks taken as the averages); volumes declared for 0 of 5 entities |
 | Cost | $0.00/month at the declared volumes and rates |
 | Findings | 0 errors, 0 warnings, 1 note open; 0 accepted |
 
@@ -28,6 +28,7 @@ Table generation **1**: `fixture-g1`.
 | [Account](#account) |  | `tenantId`, `accountId` | not declared | — |
 | [Depot](#depot) |  | `depotId` | not declared | — |
 | [Parcel](#parcel) |  | `depotId`, `parcelId` | not declared | — |
+| [Tag](#tag) |  | `depotId`, `tag` | not declared | — |
 | [Damage](#damage) |  | `depotId`, `parcelId`, `damageId` | not declared | — |
 
 ### Relationships
@@ -35,12 +36,14 @@ Table generation **1**: `fixture-g1`.
 ```mermaid
 erDiagram
   Depot ||--o{ Parcel : "contains"
+  Depot ||--o{ Tag : "contains"
   Parcel ||--o{ Damage : "contains"
 ```
 
 | Entity | Related to | How |
 |---|---|---|
 | Parcel | Depot | Lives in (or under) its Depot's partition, and holds its Depot's key in `depotId`; Arrive, Leave require it. |
+| Tag | Depot | Lives in (or under) its Depot's partition, and holds its Depot's key in `depotId`. |
 | Damage | Parcel | Lives in (or under) its Parcel's partition, and holds its Parcel's key in `depotId`, `parcelId`; File, Dispute require it. |
 
 ### Guarantees
@@ -52,6 +55,9 @@ What the generated code enforces on every write, so no bug or race elsewhere can
 - **Parcel**
   - Arrive requires any Depot there is to have closed = false, and creates the Depot if there is none (with name "unnamed"), and adds 1 to its parcels, in one transaction. *(Parcel.Arrive)*
   - Leave creates the Depot if there is none, in one transaction. *(Parcel.Leave)*
+- **Tag**
+  - Describe requires counter TagCounts to have onSite = 0 (a missing value counts as 0), in one transaction. *(Tag.Describe)*
+  - Retire requires counter TagCounts to have parcels = 0 and onSite = 0 (a missing value counts as 0), and deletes the counter item, in one transaction. *(Tag.Retire)*
 - **Damage**
   - File requires the Parcel to exist with state in ["received", "shelved", "returned"], and sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages, in one transaction. *(Damage.File)*
   - Dispute requires the Parcel to exist with state != "lost", and sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes, in one transaction. *(Damage.Dispute)*
@@ -124,6 +130,7 @@ Every read the code can make. A read that isn't listed has no method, so a new w
 | `Parcel.OnSite` | Parcels with a given depotId, by parcelId (ascending). | Query of copy OnSite | immediate | pages of 50, a page at a time (volume not declared) | 3 / 5 | — |
 | `Parcel.Known` | Parcels with a given depotId, by parcelId (ascending). | Query of GSI Known | eventual (not stated) | pages of 50, a page at a time (volume not declared) | 1.5 / 3 | — |
 | `Parcel.Counts` | The DepotParcels counts for a depotId. | counter DepotParcels (GetItem) | eventual (not stated) | the counts | 0.5 | — |
+| `Tag.Get` | One Tag, by depotId and tag. | GetItem | eventual (not stated) | one | 0.5 | — |
 | `Damage.Get` | One Damage, by depotId, parcelId and damageId. | GetItem | eventual (not stated) | one | 0.5 | — |
 | `Damage.Damaged` | Every ParcelDamages count of a depotId: one for each parcelId. | Query of counter ParcelDamages's items | immediate | pages of 2 counter items, a page at a time | 1 | — |
 
@@ -150,6 +157,9 @@ Every write the code can make, and everything each changes. Each is atomic: all 
 | `Parcel.Retag` | Sets `tags` | the Parcel exists | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes | transaction, 13 items | 10 / 26 | — |
 | `Parcel.ShelveSeveral` | For each of several Parcels (20 a call): sets `state` = "shelved" | the Parcel exists; state = "received" | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts (moved: two counter items) | yes, together | each transaction, not the batch: up to 9 Parcels to one | 280 / 440 | — |
 | `Parcel.AnnotateSeveral` | For each of several Parcels (10 a call): sets `note` | the Parcel exists | Parcel | yes, together | each transaction, not the batch: up to 100 Parcels to one | 20 | — |
+| `Tag.Define` | Creates a Tag | no Tag at the key | Tag | no | single item | 1 | — |
+| `Tag.Describe` | Sets `about` | the Tag exists; counter TagCounts has onSite = 0 | Tag<br>check counter TagCounts | no (read-free) | transaction, 2 items | 4 | — |
+| `Tag.Retire` | Deletes a Tag, deletes the counter item | the Tag exists; counter TagCounts has parcels = 0 and onSite = 0 | Tag<br>delete counter TagCounts's item | yes | transaction, 2 items | 4 | — |
 | `Damage.File` | Creates a Damage, sets the Parcel's fragile to Damage.fragile (if that has a value), and adds 1 to its damages | no Damage at the key; the Parcel exists with state in ["received", "shelved", "returned"] | Damage<br>counter ParcelDamages<br>Parcel (sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages)<br>Parcel's copy OnSite | no | transaction, 4 items | 8 | — |
 | `Damage.Dispute` | Sets `detail`, sets the Parcel's note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes | the Damage exists; the Parcel exists with state != "lost" | Damage<br>Parcel (sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes) | no (read-free) | transaction, 2 items | 4 | — |
 
@@ -192,8 +202,9 @@ flowchart LR
     p2m2["counter DepotParcels"]
     p2m3["counter TagCounts"]
     p2m4["counter StateCounts"]
-    p2m5["Damage"]
-    p2m6["counter ParcelDamages"]
+    p2m5["Tag"]
+    p2m6["Damage"]
+    p2m7["counter ParcelDamages"]
   end
   subgraph p3["DEPOTS"]
     p3m0["counter DepotTotals"]
@@ -223,6 +234,7 @@ flowchart LR
   r_Parcel_OnSite{{"Parcel.OnSite"}} --> p4
   r_Parcel_Known{{"Parcel.Known"}} --> p6
   r_Parcel_Counts{{"Parcel.Counts"}} --> p2
+  r_Tag_Get{{"Tag.Get"}} --> p2
   r_Damage_Get{{"Damage.Get"}} --> p2
   r_Damage_Damaged{{"Damage.Damaged"}} --> p2
 ```
@@ -237,7 +249,7 @@ Each row is every partition key value one key pattern renders: *Keys* is how man
 |---|---|---|---|---|---|---|---|
 | `T#{tenantId}` | base table | unknown | Account: unknown<br>counter TenantCounts: 1 | unknown / unknown | yes: Account never removed | no rates declared | — |
 | `R#{region}` | base table | unknown | counter RegionCounts: 1 | 136 B / 136 B | no | no rates declared | — |
-| `D#{depotId}` | base table | unknown | Depot: 1<br>Parcel: unknown<br>counter DepotParcels: 1<br>counter TagCounts: unknown<br>counter StateCounts: unknown<br>Damage: unknown<br>counter ParcelDamages: unknown | unknown / unknown | yes: Parcel, Damage never removed | no rates declared | — |
+| `D#{depotId}` | base table | unknown | Depot: 1<br>Parcel: unknown<br>counter DepotParcels: 1<br>counter TagCounts: unknown<br>counter StateCounts: unknown<br>Tag: unknown<br>Damage: unknown<br>counter ParcelDamages: unknown | unknown / unknown | yes: Parcel, Damage never removed | no rates declared | — |
 | `DEPOTS` | base table | unknown | counter DepotTotals: 1 | 119 B / 119 B | no | no rates declared | — |
 | `D#{depotId}#ONSITE` | base table | unknown | Parcel OnSite copy: unknown | unknown / unknown | no | no rates declared | — |
 | `D#{depotId}#TAG#{tags\|lower}` | base table | unknown | Parcel ByTag copy: unknown | unknown / unknown | yes: Parcel never removed | no rates declared | — |
@@ -258,6 +270,7 @@ Unknown counts: nothing declares how many items share a value of `tenantId` in `
 | Account | not declared | 277 B / 543 B | 0.00 GB | $0.00 | $0.00 |
 | Depot | not declared | 198 B / 335 B | 0.00 GB | $0.00 | $0.00 |
 | Parcel | not declared | 396 B / 796 B | 0.00 GB | $0.00 | $0.00 |
+| Tag | not declared | 220 B / 442 B | 0.00 GB | $0.00 | $0.00 |
 | Damage | not declared | 286 B / 596 B | 0.00 GB | $0.00 | $0.00 |
 
 Estimated total: **$0.00/month** for the declared volumes and rates.
@@ -555,6 +568,59 @@ Every item that exists because of a Parcel, and what keeps it up to date.
 | `Retag` | set `tags` | Parcel<br>copy ByTag (added and dropped tags elements)<br>counter TagCounts (added and dropped tags elements) | yes (1 consistent read; none with `dynago.From`) | transaction (13 items) | optional | 10 / 26 | `ErrParcelNotFound`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 | `ShelveSeveral` | of each of several items: set `state` = "shelved" when `state = "received"` | Parcel<br>copy OnSite<br>copy ByTag (one per tags element)<br>counter DepotParcels<br>counter TagCounts (one item per tags element)<br>counter StateCounts (moved: two counter items) | yes (one consistent BatchGetItem per transaction) | each transaction, not the batch: up to 9 Parcels to one | — | 280 / 440 for 20 Parcels | `*dynago.BatchError`, holding for each item not written:<br>`ErrParcelNotFound`<br>`ErrParcelShelveSeveralPrecondition`<br>`dynago.ErrConflict` (after retries) |
 | `AnnotateSeveral` | of each of several items: set `note` | Parcel | yes (one consistent BatchGetItem per transaction) | each transaction, not the batch: up to 100 Parcels to one | — | 20 for 10 Parcels | `*dynago.BatchError`, holding for each item not written:<br>`ErrParcelNotFound`<br>`dynago.ErrConflict` (after retries) |
+
+### Tag
+
+Schema version **1**. Go type `Tag`, store `Store.Tags`.
+
+```mermaid
+flowchart LR
+  item_Tag["Tag item<br/>D#35;{depotId}<br/>TAGDEF#35;{tag}"]
+  w_Define(["Define"])
+  w_Define --> item_Tag
+  w_Describe(["Describe"])
+  w_Describe --> item_Tag
+  other_TagCounts["counter TagCounts"]
+  w_Describe -. checks .-> other_TagCounts
+  w_Retire(["Retire"])
+  w_Retire --> item_Tag
+  other_TagCounts["counter TagCounts"]
+  w_Retire -. checks and deletes .-> other_TagCounts
+  r_Get{{"Get"}}
+  item_Tag --> r_Get
+```
+
+Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB; solid arrows are written by the generated code.
+
+#### Fields
+
+| Field | Type | Attribute | Size p50/p99 | Notes |
+|---|---|---|---|---|
+| `depotId` | string | `depotId` | 20 / 64 B | key |
+| `tag` | string | `tag` | 20 / 64 B | key |
+| `about` | string | `about` | 20 / 64 B |  |
+
+#### Stored items
+
+Every item that exists because of a Tag, and what keeps it up to date.
+
+| Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
+|---|---|---|---|---|---|
+| **Tag** | `D#{depotId}` | `TAGDEF#{tag}` | `D#{depotId}`<br>`TAGDEF#{tag}` | 220 B / 442 B | the writes below |
+
+#### Access patterns
+
+| Method | Reads | Key condition | Consistency | Requests | RRU per call p50/p99 |
+|---|---|---|---|---|---|
+| `Get` | item by key | `PK = D#{depotId}`, `SK = TAGDEF#{tag}` | eventual | GetItem | 0.5 |
+
+#### Writes
+
+| Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
+|---|---|---|---|---|---|---|---|
+| `Define` | create (fails if it exists) | Tag | no | single item | — | 1 | `ErrTagExists` |
+| `Describe` | set `about`; requires counter TagCounts to have onSite = 0 (a missing value counts as 0) | Tag<br>check counter TagCounts | no: read-free (reads only if the item is not in the assumed state) | transaction (2 items) | optional | 4 | `ErrTagNotFound`<br>`ErrTagDescribeRequiresTagCounts`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `Retire` | delete (fails if absent); requires counter TagCounts to have parcels = 0 and onSite = 0 (a missing value counts as 0) and deletes the counter item | Tag<br>delete counter TagCounts's item | yes (1 consistent read; none with `dynago.From`) | transaction (2 items) | optional | 4 | `ErrTagNotFound`<br>`ErrTagRetireRequiresTagCounts`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 
 ### Damage
 

@@ -369,7 +369,12 @@ LabelCounts:
 A thread with three labels adds to three items, in the write's transaction; changing the set moves
 its contribution from the labels dropped to the labels added. The counter's key type holds one
 element (`LabelCountsKey.LabelIDsElem`), and `{ counter: LabelCounts, all: true }` reads every
-label's item in one Query. A `requires` can't check such a counter.
+label's item in one Query. A `requires` on such a counter names one element in its key, from a
+string field of the writing entity (`labelIds: labelId`).
+
+Counter items aren't removed when their values return to zero: a label nothing is filed under
+still has its item, reading zero, and `all: true` returns it. To remove one, `consume` it from
+the write that removes what it was counting for (see [Requires](#requires)).
 
 ## Access
 
@@ -505,7 +510,7 @@ write, and no crash can leave the write half done.
 | `patch` | Entities only. Sets fields of the target from this entity's fields, each only when that field has a value: `patch: { hasAttachments: "{hasAttachments}" }` marks the thread when a message with attachments arrives, and leaves the mark alone when one without arrives. Use `set` to assign whatever the field holds, empty or not. |
 | `ensure` | Entities only. Creates the target when it is absent (or expired), in the same transaction: `ensure: { subject: "{subject}" }`, or `ensure: {}`. The new item has its key from `key`, the fields `ensure` gives (constants or `"{field}"`), then `set`, `add` and `patch` applied, and its counters, claims, copies and index keys are written as a create of it writes them. A target that is there is checked against `when` and changed as without `ensure`; `when` says nothing about one the write creates. Every `required` field of the target must be given by `ensure` or `set`. Exclusive with `optional` and `consume`. See [a parent and its first child](#a-parent-and-its-first-child). |
 | `optional` | Entities only. The write goes ahead if the target is absent or has expired; `when` applies only to one that is there. |
-| `consume` | Entities only. Deletes the target in the same transaction, releasing what it contributed. Exclusive with `set`, `add` and `patch`. |
+| `consume` | Deletes the target in the same transaction. For an entity, it releases what the item contributed; exclusive with `set`, `add` and `patch`. For a counter, it deletes the counter item, which must read zero for **every** value (whether or not `when` names it): `Label.Remove` with `requires: { LabelCounts: { key: { userId: userId, labelIds: labelId }, consume: true } }` is refused while a thread carries the label, and takes the label's counter item with it. A counter item that was never written passes. |
 
 The write fails with `Err<Entity><Write>Requires<Target>`, and writes nothing, unless the target
 meets the requirement: it exists (unless `optional`), has not expired, and meets `when`.

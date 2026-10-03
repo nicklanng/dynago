@@ -168,6 +168,30 @@ entities:
       ShelveSeveral: { set: { state: shelved }, when: { state: received }, batch: 20 }
       AnnotateSeveral: { update: [note], batch: 10 }
 
+  # A tag a depot defines for its parcels. Retiring one needs no parcel to carry it, and takes its
+  # counter item with it: a counter keyed by a set's elements is required by naming one element,
+  # and consume deletes an item that reads zero.
+  Tag:
+    fields:
+      depotId: string
+      tag: string
+      about: string
+    key:
+      pk: "D#{depotId}"
+      sk: "TAGDEF#{tag}"
+    access:
+      Get: get
+    writes:
+      Define: create
+      Describe:
+        update: [about]
+        requires:
+          TagCounts: { key: { depotId: depotId, tags: tag }, when: { onSite: 0 } }
+      Retire:
+        delete: true
+        requires:
+          TagCounts: { key: { depotId: depotId, tags: tag }, consume: true }
+
   # A damage report can only be filed against a parcel that is still on site. Filing one counts on
   # the parcel (add) and marks it fragile if the report says so (patch), leaving the mark alone
   # otherwise. The count is listed in the OnSite copy, so the parcel is read first; a dispute

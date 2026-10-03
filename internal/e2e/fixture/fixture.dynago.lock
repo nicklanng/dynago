@@ -358,6 +358,36 @@
           }
         }
       ]
+    },
+    "Tag": {
+      "versions": [
+        {
+          "version": 1,
+          "generation": 1,
+          "fingerprint": "ee8f2362d5138b54",
+          "shape": {
+            "fields": [
+              {
+                "name": "depotId",
+                "attr": "depotId",
+                "type": "string"
+              },
+              {
+                "name": "tag",
+                "attr": "tag",
+                "type": "string"
+              },
+              {
+                "name": "about",
+                "attr": "about",
+                "type": "string"
+              }
+            ],
+            "pk": "D#{depotId}",
+            "sk": "TAGDEF#{tag}"
+          }
+        }
+      ]
     }
   }
 }

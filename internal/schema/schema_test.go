@@ -199,7 +199,9 @@ func TestValidationErrors(t *testing.T) {
 		{"index keyed by two sets", "      more: string_set\n    indexes:\n      ByTag: { pk: \"TAG#{tags}#{more}\", sk: \"T#{tenantId}#{thingId}\", project: keys }\n", "are both sets"},
 		{"counter keyed by two sets", "      more: string_set\n    counters:\n      C: { pk: \"C#{tags}\", sk: \"C#{more}\", values: { n: count } }\n", "are both sets"},
 		{"range over a set", "    indexes:\n      ByTag: { pk: \"TAG#{tenantId}\", sk: \"T#{tags}#{tenantId}#{thingId}\", project: keys }\n    access:\n      L: { query: ByTag, range: tags }\n", "a range bounds a single value"},
-		{"requires a set-keyed counter", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{tags}\", values: { n: count } }\n    writes:\n      W: { update: [name], requires: { C: { key: { tenantId: tenantId, tags: name }, when: { n: 0 } } } }\n", "requiring one of them isn't supported"},
+		{"requires a set-keyed counter by a whole set", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{tags}\", values: { n: count } }\n    writes:\n      W: { update: [name], requires: { C: { key: { tenantId: tenantId, tags: tags }, when: { n: 0 } } } }\n", "the key takes one element: a string field of Thing, and tags is a string_set"},
+		{"consume a counter that isn't zero", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{tags}\", values: { n: count, m: count } }\n    writes:\n      W: { update: [name], requires: { C: { key: { tenantId: tenantId, tags: name }, when: { n: 1 }, consume: true } } }\n", "n can't be required to be 1"},
+		{"optional counter", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{tags}\", values: { n: count } }\n    writes:\n      W: { update: [name], requires: { C: { key: { tenantId: tenantId, tags: name }, when: { n: 0 }, optional: true } } }\n", "its item deleted with consume once it reads zero"},
 		{"set in the primary key", "  Other:\n    fields: { tenantId: string, tags: string_set }\n    key: { pk: \"O#{tenantId}\", sk: \"OTHER#{tags}\" }\n", "cannot be part of a key"},
 		{"batch create", "    writes:\n      W: { create: true, batch: 10 }\n", "batch applies to updates"},
 		{"batch without a number", "    writes:\n      W: { update: [name], batch: true }\n", "the typical number of items a call changes"},
@@ -319,6 +321,32 @@ func TestKeysPerSetElement(t *testing.T) {
 	// The set keys copies and counters; the name is in every copy; the time feeds nothing.
 	if !reads["Retag"] || !reads["Rename"] || reads["Touch"] {
 		t.Errorf("writes that read first: %v", reads)
+	}
+}
+
+// A requirement on a counter keyed by a set's elements names one element, and consume deletes the
+// counter item once every value it holds reads zero, whether or not when names it.
+func TestRequireAndConsumeACounter(t *testing.T) {
+	m, err := Parse([]byte(base + `    counters:
+      TagCounts: { pk: "T#{tenantId}", sk: "TAGS#{tags}", values: { things: count, named: { count: true, where: { status: a } } } }
+  Tag:
+    fields:
+      tenantId: string
+      tag: string
+    key: { pk: "T#{tenantId}", sk: "TAGDEF#{tag}" }
+    writes:
+      Define: create
+      Retire: { delete: true, requires: { TagCounts: { key: { tenantId: tenantId, tags: tag }, when: { things: 0 }, consume: true } } }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rq := m.Entity("Tag").Writes[1].Requires[0]
+	if rq.Counter == nil || !rq.Consume || rq.Writes() || len(rq.CounterWhen) != 2 {
+		t.Fatalf("requirement: %+v", rq)
+	}
+	if got := rq.Condition("Tag") + ", and " + rq.Effect("Tag"); got != "counter TagCounts to have things = 0 and named = 0 (a missing value counts as 0), and deletes the counter item" {
+		t.Errorf("the requirement reads %q", got)
 	}
 }
 

@@ -35,6 +35,7 @@ type Store struct {
 	Accounts *AccountStore
 	Depots   *DepotStore
 	Parcels  *ParcelStore
+	Tags     *TagStore
 	Damages  *DamageStore
 }
 
@@ -45,6 +46,7 @@ func New(db *dynamo.DB, tableName string) *Store {
 		Accounts: &AccountStore{db: db, t: t},
 		Depots:   &DepotStore{db: db, t: t},
 		Parcels:  &ParcelStore{db: db, t: t},
+		Tags:     &TagStore{db: db, t: t},
 		Damages:  &DamageStore{db: db, t: t},
 	}
 }
@@ -2024,6 +2026,348 @@ func (s *ParcelStore) requireLeaveDepot(ctx context.Context, e *Parcel, read boo
 	}
 	req := dynago.Requirement{Key: key}
 	return []dynago.Op{dynago.CheckOp(key, dynago.CheckRequirement(s.t, req), dynago.ErrStale)}, dynago.Change{}, nil
+}
+
+// ---- Tag ----
+
+// Tag is stored in the fixture table.
+type Tag struct {
+	DepotID string `dynamo:"depotId"`
+	Tag     string `dynamo:"tag"`
+	About   string `dynamo:"about,omitempty"`
+
+	loaded *tagLoaded // set when the store returns the entity
+	stamps dynago.Timestamps
+}
+
+// tagLoaded remembers the stored state an entity was read at, so a write passed the entity
+// with dynago.From can start from it without reading again.
+type tagLoaded struct {
+	rev      int64
+	v        int
+	snapshot Tag
+	raw      dynamo.Item // as stored, including attributes this code doesn't know
+}
+
+// Version identifies the stored state e was read at, for optimistic concurrency: pass it back
+// with dynago.IfVersion (e.g. from an ETag) to make a write fail if anything changed since.
+// It is "" for an entity that was not read from the store.
+func (e *Tag) Version() string {
+	if e.loaded == nil {
+		return ""
+	}
+	return dynago.FormatVersion(e.loaded.rev)
+}
+
+// Timestamps says when the stored item was first written and last changed, by the writing
+// server's clock. It is zero for an entity the store didn't return or create, and a time is
+// zero if the item was written before dynago kept it.
+func (e *Tag) Timestamps() dynago.Timestamps { return e.stamps }
+
+// clone copies e, including its slices and maps, without its loaded state.
+func (e *Tag) clone() Tag {
+	c := *e
+	c.loaded = nil
+	return c
+}
+
+// checkKeyParts rejects values containing a character their key templates use as a separator.
+func (e *Tag) checkKeyParts() error {
+	if err := dynago.CheckKeyPart("depotId", e.DepotID, "#"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// TagKey identifies a Tag.
+type TagKey struct {
+	DepotID string
+	Tag     string
+}
+
+// Key returns the primary key of e.
+func (e *Tag) Key() TagKey {
+	return TagKey{DepotID: e.DepotID, Tag: e.Tag}
+}
+
+func (k TagKey) dynamoKey() (dynago.Key, error) {
+	if k.DepotID == "" || k.Tag == "" {
+		return dynago.Key{}, fmt.Errorf("%w: Tag needs depotId and tag", dynago.ErrInvalidKey)
+	}
+	if err := dynago.CheckKeyPart("depotId", k.DepotID, "#"); err != nil {
+		return dynago.Key{}, err
+	}
+	return dynago.Key{PK: "D#" + k.DepotID, SK: "TAGDEF#" + k.Tag}, nil
+}
+
+// Errors returned by TagStore. Each wraps the matching dynago sentinel.
+var (
+	ErrTagNotFound                  = fmt.Errorf("%w: Tag", dynago.ErrNotFound)
+	ErrTagExists                    = fmt.Errorf("%w: Tag", dynago.ErrExists)
+	ErrTagDescribeRequiresTagCounts = fmt.Errorf("%w: Tag.Describe requires counter TagCounts to have onSite = 0 (a missing value counts as 0)", dynago.ErrPrecondition)
+	ErrTagRetireRequiresTagCounts   = fmt.Errorf("%w: Tag.Retire requires counter TagCounts to have parcels = 0 and onSite = 0 (a missing value counts as 0)", dynago.ErrPrecondition)
+)
+
+const tagVersion = 1
+
+type tagItem struct {
+	Tag
+	PK            string `dynamo:"PK"`
+	SK            string `dynamo:"SK"`
+	T             string `dynamo:"_t"`
+	V             int    `dynamo:"_v"`
+	Rev           int64  `dynamo:"_rev"`
+	DynagoCreated string `dynamo:"_created,omitempty"`
+	DynagoUpdated string `dynamo:"_updated,omitempty"`
+
+	raw dynamo.Item // as read, for writes to keep attributes this code doesn't know
+}
+
+// tagKnown is every attribute this code writes on Tag items.
+var tagKnown = map[string]bool{"PK": true, "SK": true, "_t": true, "_v": true, "_rev": true, "_created": true, "_updated": true, "depotId": true, "tag": true, "about": true}
+
+// tagToItem is e as stored, created and last updated at the given times (TimeLayout, or "" if
+// unknown).
+func tagToItem(e *Tag, key dynago.Key, rev int64, created, updated string) *tagItem {
+	it := &tagItem{Tag: *e, PK: key.PK, SK: key.SK, T: "Tag", V: tagVersion, Rev: rev, DynagoCreated: created, DynagoUpdated: updated}
+	return it
+}
+
+// TagStore reads and writes Tag items. Only the access patterns declared in the schema
+// exist as methods.
+type TagStore struct {
+	db *dynamo.DB
+	t  dynamo.Table
+}
+
+func (s *TagStore) load(ctx context.Context, key dynago.Key, consistent bool) (*tagItem, error) {
+	var raw dynamo.Item
+	found, err := dynago.GetOne(ctx, s.t, key, consistent, &raw)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrTagNotFound
+	}
+	return tagDecode(raw)
+}
+
+// tagDecode decodes a stored item, remembering its state for writes passed dynago.From.
+func tagDecode(raw dynamo.Item) (*tagItem, error) {
+	var it tagItem
+	if err := dynamo.UnmarshalItem(raw, &it); err != nil {
+		return nil, err
+	}
+	it.raw = raw
+	it.stamps = dynago.Timestamps{Created: dynago.ParseStamp(it.DynagoCreated), Updated: dynago.ParseStamp(it.DynagoUpdated)}
+	it.loaded = &tagLoaded{rev: it.Rev, v: it.V, snapshot: it.clone(), raw: raw}
+	return &it, nil
+}
+
+func tagDecodeAll(raws []dynamo.Item) ([]Tag, error) {
+	out := make([]Tag, 0, len(raws))
+	for _, raw := range raws {
+		it, err := tagDecode(raw)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, it.Tag)
+	}
+	return out, nil
+}
+
+// from returns the entity passed with dynago.From, checked to be this item and read from the
+// store, or nil if none was passed.
+func (s *TagStore) from(key dynago.Key, o dynago.WriteOptions) (*Tag, error) {
+	if o.From == nil {
+		return nil, nil
+	}
+	from, ok := o.From.(*Tag)
+	if !ok || from == nil || from.loaded == nil {
+		return nil, fmt.Errorf("%w: dynago.From needs a *Tag read from its own item, not built by hand or read through a copy index", dynago.ErrVersionRequired)
+	}
+	if fk, err := from.Key().dynamoKey(); err != nil || fk != key {
+		return nil, fmt.Errorf("%w: the Tag passed with dynago.From is a different item", dynago.ErrInvalidKey)
+	}
+	return from, nil
+}
+
+// start returns the state a read-modify-write starts from: the entity passed with dynago.From
+// (no read), or a consistent read. versioned reports whether the caller named a version, in
+// which case a concurrent change is a mismatch for the caller rather than something to retry.
+func (s *TagStore) start(ctx context.Context, key dynago.Key, o dynago.WriteOptions, required bool) (*tagItem, bool, error) {
+	expect, err := o.ExpectedRev()
+	if err != nil {
+		return nil, false, err
+	}
+	from, err := s.from(key, o)
+	if err != nil {
+		return nil, false, err
+	}
+	if from != nil {
+		if expect != 0 && expect != from.loaded.rev {
+			return nil, false, dynago.ErrVersionMismatch
+		}
+		return &tagItem{Tag: from.loaded.snapshot, Rev: from.loaded.rev, V: from.loaded.v, raw: from.loaded.raw}, true, nil
+	}
+	if required && expect == 0 {
+		return nil, false, dynago.ErrVersionRequired
+	}
+	it, err := s.load(ctx, key, true)
+	if err != nil {
+		return nil, false, err
+	}
+	if expect != 0 && it.Rev != expect {
+		return nil, false, dynago.ErrVersionMismatch
+	}
+	return it, expect != 0, nil
+}
+
+// Get reads a Tag by primary key with one eventually consistent GetItem.
+func (s *TagStore) Get(ctx context.Context, k TagKey) (*Tag, error) {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return nil, err
+	}
+	it, err := s.load(ctx, key, false)
+	if err != nil {
+		return nil, err
+	}
+	return &it.Tag, nil
+}
+
+// Define creates a Tag, failing with ErrTagExists if one already exists. Afterwards e.Version()
+// returns the new item's version.
+func (s *TagStore) Define(ctx context.Context, e *Tag) error {
+	key, err := e.Key().dynamoKey()
+	if err != nil {
+		return err
+	}
+	if err := e.checkKeyParts(); err != nil {
+		return err
+	}
+	rev, stamp := dynago.NewRev(), dynago.NewStamp()
+	// Known before the write, so the copies it writes carry the entity's creation time.
+	e.stamps = dynago.Timestamps{Created: dynago.ParseStamp(stamp), Updated: dynago.ParseStamp(stamp)}
+	err = dynago.Retry(ctx, func() error {
+		put := s.t.Put(tagToItem(e, key, rev, stamp, stamp)).If("attribute_not_exists($)", "PK")
+		ops := []dynago.Op{dynago.CreateOp(key, put, ErrTagExists, rev)}
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return err
+		}
+		e.loaded = &tagLoaded{rev: rev, v: tagVersion, snapshot: e.clone()}
+		return nil
+	})
+	if err != nil {
+		e.stamps = dynago.Timestamps{} // not created
+	}
+	return err
+}
+
+// TagDescribe holds the new values for Tag.Describe.
+type TagDescribe struct {
+	About string
+}
+
+// Describe updates about of a Tag. The change to the items it requires is known from the arguments,
+// so it runs without reading the item: conditional writes in one transaction. If the item is not in
+// the state assumed, it falls back to reading it. In the same transaction it requires counter
+// TagCounts to have onSite = 0 (a missing value counts as 0) (else
+// ErrTagDescribeRequiresTagCounts).
+func (s *TagStore) Describe(ctx context.Context, k TagKey, v TagDescribe, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	// The derived changes depend only on the key and the state `when` pins, so try without
+	// reading. ReturnVersion and dynago.From need the read path.
+	if o.From == nil && o.NewVersion == nil {
+		expect, err := o.ExpectedRev()
+		if err != nil {
+			return err
+		}
+		err = dynago.Retry(ctx, func() error {
+			before := Tag{DepotID: k.DepotID, Tag: k.Tag}
+			after := before.clone()
+			after.About = v.About
+			sets := []dynago.Set{
+				{Attr: "about", Value: v.About, Remove: v.About == ""},
+			}
+			u := s.t.Update("PK", key.PK).Range("SK", key.SK)
+			dynago.SetFields(u, sets)
+			dynago.GuardUpdate(u, dynago.Guard{ExpectRev: expect}, dynago.Now())
+			ops := []dynago.Op{dynago.UpdateOp(key, u, dynago.ErrNeedsRead)}
+			// requires TagCounts
+			if after.DepotID == "" || after.Tag == "" {
+				return fmt.Errorf("%w: Tag.Describe requires the TagCounts, keyed by depotId and tag", dynago.ErrFieldRequired)
+			}
+			tagCountsKey := dynago.Key{PK: "D#" + after.DepotID, SK: "TAG#" + after.Tag}
+			ops = append(ops, dynago.CheckOp(tagCountsKey, dynago.CheckCounter(s.t, tagCountsKey, []dynago.Cond{{Attr: "onSite", Value: 0, Zero: true}}), ErrTagDescribeRequiresTagCounts))
+			return dynago.Run(ctx, s.db, ops)
+		})
+		if !dynago.NeedsRead(err) {
+			return err
+		}
+		// The item was absent, not in the assumed state, or older: the read path reports which.
+	}
+	return dynago.Retry(ctx, func() error {
+		it, versioned, err := s.start(ctx, key, o, false)
+		if err != nil {
+			return err
+		}
+		before := &it.Tag
+		after := before.clone()
+		after.About = v.About
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, tagKnown, tagToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		// requires TagCounts
+		if after.DepotID == "" || after.Tag == "" {
+			return fmt.Errorf("%w: Tag.Describe requires the TagCounts, keyed by depotId and tag", dynago.ErrFieldRequired)
+		}
+		tagCountsKey := dynago.Key{PK: "D#" + after.DepotID, SK: "TAG#" + after.Tag}
+		ops = append(ops, dynago.CheckOp(tagCountsKey, dynago.CheckCounter(s.t, tagCountsKey, []dynago.Cond{{Attr: "onSite", Value: 0, Zero: true}}), ErrTagDescribeRequiresTagCounts))
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return dynago.StaleAs(versioned, err)
+		}
+		o.Written(it.Rev + 1)
+		return nil
+	})
+}
+
+// Retire deletes a Tag, failing with ErrTagNotFound if it is absent. It reads the item consistently
+// first (not with dynago.From) so it can release what the item contributed, then writes everything
+// in one transaction guarded by the item's revision. In the same transaction it requires counter
+// TagCounts to have parcels = 0 and onSite = 0 (a missing value counts as 0) (else
+// ErrTagRetireRequiresTagCounts), and deletes the counter item.
+func (s *TagStore) Retire(ctx context.Context, k TagKey, opts ...dynago.WriteOption) error {
+	key, err := k.dynamoKey()
+	if err != nil {
+		return err
+	}
+	o := dynago.ApplyOptions(opts)
+	return dynago.Retry(ctx, func() error {
+		it, versioned, err := s.start(ctx, key, o, false)
+		if err != nil {
+			return err
+		}
+		ops := []dynago.Op{dynago.DeleteOp(key, s.t.Delete("PK", key.PK).Range("SK", key.SK).If("$ = ?", "_rev", it.Rev), dynago.ErrStale)}
+		e := &it.Tag
+		// requires TagCounts
+		if e.DepotID == "" || e.Tag == "" {
+			return fmt.Errorf("%w: Tag.Retire requires the TagCounts, keyed by depotId and tag", dynago.ErrFieldRequired)
+		}
+		tagCountsKey := dynago.Key{PK: "D#" + e.DepotID, SK: "TAG#" + e.Tag}
+		ops = append(ops, dynago.DeleteOp(tagCountsKey, dynago.ConsumeCounter(s.t, tagCountsKey, []dynago.Cond{{Attr: "parcels", Value: 0, Zero: true}, {Attr: "onSite", Value: 0, Zero: true}}), ErrTagRetireRequiresTagCounts))
+		if err := dynago.Run(ctx, s.db, ops); err != nil {
+			return dynago.StaleAs(versioned, err)
+		}
+		return nil
+	})
 }
 
 // ---- Damage ----

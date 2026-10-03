@@ -59,6 +59,12 @@ format, the generated code and the runtime API; the changelog says how to move.
   yet: delete the lock file and generate again. The schema-changes guide and getting-started say
   when that is right.
 
+- A `requires` on a counter can delete the counter item: `consume: true` removes it in the write's
+  transaction, provided every value reads zero. Deleting a label takes its counter item with it,
+  and is refused while anything is still counted under it. A requirement can also name a counter
+  keyed by a set's elements, by one element (`labelIds: labelId`), which was refused before. The
+  runtime gained `dynago.ConsumeCounter`.
+
 ### Changed
 
 - Go names keep the capitals of an initialism in the plural: a field `labelIds` generates

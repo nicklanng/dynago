@@ -1113,7 +1113,7 @@
         "consume": {
           "type": "boolean",
           "default": false,
-          "description": "Deletes the required entity in the same transaction."
+          "description": "Deletes the required item in the same transaction: an entity, or a counter's item, which must read zero for every value."
         }
       },
       "not": {

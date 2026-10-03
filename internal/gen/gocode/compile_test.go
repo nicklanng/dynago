@@ -96,6 +96,14 @@ var awkwardEntities = []struct {
 		"    unique:\n      Label: { fields: [tenantId, label] }\n" +
 		"    counters:\n      Ranks: { pk: \"T#{tenantId}\", sk: \"RANKS\", values: { total: { sum: rank, limit: 100 }, n: count } }\n" +
 		"    writes:\n      Make: create\n      Relabel: { update: [label, rank], patch: [until, tags], batch: 40 }\n      Zero: { set: { rank: 0 }, when: { rank: { not: 0 } }, batch: 3 }\n", ""},
+	{"requires that check and delete counter items", "  Tally:\n    fields:\n      tenantId: string\n      tallyId: string\n      labels: string_set\n      rank: int\n" +
+		"    key: { pk: \"T#{tenantId}\", sk: \"TALLY#{tallyId}\" }\n" +
+		"    counters:\n      PerLabel: { pk: \"C#{tenantId}\", sk: \"LABEL#{labels}\", values: { n: count, ranks: { sum: rank } } }\n      Whole: { pk: \"C#{tenantId}\", sk: \"WHOLE\", values: { n: count } }\n" +
+		"    writes:\n      Make: create\n" +
+		"  Label:\n    fields:\n      tenantId: string\n      name: string\n      until: time\n    ttl: until\n    key: { pk: \"T#{tenantId}\", sk: \"LABEL#{name}\" }\n    writes:\n" +
+		"      Make: { create: true, requires: { PerLabel: { key: { tenantId: tenantId, labels: name }, when: { n: 0 } } } }\n" +
+		"      Drop: { delete: true, requires: { PerLabel: { key: { tenantId: tenantId, labels: name }, consume: true }, Whole: { key: { tenantId: tenantId }, when: { n: 0 }, consume: true } } }\n" +
+		"      Touch: { update: [until], requires: { PerLabel: { key: { tenantId: tenantId, labels: name }, when: { ranks: 0 }, consume: true } } }\n", ""},
 	{"entity named like another's store", "  ThingStore:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},
 	{"entities differing in initialism case", "  THING:\n    fields: { id: string }\n    key: { pk: \"U#{id}\", sk: \"U\" }\n", "collides"},
 	{"entity named Store", "  Store:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},

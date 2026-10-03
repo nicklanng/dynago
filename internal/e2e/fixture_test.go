@@ -697,3 +697,61 @@ func onlyPreconditions(be *dynago.BatchError) bool {
 	}
 	return true
 }
+
+// A counter keyed by a set's elements is required by naming one element, and consume deletes the
+// counter item in the write's transaction once it reads zero. Retiring a tag is refused while a
+// parcel carries it, and afterwards the tag's counter is gone from the list of all of them.
+func TestConsumeACounterItem(t *testing.T) {
+	t.Parallel()
+	db := testdb.DB(t)
+	st := fixture.New(db, testdb.Table(t, db, fixture.TableSpec))
+	pk := fixture.ParcelKey{DepotID: "d1", ParcelID: "p1"}
+	tag := func(name string) fixture.TagKey { return fixture.TagKey{DepotID: "d1", Tag: name} }
+	for _, name := range []string{"fragile", "cold", "unused"} {
+		must(t, st.Tags.Define(ctx, &fixture.Tag{DepotID: "d1", Tag: name}))
+	}
+	must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d1", ParcelID: "p1", Tags: []string{"fragile", "cold"}}))
+	counters := func() string {
+		t.Helper()
+		entries, _, err := st.Parcels.Tags(ctx, fixture.ParcelTagsQuery{DepotID: "d1"}, dynago.Page{})
+		must(t, err)
+		var out []string
+		for _, e := range entries {
+			out = append(out, fmt.Sprintf("%s=%d", e.Key.TagsElem, e.Parcels))
+		}
+		return fmt.Sprint(out)
+	}
+
+	// A check of one element's counter: a parcel on site carries the tag.
+	wantErr(t, st.Tags.Describe(ctx, tag("fragile"), fixture.TagDescribe{About: "handle with care"}), fixture.ErrTagDescribeRequiresTagCounts)
+	must(t, st.Tags.Describe(ctx, tag("unused"), fixture.TagDescribe{About: "nothing has counted under it"}))
+
+	// The tag can't go while it counts something, and nothing is deleted when it is refused.
+	wantErr(t, st.Tags.Retire(ctx, tag("fragile")), fixture.ErrTagRetireRequiresTagCounts)
+	if _, err := st.Tags.Get(ctx, tag("fragile")); err != nil {
+		t.Fatalf("a refused retirement deleted the tag: %v", err)
+	}
+	if got := counters(); got != "[cold=1 fragile=1]" {
+		t.Fatalf("counters: %s", got)
+	}
+
+	// Once no parcel carries it, its counter item reads zero and goes with the tag.
+	must(t, st.Parcels.Retag(ctx, pk, fixture.ParcelRetag{Tags: []string{"cold"}}))
+	if got := counters(); got != "[cold=1 fragile=0]" {
+		t.Fatalf("counters after untagging: %s", got)
+	}
+	must(t, st.Tags.Retire(ctx, tag("fragile")))
+	if got := counters(); got != "[cold=1]" {
+		t.Fatalf("counters after retiring the tag: %s", got)
+	}
+	if _, err := st.Tags.Get(ctx, tag("fragile")); !errors.Is(err, fixture.ErrTagNotFound) {
+		t.Fatalf("the retired tag: %v", err)
+	}
+	// A tag nothing was ever counted under has no counter item: there is nothing to delete.
+	must(t, st.Tags.Retire(ctx, tag("unused")))
+	// The counter starts again if the element comes back.
+	must(t, st.Parcels.Retag(ctx, pk, fixture.ParcelRetag{Tags: []string{"cold", "fragile"}}))
+	if got := counters(); got != "[cold=1 fragile=1]" {
+		t.Fatalf("counters after tagging again: %s", got)
+	}
+}

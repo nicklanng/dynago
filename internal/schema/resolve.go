@@ -1378,12 +1378,8 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 		if c.Shards > 1 {
 			r.errorf("%s: %s is sharded, so no single item holds its values to check", where, target)
 		}
-		if c.Set != nil {
-			r.errorf("%s: %s has an item for each element of %s; requiring one of them isn't supported", where, target, c.Set.Name)
-			return nil
-		}
-		if len(raw.Set)+len(raw.Add)+len(raw.Patch) > 0 || raw.Optional || raw.Consume || raw.Ensure != nil {
-			r.errorf("%s: a counter can only be checked with when (an absent value counts as 0)", where)
+		if len(raw.Set)+len(raw.Add)+len(raw.Patch) > 0 || raw.Optional || raw.Ensure != nil {
+			r.errorf("%s: a counter can only be checked with when (an absent value counts as 0), and its item deleted with consume once it reads zero", where)
 		}
 	default:
 		r.errorf("%s: %s is not an entity or counter of this table", where, target)
@@ -1400,6 +1396,19 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 			continue
 		}
 		delete(given, tf.Name)
+		if req.Counter != nil && tf == req.Counter.Set {
+			// The counter has an item for each element of the set: the key names one of them.
+			sf := e.Field(src)
+			switch {
+			case sf == nil:
+				r.errorf("%s key %s: %s is not a field of %s", where, tf.Name, src, e.Name)
+			case sf.Type != TypeString:
+				r.errorf("%s key %s: %s has an item for each element of %s, so the key takes one element: a string field of %s, and %s is a %s", where, tf.Name, target, tf.Name, e.Name, src, sf.Type)
+			default:
+				req.Key = append(req.Key, RequireKey{Target: tf, Source: sf})
+			}
+			continue
+		}
 		sf := r.source(e, where+" key "+tf.Name, src, owner, tf)
 		if sf != nil {
 			req.Key = append(req.Key, RequireKey{Target: tf, Source: sf})
@@ -1424,6 +1433,25 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 				r.errorf("%s when: %s: want an integer, got %v", where, p.Key, p.Value)
 			default:
 				req.CounterWhen = append(req.CounterWhen, CounterPred{Value: v, Equals: int64(n)})
+			}
+		}
+		if req.Consume {
+			// The item goes, so everything it counts must have gone first: every value, not only
+			// those when names.
+			for _, v := range req.Counter.Values {
+				named := false
+				for _, p := range req.CounterWhen {
+					if p.Value != v {
+						continue
+					}
+					named = true
+					if p.Equals != 0 {
+						r.errorf("%s when: consume deletes the counter item, which must read zero: %s can't be required to be %d", where, v.Name, p.Equals)
+					}
+				}
+				if !named {
+					req.CounterWhen = append(req.CounterWhen, CounterPred{Value: v, Equals: 0})
+				}
 			}
 		}
 		if len(req.CounterWhen) == 0 {

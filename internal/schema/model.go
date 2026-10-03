@@ -882,7 +882,9 @@ type Require struct {
 	Sets        []SetConst
 	// Optional lets the write go ahead when the target is absent or expired.
 	Optional bool
-	Consume  bool
+	// Consume deletes the target in the write's transaction. For a counter, it deletes the counter
+	// item, which must read zero for every value.
+	Consume bool
 	// Ensure makes the write create the target when it is absent, with EnsureSets and then Sets
 	// applied to a new item; When and Sets apply to one that is there, as without it.
 	Ensure     bool
@@ -893,8 +895,11 @@ type Require struct {
 	ErrName string
 }
 
-// Writes reports whether the requirement changes its target, rather than only checking it.
-func (rq *Require) Writes() bool { return len(rq.Sets) > 0 || rq.Consume || rq.Ensure }
+// Writes reports whether the requirement changes an entity, rather than only checking it. (One
+// on a counter can delete the counter item, with Consume: that is not a change to an entity.)
+func (rq *Require) Writes() bool {
+	return rq.Target != nil && (len(rq.Sets) > 0 || rq.Consume || rq.Ensure)
+}
 
 // Sources returns the fields of the writing entity the requirement reads: its key and references.
 func (rq *Require) Sources() []*Field {
