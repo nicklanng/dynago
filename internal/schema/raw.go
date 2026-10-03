@@ -197,6 +197,7 @@ type RawIndex struct {
 	SK       string          `yaml:"sk"`
 	Project  RawProject      `yaml:"project"`
 	Where    Ordered[any]    `yaml:"where"`
+	Matches  *float64        `yaml:"matches"`
 	Doc      string          `yaml:"doc"`
 	Accept   Ordered[string] `yaml:"accept"`
 }

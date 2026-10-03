@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"math"
 	"os"
 	"strings"
 	"testing"
@@ -118,10 +119,10 @@ func TestExamplePartitions(t *testing.T) {
 	if loan == nil || !loan.Grows || loan.Count.Typical != 20 || loan.Count.Max != 500 || !tool.Grows {
 		t.Errorf("loan member = %+v", loan)
 	}
-	// Overdue gathers a library's loans in one GSI partition: 60 tools × 20 loans typically, and
-	// the biggest skew (5,000 tools) at most.
+	// Overdue gathers a library's active loans in one GSI partition: of 60 tools × 20 loans
+	// typically, and the biggest skew (5,000 tools) at most, the 2% its where matches.
 	due := find("GSI Overdue", "LIB#{libraryId}#DUE")
-	if c := due.Members[0].Count; c.Typical != 1200 || c.Max != 100000 {
+	if c := due.Members[0].Count; c.Typical != 24 || c.Max != 2000 || due.Bound() {
 		t.Errorf("overdue count = %+v", c)
 	}
 	// An enum in the key divides the typical count, not the largest.
@@ -136,7 +137,8 @@ func TestExamplePartitions(t *testing.T) {
 	}
 	// A member's partition holds their loan copies, counted by the declared spread over members.
 	mine := find("base table", "LIB#{libraryId}#MEMBER#{memberId}")
-	if c := mine.Members[0].Count; c.Typical != 60 || c.Max != 400 {
+	// Only the active ones are copied there: 2% of the 60 typical and 400 at most.
+	if c := mine.Members[0].Count; math.Abs(c.Typical-1.2) > 1e-9 || c.Max != 8 {
 		t.Errorf("my loans count = %+v", c)
 	}
 	for _, p := range r.Partitions {
@@ -345,6 +347,97 @@ func TestDeclaredSpreadBeatsTheChain(t *testing.T) {
 	_, err := schema.Parse([]byte(note("{ per: Thing, typical: 0.2, max: 50, by: { Thing: { typical: 1, max: 9 } } }")))
 	if err == nil || !strings.Contains(err.Error(), "the volume already counts per Thing") {
 		t.Errorf("by repeating per: %v", err)
+	}
+}
+
+// A sparse index holds the items its where matches. With the share declared (matches), its
+// partitions, their traffic and the writes that maintain it are sized by it; without, every item
+// is counted and the result is marked as the most it can be.
+func TestSparseIndexIsSizedByItsShare(t *testing.T) {
+	src := func(matches string) string {
+		return strings.Replace(base, "    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n", `    indexes:
+      Binned:
+        pk: "BIN"
+        sk: "T#{orgId}#{thingId}"
+        where: { kind: b }
+        project: keys
+`+matches+`    access:
+      Binned: { query: Binned, rate: 1 }
+    writes:
+      Add: { create: true, rate: 10 }
+      AddA: { create: true, set: { kind: a }, rate: 10 }
+      Bin: { set: { kind: b }, when: { kind: a }, rate: 1 }
+      Rename: { update: [name], rate: 10 }
+    volume: { typical: 10, max: 1000 }
+`, 1)
+	}
+	binned := func(r *Result) (*Partition, *Member) {
+		t.Helper()
+		for _, p := range r.Partitions {
+			if p.PK == "BIN" {
+				return p, p.Members[0]
+			}
+		}
+		t.Fatal("no partition for the Binned index")
+		return nil, nil
+	}
+	units := func(r *Result, write string) float64 {
+		t.Helper()
+		for _, er := range r.Cost.Entities {
+			for _, wc := range er.Writes {
+				if wc.Write.Entity.Name != "Thing" || wc.Write.Name != write {
+					continue
+				}
+				for _, tc := range wc.Touches {
+					if tc.Target.Index != nil {
+						return tc.Units.P50
+					}
+				}
+				return 0
+			}
+		}
+		t.Fatalf("no write %s", write)
+		return 0
+	}
+
+	// Not declared: all 1,000 things are counted, as a bound.
+	r := Analyze(parse(t, src("")), cost.DefaultPrices, nil)
+	p, mb := binned(r)
+	if !mb.Bound || !p.Bound() || mb.Count.Typical != 1000 {
+		t.Errorf("without matches: bound %v, count %+v; want a bound of 1,000", mb.Bound, mb.Count)
+	}
+	if !has(r, "low-cardinality-key", Note, "Thing.Binned", `every Thing with kind = "b" lands in one partition`) ||
+		!has(r, "low-cardinality-key", Note, "Thing.Binned", "at most (if every Thing matched") {
+		t.Errorf("the finding should speak of matching things, and of a bound:\n%s", dump(r))
+	}
+	if st := r.Reads[r.Model.Entity("Thing").Access[0]]; !st.Filtered {
+		t.Errorf("the read should say fewer items qualify than counted")
+	}
+	loose := p.PeakWRU
+
+	// One thing in a hundred is binned.
+	r = Analyze(parse(t, src("        matches: 0.01\n")), cost.DefaultPrices, nil)
+	p, mb = binned(r)
+	if mb.Bound || mb.Count.Typical != 10 || p.Count.Typical != 1 {
+		t.Errorf("with matches: bound %v, count %+v, %v partitions; want 10 things in one partition", mb.Bound, mb.Count, p.Count.Typical)
+	}
+	if has(r, "low-cardinality-key", Note, "Thing.Binned", "at most (if every") {
+		t.Errorf("a sized index isn't a bound:\n%s", dump(r))
+	}
+	if st := r.Reads[r.Model.Entity("Thing").Access[0]]; st.Filtered || st.Items.Typical != 10 {
+		t.Errorf("the read returns %+v, want 10 items and no caveat", st.Items)
+	}
+	// What a write pays for the index follows what it says about the item: a create that may or
+	// may not match pays the share; one that sets another kind pays nothing; binning always adds
+	// the entry; a rename touches no index key, and the index projects nothing.
+	for write, want := range map[string]float64{"Add": 0.01, "AddA": 0, "Bin": 1, "Rename": 0} {
+		if got := units(r, write); got != want {
+			t.Errorf("%s pays %v WRU for the index typically, want %v", write, got, want)
+		}
+	}
+	// 10 creates/s at 1% and one binning a second, against 21 writes/s counted in full.
+	if p.PeakWRU >= loose || p.PeakWRU < 1 || p.PeakWRU > 1.2 {
+		t.Errorf("peak on the index partition: %v WRU/s (was %v as a bound), want about 1.1", p.PeakWRU, loose)
 	}
 }
 

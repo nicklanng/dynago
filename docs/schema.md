@@ -227,6 +227,7 @@ An index is another key for the same entity. Index names are PascalCase.
 | `sk` | gsi: no; copy: yes | | Sort key template. A copy's `sk` must start with literal text. |
 | `project` | yes | | What the index holds: `all` (every field), `keys` (key fields only), or a list of fields. Key fields are always included. |
 | `where` | no | | Only index the entity while these [predicates](#predicates) hold (a sparse index). |
+| `matches` | no | | With `where`: the share of the entity's items that satisfy it, from just above 0 to 1 (`0.01` is one in a hundred). The analysis sizes the index, its partitions' traffic and the cost of the writes that maintain it with this share. Without it every item is counted, which is the most the index can hold: the results are marked as upper bounds, and left out of the summary's largest and busiest partition. |
 | `doc` | no | | Shown in the model document and on the generated method. |
 | `accept` | no | | Findings about the index recorded as deliberate. See [Accepting findings](#accept). |
 

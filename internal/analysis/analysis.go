@@ -165,7 +165,7 @@ func (a *analyzer) assumptions() {
 	a.r.Assumptions = append(a.r.Assumptions, horizon, peak,
 		"Items per partition follow the volumes: an entity's items per parent (typical and max), multiplied up the parents. A partition's largest count takes the biggest skew along its path, not every one at once.",
 		"An enum in a partition key splits the items evenly among its values typically; at worst they all share one. A field that refers to another entity (by name, ref or requires) spreads the items evenly over that entity's items, unless volume.by says otherwise. Any other field leaves the count unknown.",
-		"Index entries are counted as if every item had one: `where` and empty key fields only make an index smaller.",
+		"An index with a `where` holds the share of the items its `matches` declares. Without `matches`, every item is counted, so its sizes, traffic and write costs are upper bounds, marked as such. Empty key fields only make an index smaller.",
 		"The busiest partition gets traffic in proportion to its share of the items: its largest count over the entity's total. A write's declared hot_key_rate replaces that estimate for every partition it touches.",
 		fmt.Sprintf("A partition key value takes at most %d WRU and %d RRU per second. Risk is the larger share of either at peak: low under 10%%, medium under 50%%, high above.", cost.PartitionWCU, cost.PartitionRCU),
 	)

@@ -52,13 +52,32 @@ type Count struct {
 	// Spread says the items are on different partition keys (a key moved, or one claim per
 	// element), so each key takes one of them rather than all.
 	Spread bool
+	// Chance is the share of calls that touch the items at all, when it is less than every call:
+	// entries of a sparse index exist only for the items that match its where. 0 means every call.
+	Chance float64
+}
+
+// chance is the share of calls that touch the items.
+func (c Count) chance() float64 {
+	if c.Chance > 0 {
+		return c.Chance
+	}
+	return 1
+}
+
+// maybe returns the count for a share of the calls.
+func (c Count) maybe(chance float64) Count {
+	if chance < 1 {
+		c.Chance = chance
+	}
+	return c
 }
 
 var (
-	once  = Count{1, 1, false}
-	twice = Count{2, 2, false}
+	once  = Count{P50: 1, P99: 1}
+	twice = Count{P50: 2, P99: 2}
 	// apart is two items on two partition keys: an entry or counter whose partition key moved.
-	apart = Count{2, 2, true}
+	apart = Count{P50: 2, P99: 2, Spread: true}
 )
 
 // TargetKind is a kind of stored item.
@@ -290,10 +309,12 @@ func analyzeEntity(r *Report, m *schema.Model, e *schema.Entity) *EntityReport {
 		bytes := n * float64(er.Item.P50+IndexOverhead)
 		er.BaseBytes, er.BaseItems = n*float64(er.Item.P50), n
 		for _, ix := range e.Indexes {
-			bytes += n * float64(er.Indexes[ix.Name].P50+IndexOverhead)
+			// A sparse index holds the share of the items its where matches, when declared.
+			in := n * ix.Share()
+			bytes += in * float64(er.Indexes[ix.Name].P50+IndexOverhead)
 			if ix.Strategy == schema.StrategyCopy {
-				er.BaseBytes += n * float64(er.Indexes[ix.Name].P50)
-				er.BaseItems += n
+				er.BaseBytes += in * float64(er.Indexes[ix.Name].P50)
+				er.BaseItems += in
 			}
 		}
 		for _, u := range e.Uniques {
@@ -382,7 +403,8 @@ func WriteCostOf(m *schema.Model, e *schema.Entity, w *schema.Write, readFirst b
 				wc.TxBytes += n.P99 * s.P99
 			}
 		}
-		u := Units{float64(n.P50) * wru(s.P50), float64(n.P99) * wru(s.P99)}
+		// Typically, only the calls that touch the items pay for them; at worst, every one does.
+		u := Units{float64(n.P50) * wru(s.P50) * n.chance(), float64(n.P99) * wru(s.P99)}
 		*dst = dst.add(u)
 		wc.Items = append(wc.Items, name)
 		wc.Touches = append(wc.Touches, Touch{Target: t, Label: name, Check: check, Async: async, Size: s, Count: n, Units: u})
@@ -433,7 +455,7 @@ const setElementBytes = 20
 // setElements estimates the number of elements of a string set field.
 func setElements(f *schema.Field) Count {
 	n := func(size int) int { return max(1, (size+setElementBytes-1)/setElementBytes) }
-	return Count{n(f.SizeP50), n(f.SizeP99), true}
+	return Count{P50: n(f.SizeP50), P99: n(f.SizeP99), Spread: true}
 }
 
 // derivedWrites records the index entries, copies, counters and claims a write of e changes. A
@@ -455,34 +477,47 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 	}
 	all := w.Kind != schema.WriteUpdate
 	for _, ix := range e.Indexes {
-		keyFields := append(append([]*schema.Field{}, ix.PK.Fields...), ix.SK.Fields...)
-		keyFields = append(keyFields, predFields(ix.Where)...)
-		moved, projected := touches(keyFields), ix.Projection == schema.ProjectAll || touches(ix.ProjectedFields())
+		keys := append(append([]*schema.Field{}, ix.PK.Fields...), ix.SK.Fields...)
+		projected := ix.Projection == schema.ProjectAll || touches(ix.ProjectedFields())
 		size := er.Indexes[ix.Name]
-		movedN := twice
-		if touches(ix.PK.Fields) {
-			movedN = apart
-		}
+		t, entry, moved, async := Target{Kind: TargetCopy, Entity: e, Index: ix}, owner+"copy "+ix.Name, " (moved: put + delete)", false
 		if ix.Strategy == schema.StrategyGSI {
-			t := Target{Kind: TargetGSI, Entity: e, Index: ix}
-			switch {
-			case all:
-				write(t, false, true, owner+"GSI "+ix.Name+" entry", size, once)
-			case moved:
-				write(t, false, true, owner+"GSI "+ix.Name+" entry (moved: delete + put)", size, movedN)
-			case projected:
-				write(t, false, true, owner+"GSI "+ix.Name+" entry", size, once)
-			}
-			continue
+			t, entry, moved, async = Target{Kind: TargetGSI, Entity: e, Index: ix}, owner+"GSI "+ix.Name+" entry", " (moved: delete + put)", true
 		}
-		t := Target{Kind: TargetCopy, Entity: e, Index: ix}
+		// A sparse index has an entry only while the item matches its where: the write's `when`
+		// and `set` may say whether it does, and otherwise the declared share of items does.
+		before, after := ix.Members(w)
+		chance := func(m schema.Membership) float64 {
+			if m == schema.Maybe {
+				return ix.Share()
+			}
+			return 1
+		}
 		switch {
-		case all:
-			write(t, false, false, owner+"copy "+ix.Name, size, once)
-		case moved:
-			write(t, false, false, owner+"copy "+ix.Name+" (moved: put + delete)", size, movedN)
+		case before == schema.No && after == schema.No:
+			// Never in the index: nothing to write.
+		case before == schema.No:
+			if all {
+				write(t, false, async, entry, size, once.maybe(chance(after)))
+			} else {
+				write(t, false, async, entry+" (added)", size, once.maybe(chance(after)))
+			}
+		case after == schema.No:
+			if all {
+				write(t, false, async, entry, size, once.maybe(chance(before)))
+			} else {
+				write(t, false, async, entry+" (removed)", size, once.maybe(chance(before)))
+			}
+		case touches(keys) || (touches(predFields(ix.Where)) && (before == schema.Maybe || after == schema.Maybe)):
+			// Its keys change, or it may enter or leave the index: the old entry goes and the
+			// new one is written, each only if the item matches at that moment.
+			n := twice
+			if touches(ix.PK.Fields) {
+				n = apart
+			}
+			write(t, false, async, entry+moved, size, n.maybe((chance(before)+chance(after))/2))
 		case projected:
-			write(t, false, false, owner+"copy "+ix.Name, size, once)
+			write(t, false, async, entry, size, once.maybe(chance(before)))
 		}
 	}
 	for _, c := range e.Counters {
@@ -518,7 +553,7 @@ func derivedWrites(e *schema.Entity, w *schema.Write, er *EntityReport, owner st
 			case all:
 				write(t, false, false, fmt.Sprintf("%sclaims %s (one per %s element)", owner, u.Name, u.Set.Name), claimSize, n)
 			case touches(u.Fields):
-				write(t, false, false, fmt.Sprintf("%sclaims %s (added and dropped %s elements)", owner, u.Name, u.Set.Name), claimSize, Count{2, 2 * n.P99, true})
+				write(t, false, false, fmt.Sprintf("%sclaims %s (added and dropped %s elements)", owner, u.Name, u.Set.Name), claimSize, Count{P50: 2, P99: 2 * n.P99, Spread: true})
 			}
 			continue
 		}

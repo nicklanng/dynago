@@ -20,6 +20,9 @@ format, the generated code and the runtime API; the changelog says how to move.
   regenerating, rename the uses of the affected names in your code; the compiler finds them.
   Stored attribute names don't change.
 
+- `matches` on an index with a `where`: the share of the entity's items that satisfy it. The
+  analysis sizes the index's partitions, storage and traffic with it, and the writes that maintain
+  it pay for the entry in that share of their calls.
 - Conditions can exclude a value or list several: `where: { mailbox: { not: trash } }`,
   `when: { mailbox: { in: [inbox, archived] } }`. They work wherever a condition does: an index's
   and a counter value's `where`, a write's `when`, and a require's `when` (where `not` may also
@@ -37,6 +40,15 @@ format, the generated code and the runtime API; the changelog says how to move.
 
 ### Fixed
 
+- A sparse index (one with a `where`) was sized, and its writes priced, as if every item of the
+  entity were in it, and reported as fact: it could be the model document's largest partition
+  while holding a sliver of the items. Now a write's `when` and `set` decide what it does to the
+  index where they can: a write that takes the item out of the index removes one entry (it was
+  costed as a delete and a put), and one that can't match doesn't touch it. Where the write
+  doesn't say, the index's `matches` share is used, and without one the numbers are marked as
+  upper bounds: "at most" in the partition table, worded so in the `low-cardinality-key` finding,
+  and kept out of the summary's largest and busiest partition. Estimated costs and transaction
+  sizes of existing schemas can go down as a result.
 - A `volume.by` naming an entity further up the parent chain (a draft's spread `by: User`, where
   drafts are counted per thread and threads per user) was ignored: the partitions keyed by that
   entity were sized from the chain, whose largest value multiplies the most skewed step by the

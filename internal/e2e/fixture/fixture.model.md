@@ -120,9 +120,9 @@ Every write the code can make, and everything each changes. Each is atomic: all 
 | `Account.Activate` | Sets `status` = "active" | the Account exists; status = "pending" | Account<br>counter TenantCounts<br>counter RegionCounts | yes | transaction, 3 items | 6 | — |
 | `Account.HandOver` | Sets `successorId`, sets `status` = "closed", sets the Account's status to "active" | the Account exists; status = "active"; the Account exists with status = "pending" | Account<br>counter TenantCounts<br>counter RegionCounts<br>Account (sets its status to "active")<br>Account's counter TenantCounts<br>Account's counter RegionCounts | yes | transaction, 6 items | 12 | — |
 | `Parcel.Receive` | Creates a Parcel, sets `state` = "received" | no Parcel at the key | Parcel<br>copy OnSite<br>GSI Known entry<br>counter DepotParcels | no | transaction, 3 items | 7 | — |
-| `Parcel.Shelve` | Sets `state` = "shelved" | the Parcel exists; state = "received" | Parcel<br>copy OnSite (moved: put + delete)<br>GSI Known entry (moved: delete + put)<br>counter DepotParcels | yes | transaction, 4 items | 10 | — |
-| `Parcel.SendOut` | Sets `state` = "out" | the Parcel exists; state in ["received", "shelved"] | Parcel<br>copy OnSite (moved: put + delete)<br>GSI Known entry (moved: delete + put)<br>counter DepotParcels | yes | transaction, 4 items | 10 | — |
-| `Parcel.Lose` | Sets `state` = "lost" | the Parcel exists; state != "lost" | Parcel<br>copy OnSite (moved: put + delete)<br>GSI Known entry (moved: delete + put)<br>counter DepotParcels | yes | transaction, 4 items | 10 | — |
+| `Parcel.Shelve` | Sets `state` = "shelved" | the Parcel exists; state = "received" | Parcel<br>copy OnSite<br>counter DepotParcels | yes | transaction, 3 items | 6 | — |
+| `Parcel.SendOut` | Sets `state` = "out" | the Parcel exists; state in ["received", "shelved"] | Parcel<br>copy OnSite (removed)<br>counter DepotParcels | yes | transaction, 3 items | 6 | — |
+| `Parcel.Lose` | Sets `state` = "lost" | the Parcel exists; state != "lost" | Parcel<br>copy OnSite (removed)<br>GSI Known entry (removed)<br>counter DepotParcels | yes | transaction, 3 items | 7 | — |
 | `Parcel.Annotate` | Sets `note` | the Parcel exists; state != "lost" | Parcel | no | single item | 1 | — |
 | `Damage.File` | Creates a Damage | no Damage at the key; the Parcel exists with state in ["received", "shelved", "returned"] | Damage<br>check Parcel | no | transaction, 2 items | 4 | — |
 | `Damage.Dispute` | Sets `detail`, sets the Parcel's note to "disputed" | the Damage exists; the Parcel exists with state != "lost" | Damage<br>Parcel (sets its note to "disputed") | no (read-free) | transaction, 2 items | 4 | — |
@@ -143,8 +143,8 @@ A GSI is maintained by DynamoDB a moment after each write: writes stay cheap, an
 
 | Index | Kind | Keys | Projection | Read by | Why this kind | The other kind |
 |---|---|---|---|---|---|---|
-| `Parcel.OnSite` | copy | `D#{depotId}#ONSITE` / `P#{parcelId}`; only when `state in ["received", "shelved", "returned"]` | `state` plus key fields | OnSite | chosen: OnSite needs immediate freshness | As a GSI: Parcel.Receive 7 → 6 WRU (3 → 2 items); Parcel.Shelve 10 → 8 WRU (4 → 2 items); Parcel.SendOut 10 → 8 WRU (4 → 2 items); Parcel.Lose 10 → 8 WRU (4 → 2 items); OnSite would lose immediate freshness. |
-| `Parcel.Known` | GSI `Known` | `KNOWN#{depotId}` / `P#{parcelId}`; only when `state != "lost"` | key fields only | Known | chosen: no read through it needs immediate freshness | As a copy: Parcel.Receive 7 → 8 WRU (3 → 4 items); Parcel.Shelve 10 → 12 WRU (4 → 6 items); Parcel.SendOut 10 → 12 WRU (4 → 6 items); Parcel.Lose 10 → 12 WRU (4 → 6 items); reads could see writes immediately. |
+| `Parcel.OnSite` | copy | `D#{depotId}#ONSITE` / `P#{parcelId}`; only when `state in ["received", "shelved", "returned"]` | `state` plus key fields | OnSite | chosen: OnSite needs immediate freshness | As a GSI: Parcel.Receive 7 → 6 WRU (3 → 2 items); Parcel.Shelve 6 → 5 WRU (3 → 2 items); Parcel.SendOut 6 → 5 WRU (3 → 2 items); Parcel.Lose 7 → 6 WRU (3 → 2 items); OnSite would lose immediate freshness. |
+| `Parcel.Known` | GSI `Known` | `KNOWN#{depotId}` / `P#{parcelId}`; only when `state != "lost"` | key fields only | Known | chosen: no read through it needs immediate freshness | As a copy: Parcel.Receive 7 → 8 WRU (3 → 4 items); Parcel.Lose 7 → 8 WRU (3 → 4 items); reads could see writes immediately. |
 
 ### Partition map
 
@@ -218,7 +218,7 @@ Assumptions:
 - Peak traffic is assumed equal to the declared average rates (no workload.peak).
 - Items per partition follow the volumes: an entity's items per parent (typical and max), multiplied up the parents. A partition's largest count takes the biggest skew along its path, not every one at once.
 - An enum in a partition key splits the items evenly among its values typically; at worst they all share one. A field that refers to another entity (by name, ref or requires) spreads the items evenly over that entity's items, unless volume.by says otherwise. Any other field leaves the count unknown.
-- Index entries are counted as if every item had one: `where` and empty key fields only make an index smaller.
+- An index with a `where` holds the share of the items its `matches` declares. Without `matches`, every item is counted, so its sizes, traffic and write costs are upper bounds, marked as such. Empty key fields only make an index smaller.
 - The busiest partition gets traffic in proportion to its share of the items: its largest count over the entity's total. A write's declared hot_key_rate replaces that estimate for every partition it touches.
 - A partition key value takes at most 1000 WRU and 3000 RRU per second. Risk is the larger share of either at peak: low under 10%, medium under 50%, high above.
 - Sizes use each field's declared size (p50/p99); undeclared sizes use type defaults (string 20/64 B, time 30/35 B, int 8/11 B).
@@ -386,9 +386,9 @@ Every item that exists because of a Parcel, and what keeps it up to date.
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
 | `Receive` | create (fails if it exists), set `state` = "received" | Parcel<br>copy OnSite<br>GSI Known entry<br>counter DepotParcels | no | transaction (3 items) | — | 7 | `ErrParcelExists` |
-| `Shelve` | set `state` = "shelved" when `state = "received"` | Parcel<br>copy OnSite (moved: put + delete)<br>GSI Known entry (moved: delete + put)<br>counter DepotParcels | yes (1 consistent read; none with `dynago.From`) | transaction (4 items) | optional | 10 | `ErrParcelNotFound`<br>`ErrParcelShelvePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
-| `SendOut` | set `state` = "out" when `state in ["received", "shelved"]` | Parcel<br>copy OnSite (moved: put + delete)<br>GSI Known entry (moved: delete + put)<br>counter DepotParcels | yes (1 consistent read; none with `dynago.From`) | transaction (4 items) | optional | 10 | `ErrParcelNotFound`<br>`ErrParcelSendOutPrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
-| `Lose` | set `state` = "lost" when `state != "lost"` | Parcel<br>copy OnSite (moved: put + delete)<br>GSI Known entry (moved: delete + put)<br>counter DepotParcels | yes (1 consistent read; none with `dynago.From`) | transaction (4 items) | optional | 10 | `ErrParcelNotFound`<br>`ErrParcelLosePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `Shelve` | set `state` = "shelved" when `state = "received"` | Parcel<br>copy OnSite<br>counter DepotParcels | yes (1 consistent read; none with `dynago.From`) | transaction (3 items) | optional | 6 | `ErrParcelNotFound`<br>`ErrParcelShelvePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `SendOut` | set `state` = "out" when `state in ["received", "shelved"]` | Parcel<br>copy OnSite (removed)<br>counter DepotParcels | yes (1 consistent read; none with `dynago.From`) | transaction (3 items) | optional | 6 | `ErrParcelNotFound`<br>`ErrParcelSendOutPrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `Lose` | set `state` = "lost" when `state != "lost"` | Parcel<br>copy OnSite (removed)<br>GSI Known entry (removed)<br>counter DepotParcels | yes (1 consistent read; none with `dynago.From`) | transaction (3 items) | optional | 7 | `ErrParcelNotFound`<br>`ErrParcelLosePrecondition`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 | `Annotate` | set `note` when `state != "lost"` | Parcel | no | single item | optional | 1 | `ErrParcelNotFound`<br>`ErrParcelAnnotatePrecondition`<br>`dynago.ErrVersionMismatch` (with a version) |
 
 ### Damage

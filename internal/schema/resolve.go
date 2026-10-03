@@ -667,6 +667,16 @@ func (r *resolver) index(e *Entity, name string, raw RawIndex, fresh []string) *
 		r.errorf("%s: project must be all, keys, or a list of fields", where)
 	}
 	ix.Where = r.preds(e, where+" where", raw.Where)
+	if m := raw.Matches; m != nil {
+		switch {
+		case len(raw.Where) == 0:
+			r.errorf("%s: matches is the share of items that satisfy where; this index has no where, so every item is in it", where)
+		case *m <= 0 || *m > 1:
+			r.errorf("%s: matches is a share of the entity's items: more than 0, at most 1 (0.01 is one in a hundred)", where)
+		default:
+			ix.Matches = *m
+		}
+	}
 	if !ix.ReturnsEntity() {
 		r.claimType(e.GoName+ix.GoName, where)
 	}

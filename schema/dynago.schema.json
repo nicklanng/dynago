@@ -555,6 +555,12 @@
         "where": {
           "$ref": "#/$defs/conditions"
         },
+        "matches": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "description": "The share of the entity's items that satisfy where (0.01 is one in a hundred), for sizing the index, its traffic and the writes that maintain it. Without it, every item is counted, as an upper bound."
+        },
         "doc": {
           "$ref": "#/$defs/doc"
         },

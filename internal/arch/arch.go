@@ -70,14 +70,16 @@ type Field struct {
 
 // Index is one index.
 type Index struct {
-	Name       string   `json:"name"`
-	Strategy   string   `json:"strategy"`
-	Why        string   `json:"why,omitempty"`
-	PK         string   `json:"pk"`
-	SK         string   `json:"sk,omitempty"`
-	Projection string   `json:"projection"`
-	Where      string   `json:"where,omitempty"`
-	ReadBy     []string `json:"readBy,omitempty"`
+	Name       string `json:"name"`
+	Strategy   string `json:"strategy"`
+	Why        string `json:"why,omitempty"`
+	PK         string `json:"pk"`
+	SK         string `json:"sk,omitempty"`
+	Projection string `json:"projection"`
+	Where      string `json:"where,omitempty"`
+	// Matches is the declared share of items its where matches (0: not declared).
+	Matches float64  `json:"matches,omitempty"`
+	ReadBy  []string `json:"readBy,omitempty"`
 }
 
 // Unique is one uniqueness constraint.
@@ -182,6 +184,7 @@ func Build(r *analysis.Result) *Snapshot {
 			}
 			if len(ix.Where) > 0 {
 				si.Where = schema.PredText(ix.Where, e.Name)
+				si.Matches = ix.Matches
 			}
 			for _, a := range e.Access {
 				if a.Index == ix {

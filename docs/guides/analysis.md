@@ -75,6 +75,33 @@ How the analysis treats partition key fields:
 | An enum | Divides the typical count by its values; the maximum stays (they could all share one) |
 | Anything else (`codeHash`, a free-text name, a time) | Unknown: nothing says how many items share a value |
 
+### Sparse indexes
+
+An index with a `where` holds only the items that match it, and the volumes say how many items
+there are, not how many match. Say what share does, on the index:
+
+```yaml
+Purge:
+  doc: Trashed threads by when they were trashed, for the job that empties the trash.
+  pk: "PURGE"
+  sk: "{trashedAt}#{userId}#{threadId}"
+  where: { mailbox: trash }
+  matches: 0.01          # about one thread in a hundred is in the trash
+  project: keys
+```
+
+The share sizes the index's partitions and storage, its part of each partition's traffic, and what
+the writes that maintain it cost: a write that doesn't say whether the item matches pays for the
+index entry in that share of its calls. What a write does say is used first. A `set` that makes
+the item match (`set: { mailbox: trash }`) always writes the entry, one that makes it stop matching
+only removes it, and a write whose `when` and `set` both rule the item out doesn't touch the index
+at all.
+
+Without `matches`, every item is counted. That is the most the index can hold, and the analysis
+says so wherever the number appears: "at most" beside the count in the partition table, a caveat on
+the reads through it, and in the `low-cardinality-key` finding. Such a partition is never the
+summary's largest or busiest; the summary names it beside the one it reports if it could be more.
+
 ### What a hot partition means
 
 DynamoDB serves each partition key value from one partition, up to 1,000 WRU and 3,000 RRU per

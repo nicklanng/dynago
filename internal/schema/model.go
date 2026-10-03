@@ -468,8 +468,11 @@ type Index struct {
 	Projection string
 	Project    []*Field
 	Where      []*Pred
-	Doc        string
-	GSI        *GSI
+	// Matches is the declared share of the entity's items that satisfy Where (0 < share <= 1), or
+	// 0 when the schema doesn't say: the analysis then counts every item, as an upper bound.
+	Matches float64
+	Doc     string
+	GSI     *GSI
 	// StrategyInferred is true when the schema left strategy out and dynago chose it from the
 	// freshness its reads need; StrategyReason says why.
 	StrategyInferred bool
@@ -497,6 +500,111 @@ func (ix *Index) ProjectedFields() []*Field {
 	for _, f := range ix.Entity.Fields {
 		if set[f] {
 			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// Share is the fraction of the entity's items counted in the index: the declared Matches, or all
+// of them.
+func (ix *Index) Share() float64 {
+	if ix.Matches > 0 {
+		return ix.Matches
+	}
+	return 1
+}
+
+// Unsized reports whether the index holds only some of the entity's items (it has a where) and
+// nothing says how many: its sizes and traffic are then upper bounds.
+func (ix *Index) Unsized() bool { return len(ix.Where) > 0 && ix.Matches == 0 }
+
+// Membership says whether an item is in a sparse index.
+type Membership int
+
+// Memberships.
+const (
+	// Maybe: nothing the write says decides it.
+	Maybe Membership = iota
+	Yes
+	No
+)
+
+// Members reports whether the item a write touches satisfies the index's where before the write
+// and after it, as far as the write itself says: its `when` fixes values before, its `set` fixes
+// values after. A create has no item before, a delete none after.
+func (ix *Index) Members(w *Write) (before, after Membership) {
+	if len(ix.Where) == 0 {
+		before, after = Yes, Yes
+	} else {
+		var b, a []Membership
+		for _, p := range ix.Where {
+			was := Maybe
+			for _, q := range w.When {
+				if q.Field == p.Field {
+					was = implies(q, p)
+				}
+			}
+			is := was
+			for _, f := range append(append([]*Field{}, w.Args...), w.Patch...) {
+				if f == p.Field {
+					is = Maybe
+				}
+			}
+			for _, s := range w.Sets {
+				if s.Field != p.Field {
+					continue
+				}
+				switch {
+				case s.Source != nil:
+					is = Maybe
+				case p.Matches(s.Value):
+					is = Yes
+				default:
+					is = No
+				}
+			}
+			b, a = append(b, was), append(a, is)
+		}
+		before, after = all(b), all(a)
+	}
+	switch w.Kind {
+	case WriteCreate:
+		before = No
+	case WriteDelete:
+		after = No
+	}
+	return before, after
+}
+
+// implies reports whether a field satisfying q satisfies p.
+func implies(q, p *Pred) Membership {
+	vs, ok := q.Allowed()
+	if !ok || p.Source != nil {
+		return Maybe
+	}
+	n := 0
+	for _, v := range vs {
+		if p.Matches(v) {
+			n++
+		}
+	}
+	switch n {
+	case len(vs):
+		return Yes
+	case 0:
+		return No
+	}
+	return Maybe
+}
+
+func all(ms []Membership) Membership {
+	out := Yes
+	for _, m := range ms {
+		switch m {
+		case No:
+			return No
+		case Maybe:
+			out = Maybe
 		}
 	}
 	return out

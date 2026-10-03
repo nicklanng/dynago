@@ -45,6 +45,12 @@ type Member struct {
 	// Grows is true when nothing ever removes these items: the partition grows as long as the
 	// table lives.
 	Grows bool
+	// Share is the fraction of the entity's items the family holds: 1, or a sparse index's
+	// declared share (matches), which Count and Weight already include.
+	Share float64
+	// Bound is true when Count and Weight are upper bounds: the entries of an index with a where
+	// and no declared share, counted as if every item matched.
+	Bound bool
 	// Owner is the schema object that declares the items, for findings.
 	Owner     schema.Subject
 	Partition *Partition
@@ -80,6 +86,17 @@ type Partition struct {
 	busiestWRU, busiestRRU map[*Member]float64
 }
 
+// Bound reports whether the partition's counts, size and traffic are upper bounds: it holds the
+// entries of a sparse index whose share of items isn't declared.
+func (p *Partition) Bound() bool {
+	for _, mb := range p.Members {
+		if mb.Bound {
+			return true
+		}
+	}
+	return false
+}
+
 // Space names where the partition lives: "base table" or "GSI Name".
 func (p *Partition) Space() string {
 	if p.Index == "" {
@@ -96,7 +113,8 @@ type ReadStats struct {
 	Pages Estimate
 	// Evaluated is, for a scan, every item in the base table, which its pages read through.
 	Evaluated Estimate
-	// Filtered is true when the index has a where, so fewer items qualify than counted.
+	// Filtered is true when the index has a where and no declared share (matches), so fewer
+	// items qualify than counted.
 	Filtered  bool
 	Partition *Partition
 }
@@ -132,6 +150,9 @@ func (a *analyzer) partitions() {
 			a.r.Partitions = append(a.r.Partitions, p)
 		}
 		mb.Partition = p
+		if mb.Share == 0 {
+			mb.Share = 1
+		}
 		p.Members = append(p.Members, mb)
 		a.r.targets[keyOf(mb.Target)] = mb
 	}
@@ -143,9 +164,13 @@ func (a *analyzer) partitions() {
 			Count: cnt, Weight: cnt, Size: er.Item, Grows: a.grows(e, nil, e.PK.Fields), Owner: entitySubject(e),
 		})
 		for _, ix := range e.Indexes {
+			// A sparse index holds the share of the items that match its where, if the schema
+			// says what that is; otherwise every item is counted, as the most it can hold.
 			cnt := a.perKey(e, ix.PK.Fields)
+			cnt.Typical *= ix.Share()
+			cnt.Max *= ix.Share()
 			mb := &Member{Label: e.Name + " " + ix.Name + " entry", Count: cnt, Weight: cnt, Size: er.Indexes[ix.Name],
-				Grows: a.grows(e, ix, ix.PK.Fields), Owner: indexSubject(ix)}
+				Grows: a.grows(e, ix, ix.PK.Fields), Owner: indexSubject(ix), Share: ix.Share(), Bound: ix.Unsized()}
 			if ix.Strategy == schema.StrategyGSI {
 				mb.Target = cost.Target{Kind: cost.TargetGSI, Entity: e, Index: ix}
 				add(ix.GSI.Name, ix.PK.Raw, ix.PK.Fields, 1, mb)
@@ -194,7 +219,7 @@ func (a *analyzer) summarise(p *Partition) {
 			if mb.Target.Kind == cost.TargetCounter {
 				n = e.Count / mb.Weight.Typical
 			} else {
-				n = e.Count / mb.Count.Typical
+				n = e.Count * mb.Share / mb.Count.Typical
 			}
 			if mb.Target.Kind == cost.TargetCounter && !mb.Weight.Known {
 				n = 0
@@ -536,7 +561,8 @@ func share(mb *Member) (float64, bool) {
 	if mb.Weight.MaxKnown {
 		w = mb.Weight.Max
 	}
-	return math.Min(1, math.Max(w, 1)/e.Count), true
+	// The writes and reads that reach the family at all are spread over its items.
+	return math.Min(1, math.Max(w, 1)/(e.Count*mb.Share)), true
 }
 
 // traffic estimates each partition's busiest key at peak from the declared rates.
@@ -676,7 +702,7 @@ func (a *analyzer) readStats() {
 				if mb := a.r.MemberOf(t); mb != nil {
 					st.Items, st.Partition = mb.Count, mb.Partition
 				}
-				st.Filtered = ac.Index != nil && len(ac.Index.Where) > 0
+				st.Filtered = ac.Index != nil && ac.Index.Unsized()
 			}
 			pages := func(n float64) float64 { return math.Max(1, math.Ceil(n/float64(ac.Page))) }
 			read := st.Items

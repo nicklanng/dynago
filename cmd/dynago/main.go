@@ -425,7 +425,11 @@ func check(path string, o options, w io.Writer) error {
 	for _, p := range result.Partitions {
 		var holds []string
 		for _, mb := range p.Members {
-			holds = append(holds, mb.Label+" "+estimate(mb.Count))
+			h := mb.Label + " " + estimate(mb.Count)
+			if mb.Bound && mb.Count.Known {
+				h += " at most (only those matching its where)"
+			}
+			holds = append(holds, h)
 		}
 		busy, risk := "-", "-"
 		if p.Rated {

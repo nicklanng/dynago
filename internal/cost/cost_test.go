@@ -49,9 +49,11 @@ func TestWriteCosts(t *testing.T) {
 	if s := find(r, "Tool", "Retire"); s.ReadFirst || s.RRU != 0 || s.MaxTxItems != 3 {
 		t.Errorf("Retire = %+v", s)
 	}
-	// Return moves the loan out of the copy index and hands the tool back.
+	// Return takes the loan out of the copy index (its when says the loan is in it, its set that
+	// it no longer matches: one delete, not a move) and hands the tool back.
 	ret := find(r, "Loan", "Return")
-	if !strings.Contains(strings.Join(ret.Items, ","), `Tool (sets its status to "available")`) || ret.MaxTxItems != 6 {
+	items = strings.Join(ret.Items, ",")
+	if !strings.Contains(items, `Tool (sets its status to "available")`) || !strings.Contains(items, "copy ByMember (removed)") || ret.MaxTxItems != 5 {
 		t.Errorf("Return = %+v", ret)
 	}
 	// Leave checks the member's loan counter: a condition check billed as a counter-sized write.

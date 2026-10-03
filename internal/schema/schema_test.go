@@ -165,6 +165,8 @@ func TestValidationErrors(t *testing.T) {
 		{"not of a value the enum lacks", "    indexes:\n      ByName: { pk: \"N#{name}\", project: keys, where: { status: { not: c } } }\n", `"c" is not one of`},
 		{"unknown condition form", "    writes:\n      W: { update: [name], when: { status: { neq: a } } }\n", `unknown form "neq"`},
 		{"two condition forms", "    writes:\n      W: { update: [name], when: { name: { not: x, in: [y, z] } } }\n", "want a value, { not: <value> } or { in: [<value>, ...] }"},
+		{"matches without where", "    indexes:\n      ByName: { pk: \"N#{name}\", project: keys, matches: 0.5 }\n", "this index has no where"},
+		{"matches over one", "    indexes:\n      ByName: { pk: \"N#{name}\", project: keys, where: { status: a }, matches: 5 }\n", "more than 0, at most 1"},
 		{"requires unknown counter value", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, when: { m: 0 } } } }\n", "m is not a value of counter C"},
 	}
 	for _, c := range cases {
