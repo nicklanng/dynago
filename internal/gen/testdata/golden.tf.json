@@ -7,6 +7,12 @@
     "table_2shop_table": {
       "description": "The table the current code uses (generation 1).",
       "value": "${aws_dynamodb_table.table_2shop_g1.name}"
+    },
+    "table_2shop_table_arns": {
+      "description": "Every table declared here: the current generation and the retained ones. Grant access to these and to their indexes (<arn>/index/*).",
+      "value": [
+        "${aws_dynamodb_table.table_2shop_g1.arn}"
+      ]
     }
   },
   "resource": {

@@ -388,9 +388,11 @@ func (a *analyzer) perKey(e *schema.Entity, fields []*schema.Field) Estimate {
 			break
 		}
 	}
+	// A declared spread beats one worked out up the parent chain: the chain's largest value is the
+	// most skewed step with every other step typical, a guess that `by` replaces with a statement.
 	for _, b := range e.Volume.By {
 		src := sources(b.Relation.Key)
-		if coversAll(in, src) && (!found || len(src) > len(covered)) {
+		if coversAll(in, src) && (!found || len(src) >= len(covered)) {
 			base = Estimate{Typical: b.Typical, Max: b.Max, Known: true, MaxKnown: b.Max > 0}
 			covered, found = src, true
 		}

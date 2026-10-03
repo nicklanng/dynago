@@ -304,6 +304,50 @@ func TestCopyDriftFanOut(t *testing.T) {
 	}
 }
 
+// A spread declared with `by` over a grandparent is what its partitions hold. Worked out up the
+// chain, an org's notes would peak at the busiest thing's 50 times the typical 10 things; the
+// schema says no org has more than 40.
+func TestDeclaredSpreadBeatsTheChain(t *testing.T) {
+	note := func(volume string) string {
+		return base + `  Note:
+    fields:
+      orgId: string
+      thingId: string
+      noteId: string
+      at: time
+    key: { pk: "ORG#{orgId}#T#{thingId}", sk: "NOTE#{noteId}" }
+    indexes:
+      Recent: { pk: "ORG#{orgId}#NOTES", sk: "{at}#{thingId}#{noteId}", project: keys }
+    access:
+      Latest: { query: Recent }
+    writes:
+      Add: create
+    volume: ` + volume + "\n"
+	}
+	recent := func(src string) Estimate {
+		t.Helper()
+		r := Analyze(parse(t, src), cost.DefaultPrices, nil)
+		for _, p := range r.Partitions {
+			if p.PK == "ORG#{orgId}#NOTES" {
+				return p.Members[0].Count
+			}
+		}
+		t.Fatalf("no partition for the Recent index")
+		return Estimate{}
+	}
+	if got := recent(note("{ per: Thing, typical: 0.2, max: 50 }")); got.Typical != 2 || got.Max != 500 {
+		t.Errorf("from the chain: %+v, want 2 typically and 500 at most", got)
+	}
+	if got := recent(note("{ per: Thing, typical: 0.2, max: 50, by: { Org: { typical: 2, max: 40 } } }")); got.Typical != 2 || got.Max != 40 {
+		t.Errorf("declared by Org: %+v, want 2 typically and 40 at most", got)
+	}
+	// Saying the parent's numbers twice is refused, not picked between.
+	_, err := schema.Parse([]byte(note("{ per: Thing, typical: 0.2, max: 50, by: { Thing: { typical: 1, max: 9 } } }")))
+	if err == nil || !strings.Contains(err.Error(), "the volume already counts per Thing") {
+		t.Errorf("by repeating per: %v", err)
+	}
+}
+
 // A busy partition key: every Thing write lands on its org's partition, and the counter keyed by
 // the org takes every write of the org's things.
 func TestHotPartition(t *testing.T) {
