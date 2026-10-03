@@ -486,8 +486,26 @@ func (d *doc) risks() {
 		d.p("")
 		d.p("| Rule | About | Finding | Reason |")
 		d.p("|---|---|---|---|")
+		// One row per acceptance: an entity's may cover several findings, for one reason.
+		var order []*schema.Acceptance
+		covered := map[*schema.Acceptance][]analysis.Finding{}
 		for _, f := range accepted {
-			d.p("| `%s` | %s | %s | %s |", f.Rule, analysis.SubjectText(f.Subject), escape(f.Message), escape(f.Accepted.Reason))
+			if covered[f.Accepted] == nil {
+				order = append(order, f.Accepted)
+			}
+			covered[f.Accepted] = append(covered[f.Accepted], f)
+		}
+		for _, acc := range order {
+			fs := covered[acc]
+			if len(fs) == 1 && fs[0].Subject == acc.Subject {
+				d.p("| `%s` | %s | %s | %s |", acc.Rule, analysis.SubjectText(acc.Subject), escape(fs[0].Message), escape(acc.Reason))
+				continue
+			}
+			msgs := make([]string, len(fs))
+			for i, f := range fs {
+				msgs[i] = "**" + analysis.SubjectText(f.Subject) + "** " + escape(f.Message)
+			}
+			d.p("| `%s` | %s | %s | %s |", acc.Rule, analysis.SubjectText(acc.Subject), strings.Join(msgs, "<br>"), escape(acc.Reason))
 		}
 		d.p("")
 	}

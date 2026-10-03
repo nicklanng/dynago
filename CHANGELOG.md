@@ -20,6 +20,10 @@ format, the generated code and the runtime API; the changelog says how to move.
   regenerating, rename the uses of the affected names in your code; the compiler finds them.
   Stored attribute names don't change.
 
+- An `accept` on an entity also covers the rule's findings about what the entity declares: its
+  fields, indexes, constraints, counters, reads and writes. An entity whose fields are all copies,
+  for one reason, states the reason once, and the model document lists it once. An acceptance on
+  the object itself takes precedence; one that matches nothing under the entity is still an error.
 - When a shape changes under the version the lock recorded, and the lock holds only a first design
   (generation 1, every entity at version 1), the error also says what to do if no table exists
   yet: delete the lock file and generate again. The schema-changes guide and getting-started say

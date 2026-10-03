@@ -418,6 +418,53 @@ func TestAcceptance(t *testing.T) {
 	}
 }
 
+// An acceptance on an entity covers the rule's findings about its fields (and whatever else it
+// declares), so a reason shared by all of them is given once. One on the field itself wins, and
+// an entity-wide acceptance with nothing under it to accept is still an error.
+func TestAcceptanceForAWholeEntity(t *testing.T) {
+	note := func(fieldAccept, entityAccept string) string {
+		return base + `  Note:
+    fields:
+      orgId: string
+      thingId: string
+      noteId: string
+      thingName: { type: string, copy_of: Thing.name` + fieldAccept + ` }
+      thingBody: { type: string, copy_of: Thing.body }
+    key: { pk: "ORG#{orgId}#T#{thingId}", sk: "NOTE#{noteId}" }
+    writes:
+      Add: create
+    volume: { per: Thing, typical: 5, max: 50 }
+` + entityAccept
+	}
+	reasons := func(r *Result) map[string]string {
+		out := map[string]string{}
+		for _, f := range r.Findings {
+			if f.Rule == "copy-drift" && f.Accepted != nil {
+				out[f.Subject.String()] = f.Accepted.Reason
+			}
+		}
+		return out
+	}
+	r := Analyze(parse(t, note("", "    accept: { copy-drift: \"one pass rewrites them\" }\n")), cost.DefaultPrices, nil)
+	if got := reasons(r); len(r.Open()) != 0 || got["Note.thingName"] != "one pass rewrites them" || got["Note.thingBody"] != "one pass rewrites them" {
+		t.Errorf("accepted on the entity: %v\n%s", got, dump(r))
+	}
+	r = Analyze(parse(t, note(", accept: { copy-drift: \"names never change\" }", "    accept: { copy-drift: \"one pass rewrites them\" }\n")), cost.DefaultPrices, nil)
+	if got := reasons(r); len(r.Open()) != 0 || got["Note.thingName"] != "names never change" || got["Note.thingBody"] != "one pass rewrites them" {
+		t.Errorf("the field's own acceptance wins: %v\n%s", got, dump(r))
+	}
+	r = Analyze(parse(t, note("", "    accept: { sparse-index: \"because\" }\n")), cost.DefaultPrices, nil)
+	if !has(r, "accept-invalid", Error, "Note", "neither entity Note nor anything it declares has a sparse-index finding") {
+		t.Errorf("nothing under the entity to accept:\n%s", dump(r))
+	}
+	// It doesn't reach another entity's findings.
+	r = Analyze(parse(t, strings.Replace(note("", ""), "    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n",
+		"    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n    accept: { copy-drift: \"because\" }\n", 1)), cost.DefaultPrices, nil)
+	if !has(r, "accept-invalid", Error, "Thing", "") || len(reasons(r)) != 0 {
+		t.Errorf("accepted on another entity:\n%s", dump(r))
+	}
+}
+
 func TestPolicy(t *testing.T) {
 	p, err := ParsePolicy([]byte(`
 fail_on: warning

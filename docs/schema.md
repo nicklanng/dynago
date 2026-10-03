@@ -102,7 +102,7 @@ entities:
 | `access` | no | | The reads the store offers. See [Access patterns](#access). |
 | `writes` | no | | The writes the store offers. See [Writes](#writes). |
 | `volume` | no | | How many items to expect: a total, or typical and max per parent. See [Volume](#volume). |
-| `accept` | no | | Findings about the entity recorded as deliberate. See [Accepting findings](#accept). |
+| `accept` | no | | Findings about the entity, or about anything it declares, recorded as deliberate. See [Accepting findings](#accept). |
 
 Every item also stores bookkeeping attributes: `_t` (entity name), `_v` (schema version it was
 written at), `_rev` (revision, used for optimistic concurrency), and `_created` and `_updated`
@@ -561,6 +561,9 @@ is listed with its reason in the model document and doesn't fail the build.
   or the assumption behind the estimate.
 - An acceptance must match a finding: naming an unknown rule, or a finding the object doesn't have
   (it was fixed, or moved), is an error, so acceptances don't outlive their reasons.
+- An acceptance on an entity also covers the rule's findings about everything the entity declares
+  (fields, indexes, constraints, counters, reads, writes), so a reason shared by six copied fields
+  is written once. One on the object itself takes precedence.
 - A policy can turn a rule off, or make it an error, for every schema at once. See
   [Analysis](guides/analysis.md) for every rule and the policy file.
 

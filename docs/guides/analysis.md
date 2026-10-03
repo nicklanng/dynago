@@ -191,8 +191,25 @@ indexes:
 ```
 
 The model document lists accepted findings with their reasons, so the decision is reviewed with
-the design. An acceptance covers every finding of its rule about its object, however many there are. Errors can't be accepted. An acceptance that no longer matches a finding is an error,
-so reasons don't outlive what they explained.
+the design. An acceptance covers every finding of its rule about its object, however many there
+are. Errors can't be accepted. An acceptance that no longer matches a finding is an error, so
+reasons don't outlive what they explained.
+
+One reason that holds for a whole entity is given once, on the entity: an acceptance there also
+covers the rule's findings about the entity's fields, indexes, constraints, counters, reads and
+writes. An entity whose fields are all copies of another's, kept up by one job, says so once:
+
+```yaml
+ThreadLabel:
+  accept:
+    copy-drift: "Rewritten after every thread write by one pass, which can be run again."
+  fields:
+    subject: { type: string, copy_of: Thread.subject }
+    snippet: { type: string, copy_of: Thread.snippet }
+```
+
+An acceptance on the object itself takes precedence over the entity's, and an entity's acceptance
+that nothing under the entity matches is an error like any other.
 
 ## Policy
 
