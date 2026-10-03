@@ -46,7 +46,11 @@ DynamoDB's own rules:
   before and after). **Transactions cost double** for every item in them, and a `requires` condition
   check on another item is billed as a transactional write of that item, even if it fails.
 - **Reads**: 1 RRU per started 4 KB, half for eventually consistent reads. A Query page costs the
-  total size of the items it reads, not their number.
+  total size of the items it reads, not their number. The estimate is a full page of the query's
+  items, or what its partition holds when the declared volumes say that is less (typically the
+  typical partition, at worst the largest): a `page` larger than the partition costs what the
+  partition holds, so a read sized to return a whole partition in one call isn't priced as if the
+  page were always full. Without volumes, a full page is assumed.
 - **GSI entries** cost a write on the index each time an entry is written, and two (a delete and a
   put) when its keys change. They are written by DynamoDB, outside any transaction.
 - **Storage** is item size plus 100 bytes of overhead per item, for items and index entries.

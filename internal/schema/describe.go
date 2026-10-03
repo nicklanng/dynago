@@ -107,6 +107,8 @@ func (rq *Require) Condition(source string) string {
 // Effect says what the write does to the required item, or "" if it only checks it.
 func (rq *Require) Effect(source string) string {
 	switch {
+	case rq.Counter != nil && rq.Consume:
+		return "deletes the counter item"
 	case rq.Ensure:
 		t := "creates the " + rq.Name + " if there is none"
 		var with []string

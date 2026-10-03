@@ -48,6 +48,9 @@ type Member struct {
 	// Share is the fraction of the entity's items the family holds: 1, or a sparse index's
 	// declared share (matches), which Count and Weight already include.
 	Share float64
+	// PerItem is how many of these items each of the entity's items has: 1, or the typical number
+	// of elements of the set an index is keyed by.
+	PerItem float64
 	// Bound is true when Count and Weight are upper bounds: the entries of an index with a where
 	// and no declared share, counted as if every item matched.
 	Bound bool
@@ -153,6 +156,9 @@ func (a *analyzer) partitions() {
 		if mb.Share == 0 {
 			mb.Share = 1
 		}
+		if mb.PerItem == 0 {
+			mb.PerItem = 1
+		}
 		p.Members = append(p.Members, mb)
 		a.r.targets[keyOf(mb.Target)] = mb
 	}
@@ -171,6 +177,9 @@ func (a *analyzer) partitions() {
 			cnt.Max *= ix.Share()
 			mb := &Member{Label: e.Name + " " + ix.Name + " entry", Count: cnt, Weight: cnt, Size: er.Indexes[ix.Name],
 				Grows: a.grows(e, ix, ix.PK.Fields), Owner: indexSubject(ix), Share: ix.Share(), Bound: ix.Unsized()}
+			if ix.Set != nil {
+				mb.PerItem = cost.SetElements(ix.Set)
+			}
 			if ix.Strategy == schema.StrategyGSI {
 				mb.Target = cost.Target{Kind: cost.TargetGSI, Entity: e, Index: ix}
 				add(ix.GSI.Name, ix.PK.Raw, ix.PK.Fields, 1, mb)
@@ -192,20 +201,69 @@ func (a *analyzer) partitions() {
 			if c.Shards > 1 {
 				pk += fmt.Sprintf("#S{0..%d}", c.Shards-1)
 			}
-			count := exactly(1)
-			if extra := minus(c.SK.Fields, c.PK.Fields); len(extra) > 0 {
-				count = Estimate{} // one counter item per value of the sort key's own fields
-			}
+			count := a.counterItems(e, c)
 			w := a.perKey(e, c.KeyFields())
-			add("", pk, c.PK.Fields, c.Shards, &Member{
+			mb := &Member{
 				Target: cost.Target{Kind: cost.TargetCounter, Entity: e, Counter: c}, Label: "counter " + c.Name,
 				Count: count, Weight: w, Size: cost.CounterSize(c), Owner: counterSubject(c),
-			})
+			}
+			if c.Set != nil {
+				mb.PerItem = cost.SetElements(c.Set)
+			}
+			add("", pk, c.PK.Fields, c.Shards, mb)
 		}
 	}
 	for _, p := range a.r.Partitions {
 		a.summarise(p)
 	}
+}
+
+// counterItems estimates how many items of a counter share one partition key: one, unless its
+// sort key has fields of its own. Then there is an item for each value of those fields: at most
+// the product of their values, when they are enums and bools; as many as the entity they refer to
+// has under that partition key, when the counter's key is that entity's key (a counter item per
+// label has as many items under a user as the user has labels); otherwise unknown.
+func (a *analyzer) counterItems(e *schema.Entity, c *schema.Counter) Estimate {
+	own := c.ItemFields()
+	if len(own) == 0 {
+		return exactly(1)
+	}
+	values := 1.0
+	for _, f := range own {
+		switch f.Type {
+		case schema.TypeEnum:
+			values *= float64(len(f.Enum))
+		case schema.TypeBool:
+			values *= 2
+		default:
+			values = 0
+		}
+	}
+	if values > 0 {
+		return exactly(values)
+	}
+	for _, rel := range a.m.Relations {
+		src := sources(rel.Key)
+		if rel.From != e || len(src) != len(c.KeyFields()) || !coversAll(fieldSet(c.KeyFields()), src) {
+			continue
+		}
+		var under []*schema.Field
+		for _, k := range rel.Key {
+			if slices.Contains(c.PK.Fields, k.Source) {
+				under = append(under, k.Target)
+			}
+		}
+		return a.perKey(rel.To, under)
+	}
+	return Estimate{}
+}
+
+func fieldSet(fs []*schema.Field) map[*schema.Field]bool {
+	in := map[*schema.Field]bool{}
+	for _, f := range fs {
+		in[f] = true
+	}
+	return in
 }
 
 // summarise totals a partition family's members.
@@ -217,9 +275,11 @@ func (a *analyzer) summarise(p *Partition) {
 		if mb.Count.Known && mb.Count.Typical > 0 && e.Count > 0 {
 			var n float64
 			if mb.Target.Kind == cost.TargetCounter {
-				n = e.Count / mb.Weight.Typical
+				// The entity's items over those each counter item counts are the counter's items,
+				// of which a partition holds Count.
+				n = e.Count * mb.PerItem / mb.Weight.Typical / mb.Count.Typical
 			} else {
-				n = e.Count * mb.Share / mb.Count.Typical
+				n = e.Count * mb.Share * mb.PerItem / mb.Count.Typical
 			}
 			if mb.Target.Kind == cost.TargetCounter && !mb.Weight.Known {
 				n = 0
@@ -430,6 +490,10 @@ func (a *analyzer) perKey(e *schema.Entity, fields []*schema.Field) Estimate {
 		base, covered, found = Estimate{}, src, true
 		if e.Count > 0 && rel.To.Count > 0 {
 			base = Estimate{Typical: e.Count / rel.To.Count, Known: true}
+			if set := rel.Set(); set != nil {
+				// Each item refers to as many as its set has elements.
+				base.Typical *= cost.SetElements(set)
+			}
 		}
 		if rel.OneToOne() {
 			base.Max, base.MaxKnown = 1, true
@@ -549,6 +613,75 @@ func (a *analyzer) setsOn(e *schema.Entity) []schema.SetConst {
 		}
 	}
 	return out
+}
+
+// limitReads lowers each query's estimate to what its partition holds. The cost report prices a
+// query as a full page of its items; a page larger than the partition reads the partition, so a
+// read sized to return a whole conversation in one call costs what the conversation holds.
+func (a *analyzer) limitReads() {
+	for _, er := range a.r.Cost.Entities {
+		for i := range er.Reads {
+			rc := &er.Reads[i]
+			a.r.Cost.Reprice(rc, a.limited(*rc).RRU)
+		}
+	}
+}
+
+// limited returns a read's cost with its capacity capped at its partition's contents: typically
+// at the typical partition, at worst at the largest. Unknown volumes leave the estimate as it is.
+func (a *analyzer) limited(rc cost.ReadCost) cost.ReadCost {
+	ac := rc.Access
+	if ac.Kind != schema.AccessQuery && !ac.All {
+		return rc
+	}
+	holds := a.readable(ac)
+	if len(holds) == 0 {
+		return rc
+	}
+	typical, largest := Estimate{Known: true}, Estimate{Known: true}
+	for _, mb := range holds {
+		typical.Typical += mb.Count.Typical * float64(mb.Size.P50)
+		typical.Known = typical.Known && mb.Count.Known
+		largest.Typical += mb.Count.Max * float64(mb.Size.P99)
+		largest.Known = largest.Known && mb.Count.MaxKnown
+	}
+	if typical.Known {
+		rc.RRU.P50 = math.Min(rc.RRU.P50, cost.ReadUnits(typical.Typical, ac.Consistent))
+	}
+	if largest.Known {
+		rc.RRU.P99 = math.Min(rc.RRU.P99, cost.ReadUnits(largest.Typical, ac.Consistent))
+	}
+	rc.RRU.P99 = math.Max(rc.RRU.P99, rc.RRU.P50)
+	return rc
+}
+
+// readable returns the families of items one call of a query can read: its entity's items or its
+// index's entries under one partition key; every family of the partition, for a partition read;
+// a counter's items, for a read of all of them.
+func (a *analyzer) readable(ac *schema.Access) []*Member {
+	e := ac.Entity
+	switch {
+	case ac.All:
+		if mb := a.r.MemberOf(cost.Target{Kind: cost.TargetCounter, Entity: ac.Counter.Entity, Counter: ac.Counter}); mb != nil {
+			return []*Member{mb}
+		}
+	case ac.Of != nil:
+		if mb := a.r.MemberOf(cost.Target{Kind: cost.TargetItem, Entity: e}); mb != nil {
+			return mb.Partition.Members
+		}
+	case ac.Index == nil:
+		if mb := a.r.MemberOf(cost.Target{Kind: cost.TargetItem, Entity: e}); mb != nil {
+			return []*Member{mb}
+		}
+	default:
+		// Whichever strategy the index has: comparing designs asks about the other one.
+		for _, kind := range []cost.TargetKind{cost.TargetGSI, cost.TargetCopy} {
+			if mb := a.r.MemberOf(cost.Target{Kind: kind, Entity: e, Index: ac.Index}); mb != nil {
+				return []*Member{mb}
+			}
+		}
+	}
+	return nil
 }
 
 // share is the fraction of an entity's traffic the busiest partition of a member takes: its

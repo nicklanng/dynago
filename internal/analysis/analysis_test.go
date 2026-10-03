@@ -441,6 +441,139 @@ func TestSparseIndexIsSizedByItsShare(t *testing.T) {
 	}
 }
 
+// An index and a counter keyed by a set's elements are sized once the schema says what the
+// elements are: a ref makes each one another entity's key, and volume.by gives how many items
+// have each. Without the spread, the items are spread evenly over that entity's; without the ref,
+// nothing is known.
+func TestSetKeyedPartitionsAreSizedThroughARef(t *testing.T) {
+	src := func(by string) string {
+		return strings.Replace(base, "    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n", `    indexes:
+      ByLabel: { pk: "ORG#{orgId}#L#{labels}", sk: "T#{thingId}", project: keys }
+    counters:
+      LabelCounts: { pk: "ORG#{orgId}", sk: "LCOUNT#{labels}", values: { n: count } }
+      KindCounts: { pk: "ORG#{orgId}", sk: "KCOUNT#{kind}", values: { n: count } }
+    access:
+      Labelled: { query: ByLabel }
+    writes:
+      Add: create
+    volume: { typical: 10, max: 1000`+by+` }
+  Label:
+    fields:
+      orgId: string
+      labelId: string
+    key: { pk: "ORG#{orgId}", sk: "LABEL#{labelId}" }
+    writes:
+      Add: create
+    volume: { typical: 6, max: 200 }
+`, 1) + ""
+	}
+	withField := func(s, ref string) string {
+		return strings.Replace(s, "      body: { type: string, size: 100 }\n", "      body: { type: string, size: 100 }\n      labels: { type: string_set, size: 40/100"+ref+" }\n", 1)
+	}
+	find := func(r *Result, pk, label string) (*Partition, *Member) {
+		t.Helper()
+		for _, p := range r.Partitions {
+			for _, mb := range p.Members {
+				if p.PK == pk && mb.Label == label {
+					return p, mb
+				}
+			}
+		}
+		t.Fatalf("no %s in %s", label, pk)
+		return nil, nil
+	}
+
+	// No ref: nothing says what the elements are.
+	r := Analyze(parse(t, withField(src(""), "")), cost.DefaultPrices, nil)
+	if _, mb := find(r, "ORG#{orgId}#L#{labels}", "Thing ByLabel copy"); mb.Count.Known {
+		t.Errorf("without a ref, things per label: %+v, want unknown", mb.Count)
+	}
+	if _, mb := find(r, "ORG#{orgId}", "counter LabelCounts"); mb.Count.Known {
+		t.Errorf("without a ref, label counters per org: %+v, want unknown", mb.Count)
+	}
+	// A counter item per value of an enum is as many items as the enum has values.
+	if _, mb := find(r, "ORG#{orgId}", "counter KindCounts"); mb.Count != exactly(2) {
+		t.Errorf("kind counters per org: %+v, want 2", mb.Count)
+	}
+
+	// The elements are Labels: 1,000 things with two labels each over 600 labels, spread evenly;
+	// and an org has as many label counters as labels.
+	r = Analyze(parse(t, withField(src(""), ", ref: Label")), cost.DefaultPrices, nil)
+	_, mb := find(r, "ORG#{orgId}#L#{labels}", "Thing ByLabel copy")
+	if !mb.Count.Known || math.Abs(mb.Count.Typical-1000*2/600.0) > 1e-9 || mb.Count.MaxKnown {
+		t.Errorf("with a ref, things per label: %+v, want 3.33 typically and no known largest", mb.Count)
+	}
+	if _, mb := find(r, "ORG#{orgId}", "counter LabelCounts"); mb.Count.Typical != 6 || mb.Count.Max != 200 {
+		t.Errorf("with a ref, label counters per org: %+v, want 6 typically and 200 at most", mb.Count)
+	}
+
+	// The declared spread: 3 things a label typically, 50 at most.
+	r = Analyze(parse(t, withField(src(", by: { Label: { typical: 3, max: 50, via: labels } }"), ", ref: Label")), cost.DefaultPrices, nil)
+	p, mb := find(r, "ORG#{orgId}#L#{labels}", "Thing ByLabel copy")
+	if mb.Count.Typical != 3 || mb.Count.Max != 50 || !p.Size.MaxKnown || len(p.Undeclared) != 0 {
+		t.Errorf("with the spread, things per label: %+v (size %+v, undeclared %v)", mb.Count, p.Size, p.Undeclared)
+	}
+	// 2,000 copies (two labels a thing) at 3 a label.
+	if math.Abs(p.Count.Typical-2000/3.0) > 1e-9 {
+		t.Errorf("label partitions: %v, want 667", p.Count.Typical)
+	}
+	if _, mb := find(r, "ORG#{orgId}", "counter LabelCounts"); mb.Weight.Typical != 3 || mb.Weight.Max != 50 {
+		t.Errorf("things counted by one label counter: %+v, want 3 typically and 50 at most", mb.Weight)
+	}
+	if st := r.Reads[r.Model.Entity("Thing").Access[0]]; st == nil || st.Items.Typical != 3 || st.Items.Max != 50 {
+		t.Errorf("the read through the index: %+v", st)
+	}
+	// A thing isn't counted per label: it has several.
+	_, err := schema.Parse([]byte(withField(strings.Replace(src(""), "volume: { typical: 10, max: 1000 }\n  Label:", "volume: { per: Label, typical: 10, max: 1000 }\n  Label:", 1), ", ref: Label")))
+	if err == nil || !strings.Contains(err.Error(), "a Thing holds several Label keys, in labels") {
+		t.Errorf("per through a set: %v", err)
+	}
+}
+
+// A Query reads what its partition holds, however large its page: one sized to return a whole
+// partition in a call is costed at the partition, not at a page that is never full. At worst the
+// page is what bounds it.
+func TestQueryCostIsWhatThePartitionHolds(t *testing.T) {
+	src := strings.Replace(base, "    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n", `    access:
+      List: { query: key, page: 500, max_page: 1000, rate: 4 }
+      Whole: { query: partition, of: [Org, Thing], page: 500, max_page: 1000, consistent: true }
+    writes:
+      Add: create
+    volume: { typical: 10, max: 1000 }
+`, 1)
+	m := parse(t, src)
+	full := cost.Analyze(m, cost.DefaultPrices)
+	r := Analyze(m, cost.DefaultPrices, nil)
+	read := func(rep *cost.Report, name string) cost.ReadCost {
+		t.Helper()
+		for _, rc := range rep.Entity(m.Entity("Thing")).Reads {
+			if rc.Access.Name == name {
+				return rc
+			}
+		}
+		t.Fatalf("no read %s", name)
+		return cost.ReadCost{}
+	}
+	// Ten things of about 230 bytes are one 4 KB unit, read eventually: half an RRU, where a full
+	// page of 500 would be many. The largest org's thousand things fill the page.
+	was, now := read(full, "List"), read(r.Cost, "List")
+	if now.RRU.P50 != 0.5 || was.RRU.P50 < 10 || now.RRU.P99 != was.RRU.P99 {
+		t.Errorf("List: %v RRU (a full page: %v), want 0.5 typically and the page at worst", now.RRU, was.RRU)
+	}
+	if now.Monthly >= was.Monthly/10 || r.Cost.MonthlyUSD >= full.MonthlyUSD {
+		t.Errorf("the monthly cost should follow: $%.2f a month (a full page: $%.2f); total $%.2f (was $%.2f)", now.Monthly, was.Monthly, r.Cost.MonthlyUSD, full.MonthlyUSD)
+	}
+	// A partition read is everything under the key: the org and its ten things, one unit.
+	if whole := read(r.Cost, "Whole"); whole.RRU.P50 != 1 {
+		t.Errorf("Whole: %v RRU, want 1 typically", whole.RRU)
+	}
+	// Without volumes nothing says the partition is smaller than a page.
+	bare := parse(t, strings.Replace(strings.Replace(src, "    volume: { typical: 10, max: 1000 }\n", "", 1), "    volume: 100\n", "", 1))
+	if got, want := Analyze(bare, cost.DefaultPrices, nil).Cost.Entity(bare.Entity("Thing")).Reads[0].RRU, cost.Analyze(bare, cost.DefaultPrices).Entity(bare.Entity("Thing")).Reads[0].RRU; got != want {
+		t.Errorf("without volumes: %v RRU, want the full page's %v", got, want)
+	}
+}
+
 // A busy partition key: every Thing write lands on its org's partition, and the counter keyed by
 // the org takes every write of the org's things.
 func TestHotPartition(t *testing.T) {

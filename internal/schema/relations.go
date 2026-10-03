@@ -98,7 +98,7 @@ func mapKey(e, target *Entity, via *Field) ([]RequireKey, string) {
 	if via != nil {
 		var candidates []*Field
 		for _, tf := range tks {
-			if sameType(via, tf) {
+			if refersTo(via, tf) {
 				candidates = append(candidates, tf)
 			}
 		}
@@ -182,6 +182,10 @@ func keyVia(e, target *Entity, via string) ([]RequireKey, string) {
 				picked = append(picked, key)
 			}
 		}
+		if len(picked) == 0 && len(choices) == 1 && slices.ContainsFunc(choices[0], func(k RequireKey) bool { return k.Source.Name == via }) {
+			// The only way there is, and via names a field of it: nothing to pick, but not wrong.
+			picked = choices
+		}
 		if len(picked) != 1 {
 			return nil, fmt.Sprintf("via: %s doesn't pick one way %s holds %s's key (%s)", via, e.Name, target.Name, ways(choices))
 		}
@@ -250,6 +254,26 @@ func HoldsKey(e, target *Entity) ([]*Field, bool) {
 		out[i] = k.Source
 	}
 	return out, true
+}
+
+// refersTo reports whether a ref field can hold values of the key field tf: a field of its type,
+// or a string_set whose elements are each one (a thread's labelIds, each a Label's labelId).
+func refersTo(via, tf *Field) bool {
+	return sameType(via, tf) || (via.Type == TypeStringSet && tf.Type == TypeString)
+}
+
+// Many reports whether each From item can refer to several To items: it holds their keys as the
+// elements of a set.
+func (r *Relation) Many() bool { return r.Set() != nil }
+
+// Set returns the string_set field whose elements each hold a To item's key field, or nil.
+func (r *Relation) Set() *Field {
+	for _, k := range r.Key {
+		if k.Source.Type == TypeStringSet && k.Target.Type != TypeStringSet {
+			return k.Source
+		}
+	}
+	return nil
 }
 
 func sameType(a, b *Field) bool {
@@ -386,6 +410,11 @@ func (r *resolver) volumes(m *Model) {
 			key, why := keyVia(e, p, raw.Via)
 			if why != "" {
 				r.errorf("%s: per %s: %s", where, p.Name, why)
+				continue
+			}
+			if rel := (&Relation{From: e, To: p, Key: key}); rel.Many() {
+				r.errorf("%s: per %s: a %s holds several %s keys, in %s, so its count isn't per %s. Count it per its parent, and give how many each %s has with by: { %s: { typical: ..., max: ... } }",
+					where, p.Name, e.Name, p.Name, rel.Set().Name, p.Name, p.Name, p.Name)
 				continue
 			}
 			v.Per = r.link(m, e, p, key)

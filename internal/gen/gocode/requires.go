@@ -59,7 +59,11 @@ func (g *gen) requireOps(w *schema.Write, recv, read string) {
 			}
 			kv := lowerFirst(rq.Name) + "Key"
 			g.p("%s := dynago.Key{PK: %s, SK: %s}", kv, tmplExprVals(c.Entity, c.PK, vals), tmplExprVals(c.Entity, c.SK, vals))
-			g.p("ops = append(ops, dynago.CheckOp(%s, dynago.CheckCounter(s.t, %s, []dynago.Cond{%s}), %s))", kv, kv, strings.Join(conds, ", "), rq.ErrName)
+			if rq.Consume {
+				g.p("ops = append(ops, dynago.DeleteOp(%s, dynago.ConsumeCounter(s.t, %s, []dynago.Cond{%s}), %s))", kv, kv, strings.Join(conds, ", "), rq.ErrName)
+			} else {
+				g.p("ops = append(ops, dynago.CheckOp(%s, dynago.CheckCounter(s.t, %s, []dynago.Cond{%s}), %s))", kv, kv, strings.Join(conds, ", "), rq.ErrName)
+			}
 		case rq.Writes():
 			n := lowerFirst(rq.Name)
 			g.p("%sOps, %sChange, err := s.%s(ctx, %s, %s)", n, n, requireFuncName(w, rq), addr(recv), read)

@@ -336,13 +336,17 @@ func (a *RawAccess) UnmarshalYAML(n *yaml.Node) error {
 
 // RawWrite declares a write. Short forms: `Create: create`, `Delete: delete`.
 type RawWrite struct {
-	Create   bool                `yaml:"create"`
-	Delete   bool                `yaml:"delete"`
-	Update   []string            `yaml:"update"`
-	Patch    []string            `yaml:"patch"`
-	Set      Ordered[any]        `yaml:"set"`
-	When     Ordered[any]        `yaml:"when"`
-	Requires Ordered[RawRequire] `yaml:"requires"`
+	Create bool         `yaml:"create"`
+	Delete bool         `yaml:"delete"`
+	Update []string     `yaml:"update"`
+	Patch  []string     `yaml:"patch"`
+	Set    Ordered[any] `yaml:"set"`
+	// AddTo and RemoveFrom change string_set fields by element: `arg` (the caller gives the
+	// elements) or one constant element.
+	AddTo      Ordered[string]     `yaml:"add_to"`
+	RemoveFrom Ordered[string]     `yaml:"remove_from"`
+	When       Ordered[any]        `yaml:"when"`
+	Requires   Ordered[RawRequire] `yaml:"requires"`
 	// Batch makes an update take several keys: the typical number per call.
 	Batch      any             `yaml:"batch"`
 	Versioned  string          `yaml:"versioned"`
@@ -378,7 +382,7 @@ func (w *RawWrite) UnmarshalYAML(n *yaml.Node) error {
 			if v != "true" {
 				return fmt.Errorf("line %d: %s: %s is not meaningful; leave the key out", n.Content[i].Line, k, v)
 			}
-		case "update", "patch":
+		case "update", "patch", "add_to", "remove_from":
 			w.isUpdate = true
 		case "set":
 			w.isUpdate = w.isUpdate || (!w.Create && !w.Delete)

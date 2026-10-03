@@ -59,6 +59,25 @@ format, the generated code and the runtime API; the changelog says how to move.
   yet: delete the lock file and generate again. The schema-changes guide and getting-started say
   when that is right.
 
+- A `string_set` field can declare `ref`: each element is that entity's key field. `volume.by` for
+  that entity then says how many items carry each element, which sizes the partitions of an index
+  or counter keyed by the set's elements; they were reported as unknown. Without `by`, the items
+  are spread evenly over the entity's items. A counter with sort key fields of its own is counted
+  too where the schema says how many items it has: one per enum value, or one per item of the
+  entity its key refers to.
+- Sets change by element: `AddLabel: { add_to: { labelIds: arg } }` and
+  `RemoveLabel: { remove_from: { labelIds: arg } }` add and remove elements without replacing the
+  set, so the caller no longer reads, edits and writes back under a version. Where nothing is
+  keyed by the set it is one atomic UpdateItem with no read; where copies and counters are keyed
+  by its elements, only those of the elements that change are written. Both work with `batch`,
+  which leaves alone an item already as asked. `dynago.Set` gained `AddElems` and `RemoveElems`,
+  and the runtime `AddToSet`, `RemoveFromSet` and `ErrNoChange`.
+- A `requires` on a counter can delete the counter item: `consume: true` removes it in the write's
+  transaction, provided every value reads zero. Deleting a label takes its counter item with it,
+  and is refused while anything is still counted under it. A requirement can also name a counter
+  keyed by a set's elements, by one element (`labelIds: labelId`), which was refused before. The
+  runtime gained `dynago.ConsumeCounter`.
+
 ### Changed
 
 - Go names keep the capitals of an initialism in the plural: a field `labelIds` generates
@@ -68,6 +87,11 @@ format, the generated code and the runtime API; the changelog says how to move.
 
 ### Fixed
 
+- A Query was costed as a full page of its items, whatever its partition holds. A read sized to
+  return a whole partition in one call (`page: 300` over a conversation of three messages) was
+  priced at sixty times what it reads, and a smaller `page` looked cheaper. The estimate is now
+  the lesser of a page and the partition's contents, typically and at worst, wherever the volumes
+  say what the partition holds. Estimated read costs of existing schemas can go down.
 - A sparse index (one with a `where`) was sized, and its writes priced, as if every item of the
   entity were in it, and reported as fact: it could be the model document's largest partition
   while holding a sliver of the items. Now a write's `when` and `set` decide what it does to the

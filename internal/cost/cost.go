@@ -203,6 +203,7 @@ func Analyze(m *schema.Model, p Prices) *Report {
 		"Capacity follows DynamoDB rules: 1 WRU per started 1 KB written, 1 RRU per started 4 KB read strongly (half for eventually consistent); transactions cost double, and a condition check on another item is billed as a transactional write of that item.",
 		"GSI and copy writes are counted as one index write per entry; an index key change is a delete plus a put.",
 		fmt.Sprintf("Prices: $%.3f per million WRU, $%.3f per million RRU, $%.2f per GB-month (on-demand).", p.WRUPerMillion, p.RRUPerMillion, p.GBMonth),
+		"A Query is costed at a page of its items, or at what its partition holds when the volumes say that is less: a page larger than the partition reads the partition.",
 		"Monthly figures use each access pattern's and write's declared average rate (rate:, per second); patterns without a rate are not costed.",
 		"Storage counts each entity's items, index entries and claims at its declared volume, plus 100 bytes of overhead per item. A scan reads the base table's items, copies and claims, without GSI entries or overhead; counter items aren't counted.",
 	)
@@ -460,7 +461,11 @@ func WriteCostOf(m *schema.Model, e *schema.Entity, w *schema.Write, readFirst b
 		switch {
 		case rq.Counter != nil:
 			// A condition check on another item is billed as a transactional write of that item.
-			write(Target{Kind: TargetCounter, Entity: rq.Counter.Entity, Counter: rq.Counter}, true, false, "check counter "+rq.Counter.Name, CounterSize(rq.Counter), once)
+			label := "check counter " + rq.Counter.Name
+			if rq.Consume {
+				label = "delete counter " + rq.Counter.Name + "'s item"
+			}
+			write(Target{Kind: TargetCounter, Entity: rq.Counter.Entity, Counter: rq.Counter}, !rq.Consume, false, label, CounterSize(rq.Counter), once)
 		case rq.Writes():
 			ter := EntitySizes(m, rq.Target)
 			tw := rq.TargetWrite()
@@ -541,6 +546,10 @@ func setElements(f *schema.Field) Count {
 	n := func(size int) int { return max(1, (size+setElementBytes-1)/setElementBytes) }
 	return Count{P50: n(f.SizeP50), P99: n(f.SizeP99), Spread: true}
 }
+
+// SetElements estimates how many elements a string set field holds, typically, from its declared
+// size.
+func SetElements(f *schema.Field) float64 { return float64(setElements(f).P50) }
 
 // derivedWrites records the index entries, copies, counters and claims a write of e changes. A
 // create or delete touches everything the entity has; an update only what its fields feed.
@@ -794,6 +803,28 @@ func templateSize(t schema.Template) Size {
 		}
 	}
 	return s
+}
+
+// ReadUnits is the read units of reading the given number of bytes in one request: at least one
+// unit's worth, as an empty Query costs too.
+func ReadUnits(bytes float64, consistent bool) float64 {
+	factor := 0.5
+	if consistent {
+		factor = 1
+	}
+	return math.Max(1, math.Ceil(bytes/4096)) * factor
+}
+
+// Reprice gives a read of the report another capacity estimate, and updates its monthly cost and
+// the report's total to match.
+func (r *Report) Reprice(rc *ReadCost, u Units) {
+	rc.RRU = u
+	monthly := 0.0
+	if rate := rc.Access.Rate; rate > 0 {
+		monthly = (u.P50 * rate * secondsPerMonth / 1e6) * r.Prices.RRUPerMillion
+	}
+	r.MonthlyUSD += monthly - rc.Monthly
+	rc.Monthly = monthly
 }
 
 // WRU is the write units of writing an item of the given size.

@@ -73,7 +73,14 @@ How the analysis treats partition key fields:
 | A key field of an ancestor (`libraryId` in `LIB#{libraryId}#DUE`) | The ancestor's share: items per library |
 | The key of an entity this one refers to (`memberId`, by name, `ref` or `requires`) | `volume.by` if declared; otherwise spread evenly, maximum unknown |
 | An enum | Divides the typical count by its values; the maximum stays (they could all share one) |
+| An element of a `string_set` that refers to an entity (`labelIds: { type: string_set, ref: Label }`) | `volume.by` for that entity if declared (threads per label); otherwise the items, times the set's typical number of elements, spread evenly over that entity's items, maximum unknown |
 | Anything else (`codeHash`, a free-text name, a time) | Unknown: nothing says how many items share a value |
+
+A counter with a sort key field of its own has an item for each value of it under one partition
+key. The analysis counts them when it can: the number of values, for enums and bools; and for a
+counter keyed like an entity the items refer to (a counter item per label, keyed by the user and
+an element of `labelIds`), as many as that entity has there (a user's labels). Otherwise the count
+is unknown, and so is the size of the partition they share.
 
 ### Sparse indexes
 
