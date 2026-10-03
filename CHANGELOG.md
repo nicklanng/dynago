@@ -12,14 +12,6 @@ format, the generated code and the runtime API; the changelog says how to move.
 - The generated Terraform has an output `<table>_table_arns`: every declared table's ARN (the current
   generation and the retained ones) under a name that doesn't change with the generation, so an IAM
   policy written against it follows the table through a migration.
-
-### Changed
-
-- Go names keep the capitals of an initialism in the plural: a field `labelIds` generates
-  `LabelIDs`, where it generated `LabelIds`, and likewise `imageUrls` → `ImageURLs`. After
-  regenerating, rename the uses of the affected names in your code; the compiler finds them.
-  Stored attribute names don't change.
-
 - A read of several entities that share a partition, in one Query:
   `Open: { query: partition, of: [Thread, Message, Attachment, Draft] }` returns a page of the
   partition with each kind in its own field (`ThreadOpen{Thread, Messages, Attachments, Drafts}`).
@@ -66,6 +58,13 @@ format, the generated code and the runtime API; the changelog says how to move.
   (generation 1, every entity at version 1), the error also says what to do if no table exists
   yet: delete the lock file and generate again. The schema-changes guide and getting-started say
   when that is right.
+
+### Changed
+
+- Go names keep the capitals of an initialism in the plural: a field `labelIds` generates
+  `LabelIDs`, where it generated `LabelIds`, and likewise `imageUrls` → `ImageURLs`. After
+  regenerating, rename the uses of the affected names in your code; the compiler finds them.
+  Stored attribute names don't change.
 
 ### Fixed
 
