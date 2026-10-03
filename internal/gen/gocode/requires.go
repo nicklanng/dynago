@@ -256,12 +256,16 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 		g.p("return []dynago.Op{dynago.DeleteOp(key, s.t.Delete(\"PK\", key.PK).Range(\"SK\", key.SK)%s, dynago.ErrStale)}, %s, nil", guard, ch)
 	} else {
 		g.p("after := before.clone()")
-		var changed []*schema.Field
+		var changed, checked []*schema.Field
 		for _, s := range rq.Sets {
-			g.p("after.%s = %s", s.Field.GoName, sourceValue(e, te, s.Field, s.Source, s.Value, "e"))
+			g.targetAssign(e, te, s)
 			changed = append(changed, s.Field)
+			if !s.IfSet {
+				// A patch either leaves the field as it was or gives it a value.
+				checked = append(checked, s.Field)
+			}
 		}
-		g.requiredChecks(te, changed, "after", "return nil, dynago.Change{}, err")
+		g.requiredChecks(te, checked, "after", "return nil, dynago.Change{}, err")
 		g.keyPartChecks(changed, func(f *schema.Field) string { return "after." + f.GoName }, "return nil, dynago.Change{}, err")
 		if te.HasDerived() {
 			ch = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(before, key%s), After: %sDerived(&after, key%s)}", tlo, limits, tlo, limits)
@@ -276,32 +280,85 @@ func (g *gen) requireFunc(w *schema.Write, rq *schema.Require) {
 	g.p("")
 }
 
-// targetSets emits after's changes and the matching sets list for a requirement's set.
+// targetAssign emits one change of a requirement to after, the target's state: an assignment, an
+// addition, or (patch) an assignment made only when the writing entity's field has a value.
+func (g *gen) targetAssign(e, te *schema.Entity, s schema.SetConst) {
+	v := sourceValue(e, te, s.Field, s.Source, s.Value, "e")
+	switch {
+	case s.Add && s.Source == nil && s.Value == int64(1):
+		g.p("after.%s++", s.Field.GoName)
+	case s.Add && s.Source == nil && s.Value == int64(-1):
+		g.p("after.%s--", s.Field.GoName)
+	case s.Add:
+		g.p("after.%s += %s", s.Field.GoName, v)
+	case s.IfSet:
+		g.p("if %s {", nonZeroCond(s.Source, "e."+s.Source.GoName))
+		g.p("after.%s = %s", s.Field.GoName, v)
+		g.p("}")
+	default:
+		g.p("after.%s = %s", s.Field.GoName, v)
+	}
+}
+
+// nonZeroCond returns a Go condition true when val, of f's type, holds a value.
+func nonZeroCond(f *schema.Field, val string) string {
+	switch f.Type {
+	case schema.TypeString, schema.TypeEnum:
+		return val + ` != ""`
+	case schema.TypeInt, schema.TypeFloat:
+		return val + " != 0"
+	case schema.TypeBool:
+		return val
+	case schema.TypeTime:
+		return "!" + val + ".IsZero()"
+	}
+	return "len(" + val + ") > 0"
+}
+
+// targetSets emits after's changes and the matching sets list for a requirement's changes, for the
+// update made without reading the target: what it doesn't change it doesn't know.
 func (g *gen) targetSets(e *schema.Entity, rq *schema.Require) {
 	te := rq.Target
+	var changed, checked []*schema.Field
 	for _, s := range rq.Sets {
-		g.p("after.%s = %s", s.Field.GoName, sourceValue(e, te, s.Field, s.Source, s.Value, "e"))
-	}
-	var changed []*schema.Field
-	for _, s := range rq.Sets {
+		g.targetAssign(e, te, s)
 		changed = append(changed, s.Field)
+		if !s.IfSet && !s.Add {
+			// The value before an addition isn't known here, and a patch leaves a field alone or
+			// gives it a value: neither can be checked for emptiness.
+			checked = append(checked, s.Field)
+		}
 	}
-	g.requiredChecks(te, changed, "after", "return nil, dynago.Change{}, err")
+	g.requiredChecks(te, checked, "after", "return nil, dynago.Change{}, err")
 	g.keyPartChecks(changed, func(f *schema.Field) string { return "after." + f.GoName }, "return nil, dynago.Change{}, err")
+	ttlSet := func(s schema.SetConst) {
+		if s.Field == te.TTL {
+			x := "after." + s.Field.GoName
+			g.p("sets = append(sets, dynago.Set{Attr: %q, Value: dynago.UnixTTL(%s), Remove: %s.IsZero()})", g.m.Table.TTLAttr, x, x)
+		}
+	}
 	g.p("sets := []dynago.Set{")
 	for _, s := range rq.Sets {
-		if s.Source == nil {
+		switch {
+		case s.IfSet:
+		case s.Add:
+			g.p("{Attr: %q, Value: %s, Add: true},", s.Field.Attr, sourceValue(e, te, s.Field, s.Source, s.Value, "e"))
+		case s.Source == nil:
 			g.p("%s,", constSetLit(te, s.Field, s.Value))
-		} else {
+		default:
 			g.p("%s,", setLit(s.Field, "after."+s.Field.GoName))
 		}
 	}
 	g.p("}")
 	for _, s := range rq.Sets {
-		if s.Field == te.TTL {
-			x := "after." + s.Field.GoName
-			g.p("sets = append(sets, dynago.Set{Attr: %q, Value: dynago.UnixTTL(%s), Remove: %s.IsZero()})", g.m.Table.TTLAttr, x, x)
+		if s.IfSet {
+			g.p("if %s {", nonZeroCond(s.Source, "e."+s.Source.GoName))
+			g.p("sets = append(sets, dynago.Set%s)", setLit(s.Field, "after."+s.Field.GoName))
+			ttlSet(s)
+			g.p("}")
+			continue
 		}
+		ttlSet(s)
 	}
 }
 

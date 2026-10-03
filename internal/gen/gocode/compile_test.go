@@ -62,6 +62,12 @@ var awkwardEntities = []struct {
 		"    key: { pk: \"T#{tenantId}\", sk: \"PART#{thingId}#{partId}\" }\n    writes:\n" +
 		"      Add: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, when: { name: { not: \"{label}\" }, note: { in: [a, b] } } } } }\n" +
 		"      Mark: { update: [label], requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, when: { note: { not: gone } }, set: { name: \"{label}\" } } } }\n", ""},
+	{"requires with add and patch of every type", "  Box:\n    fields:\n      tenantId: string\n      boxId: string\n      parts: int\n      weight: int\n      name: string\n      at: time\n      note: string\n" +
+		"    key: { pk: \"T#{tenantId}\", sk: \"BOX#{boxId}\" }\n    counters:\n      Weights: { pk: \"T#{tenantId}\", sk: \"WEIGHTS\", values: { total: { sum: weight } } }\n    writes:\n      Make: create\n" +
+		"  Part:\n    fields:\n      tenantId: string\n      boxId: string\n      partId: string\n      weight: int\n      seen: time\n      label: string\n" +
+		"    key: { pk: \"T#{tenantId}\", sk: \"PART#{boxId}#{partId}\" }\n    writes:\n" +
+		"      Add: { create: true, requires: { Box: { key: { tenantId: tenantId, boxId: boxId }, add: { parts: 1, weight: \"{weight}\" }, patch: { name: \"{label}\", at: \"{seen}\" } } } }\n" +
+		"      Drop: { delete: true, requires: { Box: { key: { tenantId: tenantId, boxId: boxId }, add: { parts: -1 }, when: { note: kept } } } }\n", ""},
 	{"entity named like another's store", "  ThingStore:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},
 	{"entities differing in initialism case", "  THING:\n    fields: { id: string }\n    key: { pk: \"U#{id}\", sk: \"U\" }\n", "collides"},
 	{"entity named Store", "  Store:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},

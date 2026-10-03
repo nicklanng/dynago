@@ -40,13 +40,37 @@ func (p *Pred) Text(source string) string {
 func SetText(sets []SetConst, source string) string {
 	var parts []string
 	for _, s := range sets {
-		v := ValueText(s.Value)
-		if s.Source != nil {
-			v = source + "." + s.Source.Name
+		if !s.Add {
+			parts = append(parts, s.Field.Name+" to "+s.valueText(source))
 		}
-		parts = append(parts, s.Field.Name+" to "+v)
 	}
 	return strings.Join(parts, " and ")
+}
+
+func (s SetConst) valueText(source string) string {
+	if s.Source == nil {
+		return ValueText(s.Value)
+	}
+	v := source + "." + s.Source.Name
+	if s.IfSet {
+		v += " (if that has a value)"
+	}
+	return v
+}
+
+// ChangeText renders everything a requirement changes on its item, completing "it ...":
+// `sets its status to "onLoan", and adds 1 to its loans`.
+func ChangeText(sets []SetConst, source string) string {
+	var parts []string
+	if t := SetText(sets, source); t != "" {
+		parts = append(parts, "sets its "+t)
+	}
+	for _, s := range sets {
+		if s.Add {
+			parts = append(parts, "adds "+s.valueText(source)+" to its "+s.Field.Name)
+		}
+	}
+	return strings.Join(parts, ", and ")
 }
 
 // ValueText renders a constant as it would appear in the schema.
@@ -80,7 +104,7 @@ func (rq *Require) Condition(source string) string {
 func (rq *Require) Effect(source string) string {
 	switch {
 	case len(rq.Sets) > 0:
-		return "sets its " + SetText(rq.Sets, source)
+		return ChangeText(rq.Sets, source)
 	case rq.Consume && rq.Optional:
 		return "deletes the " + rq.Name + " if there is one"
 	case rq.Consume:

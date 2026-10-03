@@ -1192,7 +1192,7 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 		if c.Shards > 1 {
 			r.errorf("%s: %s is sharded, so no single item holds its values to check", where, target)
 		}
-		if len(raw.Set) > 0 || raw.Optional || raw.Consume {
+		if len(raw.Set)+len(raw.Add)+len(raw.Patch) > 0 || raw.Optional || raw.Consume {
 			r.errorf("%s: a counter can only be checked with when (an absent value counts as 0)", where)
 		}
 	default:
@@ -1296,11 +1296,67 @@ func (r *resolver) require(e *Entity, w *Write, target string, raw RawRequire, b
 		}
 		req.Sets = append(req.Sets, SetConst{Field: f, Value: v})
 	}
+	// changes resolves the target field of an add or a patch, which may name each field once
+	// across set, add and patch.
+	changes := func(kind, name string) *Field {
+		f := te.Field(name)
+		switch {
+		case f == nil:
+			r.errorf("%s %s: %s is not a field of %s", where, kind, name, te.Name)
+			return nil
+		case f.Key:
+			r.errorf("%s %s: %s is part of %s's primary key and cannot be changed", where, kind, name, te.Name)
+			return nil
+		}
+		for _, s := range req.Sets {
+			if s.Field == f {
+				r.errorf("%s: %s is changed more than once across set, add and patch", where, name)
+				return nil
+			}
+		}
+		return f
+	}
+	for _, ad := range raw.Add {
+		f := changes("add", ad.Key)
+		if f == nil {
+			continue
+		}
+		if f.Type != TypeInt {
+			r.errorf("%s add: %s.%s is a %s; add applies to int fields", where, te.Name, ad.Key, f.Type)
+			continue
+		}
+		if ref, ok := fieldRef(ad.Value); ok {
+			if sf := r.source(e, where+" add "+ad.Key, ref, te, f); sf != nil {
+				req.Sets = append(req.Sets, SetConst{Field: f, Source: sf, Add: true})
+			}
+			continue
+		}
+		n, ok := ad.Value.(int)
+		if !ok || n == 0 {
+			r.errorf("%s add: %s: want a whole number other than 0 (negative to subtract), or \"{field}\" for an int field of %s", where, ad.Key, e.Name)
+			continue
+		}
+		req.Sets = append(req.Sets, SetConst{Field: f, Value: int64(n), Add: true})
+	}
+	for _, pt := range raw.Patch {
+		f := changes("patch", pt.Key)
+		if f == nil {
+			continue
+		}
+		ref, ok := fieldRef(pt.Value)
+		if !ok {
+			r.errorf("%s patch: %s: want \"{field}\", a field of %s: the %s's %s is set to it when it has a value, and left alone when it doesn't. A constant goes in set", where, pt.Key, e.Name, te.Name, pt.Key)
+			continue
+		}
+		if sf := r.source(e, where+" patch "+pt.Key, ref, te, f); sf != nil {
+			req.Sets = append(req.Sets, SetConst{Field: f, Source: sf, IfSet: true})
+		}
+	}
 	if req.Optional && len(req.When) == 0 && !req.Writes() {
 		r.errorf("%s: optional with no when, set or consume checks nothing", where)
 	}
 	if len(req.Sets) > 0 && req.Consume {
-		r.errorf("%s: set and consume are exclusive: the item is either changed or deleted", where)
+		r.errorf("%s: set, add and patch are exclusive with consume: the item is either changed or deleted", where)
 	}
 	if len(req.Sets) > 0 {
 		// The change to the target behaves like an update of it declared with this set and when.
@@ -1770,7 +1826,7 @@ func transitionable(e *Entity, w *Write, changed map[string]bool) bool {
 func CanGrow(w *Write, v *CounterValue, anyChange bool) bool {
 	for _, p := range v.Where {
 		for _, s := range w.Sets {
-			if s.Field == p.Field && !p.Matches(s.Value) {
+			if s.Field == p.Field && s.Fixes() && !p.Matches(s.Value) {
 				return false // the result never matches, so never contributes
 			}
 		}

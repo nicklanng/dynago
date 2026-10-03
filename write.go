@@ -264,6 +264,9 @@ type Set struct {
 	Remove bool
 	// StringSet stores Value as a DynamoDB string set rather than a list.
 	StringSet bool
+	// Add adds the number Value to the attribute (an absent one counts as 0) instead of replacing
+	// it: DynamoDB applies it atomically, so concurrent additions all count.
+	Add bool
 }
 
 // Cond is a precondition on one attribute: that it equals Value; with Not, that it differs from
@@ -343,6 +346,8 @@ func SetFields(u *dynamo.Update, sets []Set) {
 		switch {
 		case s.Remove:
 			u.Remove(Path(s.Attr))
+		case s.Add:
+			u.Add(Path(s.Attr), s.Value)
 		case s.StringSet:
 			u.SetSet(Path(s.Attr), s.Value)
 		default:

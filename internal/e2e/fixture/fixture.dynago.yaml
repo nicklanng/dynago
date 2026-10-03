@@ -59,6 +59,10 @@ entities:
       parcelId: string
       state: { type: enum, values: [received, shelved, out, returned, lost] }
       note: string
+      fragile: bool
+      damages: { type: int, doc: How many damage reports name the parcel. Listed with the parcels on site. }
+      disputes: int
+      lastDispute: string
     key:
       pk: "D#{depotId}"
       sk: "PARCEL#{parcelId}"
@@ -68,7 +72,7 @@ entities:
         pk: "D#{depotId}#ONSITE"
         sk: "P#{parcelId}"
         where: { state: { in: [received, shelved, returned] } }
-        project: [state]
+        project: [state, damages]
       Known:
         doc: Every parcel that isn't lost.
         pk: "KNOWN#{depotId}"
@@ -94,13 +98,17 @@ entities:
       Lose: { set: { state: lost }, when: { state: { not: lost } } }
       Annotate: { update: [note], when: { state: { not: lost } } }
 
-  # A damage report can only be filed against a parcel that is still on site.
+  # A damage report can only be filed against a parcel that is still on site. Filing one counts on
+  # the parcel (add) and marks it fragile if the report says so (patch), leaving the mark alone
+  # otherwise. The count is listed in the OnSite copy, so the parcel is read first; a dispute
+  # changes nothing derived, so its addition and patch go on one update without a read.
   Damage:
     fields:
       depotId: string
       parcelId: string
       damageId: string
       detail: string
+      fragile: bool
     key:
       pk: "D#{depotId}"
       sk: "DAMAGE#{parcelId}#{damageId}"
@@ -113,6 +121,8 @@ entities:
           Parcel:
             key: { depotId: depotId, parcelId: parcelId }
             when: { state: { in: [received, shelved, returned] } }
+            add: { damages: 1 }
+            patch: { fragile: "{fragile}" }
       Dispute:
         update: [detail]
         requires:
@@ -120,3 +130,5 @@ entities:
             key: { depotId: depotId, parcelId: parcelId }
             when: { state: { not: lost } }
             set: { note: disputed }
+            add: { disputes: 1 }
+            patch: { lastDispute: "{detail}" }

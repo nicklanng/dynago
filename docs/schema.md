@@ -457,9 +457,11 @@ write, and no crash can leave the write half done.
 |---|---|
 | `key` | Maps every key field of the target (for a counter, every field of its key templates) to the field of this entity holding its value. Types must match. |
 | `when` | Values the target must have ([predicates](#predicates)). For an entity, a value `"{field}"` means this entity's field: `memberId: "{memberId}"` requires the hold to be the borrower's. For a counter, integers; a missing value counts as 0, so `active: 0` also passes before anything was counted. |
-| `set` | Entities only. Changes the target in the same transaction: its revision, counters, claims, copies and index keys are maintained as by an update of it declared with this `set` and `when`. Values are constants or `"{field}"`. Not key fields; not a counter value whose limit the target's callers supply. |
+| `set` | Entities only. Changes the target in the same transaction: its revision, counters, claims, copies and index keys are maintained as by an update of it declared with this `set` and `when`. Values are constants or `"{field}"`. Not key fields; not a counter value whose limit the target's callers supply. The same holds for `add` and `patch`, and a field is changed by one of the three. |
+| `add` | Entities only. Adds to `int` fields of the target: `add: { messageCount: 1 }`. A whole number (negative to subtract) or `"{field}"`, an int field of this entity. Concurrent writes all count: the addition is DynamoDB's atomic `ADD` when the target isn't read, and guarded by the target's revision (and retried) when it is. |
+| `patch` | Entities only. Sets fields of the target from this entity's fields, each only when that field has a value: `patch: { hasAttachments: "{hasAttachments}" }` marks the thread when a message with attachments arrives, and leaves the mark alone when one without arrives. Use `set` to assign whatever the field holds, empty or not. |
 | `optional` | Entities only. The write goes ahead if the target is absent or has expired; `when` applies only to one that is there. |
-| `consume` | Entities only. Deletes the target in the same transaction, releasing what it contributed. Exclusive with `set`. |
+| `consume` | Entities only. Deletes the target in the same transaction, releasing what it contributed. Exclusive with `set`, `add` and `patch`. |
 
 The write fails with `Err<Entity><Write>Requires<Target>`, and writes nothing, unless the target
 meets the requirement: it exists (unless `optional`), has not expired, and meets `when`.

@@ -20,6 +20,11 @@ format, the generated code and the runtime API; the changelog says how to move.
   regenerating, rename the uses of the affected names in your code; the compiler finds them.
   Stored attribute names don't change.
 
+- A requirement can do more to its item than assign: `add: { messageCount: 1 }` adds to an int
+  field (atomically, so concurrent writes all count), and `patch: { hasAttachments:
+  "{hasAttachments}" }` sets a field from the writing entity's only when that has a value,
+  leaving it alone otherwise. Both maintain the item's counters, copies and index keys as `set`
+  does. The runtime's `dynago.Set` gained `Add`.
 - `matches` on an index with a `where`: the share of the entity's items that satisfy it. The
   analysis sizes the index's partitions, storage and traffic with it, and the writes that maintain
   it pay for the entry in that share of their calls.

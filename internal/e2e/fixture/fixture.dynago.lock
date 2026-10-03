@@ -110,7 +110,7 @@
         {
           "version": 1,
           "generation": 1,
-          "fingerprint": "ff5aca6f2bae45fc",
+          "fingerprint": "141fb3454ab8b50f",
           "shape": {
             "fields": [
               {
@@ -132,6 +132,11 @@
                 "name": "detail",
                 "attr": "detail",
                 "type": "string"
+              },
+              {
+                "name": "fragile",
+                "attr": "fragile",
+                "type": "bool"
               }
             ],
             "pk": "D#{depotId}",
@@ -145,7 +150,7 @@
         {
           "version": 1,
           "generation": 1,
-          "fingerprint": "89d4f150dc5c9732",
+          "fingerprint": "f77ccc26f0f449fc",
           "shape": {
             "fields": [
               {
@@ -174,6 +179,26 @@
                 "name": "note",
                 "attr": "note",
                 "type": "string"
+              },
+              {
+                "name": "fragile",
+                "attr": "fragile",
+                "type": "bool"
+              },
+              {
+                "name": "damages",
+                "attr": "damages",
+                "type": "int"
+              },
+              {
+                "name": "disputes",
+                "attr": "disputes",
+                "type": "int"
+              },
+              {
+                "name": "lastDispute",
+                "attr": "lastDispute",
+                "type": "string"
               }
             ],
             "pk": "D#{depotId}",
@@ -186,7 +211,8 @@
                 "sk": "P#{parcelId}",
                 "projection": "include",
                 "project": [
-                  "state"
+                  "state",
+                  "damages"
                 ],
                 "where": [
                   "state in [received shelved returned]"

@@ -481,6 +481,10 @@ type RawRequire struct {
 	When Ordered[any]    `yaml:"when"`
 	// Set changes the required item in the same transaction.
 	Set Ordered[any] `yaml:"set"`
+	// Add adds to int fields of the required item.
+	Add Ordered[any] `yaml:"add"`
+	// Patch sets fields of the required item from this entity's fields, where those have a value.
+	Patch Ordered[string] `yaml:"patch"`
 	// Optional lets the write go ahead when the item is absent (or expired); when only applies if
 	// it is there.
 	Optional bool `yaml:"optional"`

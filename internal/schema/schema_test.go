@@ -130,7 +130,7 @@ func TestValidationErrors(t *testing.T) {
 		{"flow comma", "      note: { type: string, doc: one, two }\n", "quote the value"},
 		{"update on a create", "    writes:\n      W: { create: true, update: [name] }\n", "declare exactly one of create, update or delete"},
 		{"set on a delete", "    writes:\n      W: { delete: true, set: { name: x } }\n", "set applies to creates and updates"},
-		{"requires set and consume", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, set: { name: x }, consume: true } } }\n", "set and consume are exclusive"},
+		{"requires set and consume", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, set: { name: x }, consume: true } } }\n", "exclusive with consume"},
 		{"requires that does nothing", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, optional: true } } }\n", "checks nothing"},
 		{"requires reference of another type", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, when: { count: \"{name}\" } } } }\n", "Thing.name is a string, but Thing.count is a int"},
 		{"requires reference to unknown field", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: thingId }, when: { name: \"{nope}\" } } } }\n", "nope is not a field of Thing"},
@@ -167,6 +167,13 @@ func TestValidationErrors(t *testing.T) {
 		{"two condition forms", "    writes:\n      W: { update: [name], when: { name: { not: x, in: [y, z] } } }\n", "want a value, { not: <value> } or { in: [<value>, ...] }"},
 		{"matches without where", "    indexes:\n      ByName: { pk: \"N#{name}\", project: keys, matches: 0.5 }\n", "this index has no where"},
 		{"matches over one", "    indexes:\n      ByName: { pk: \"N#{name}\", project: keys, where: { status: a }, matches: 5 }\n", "more than 0, at most 1"},
+		{"requires adds to a string", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, add: { name: 1 } } } }\n", "add applies to int fields"},
+		{"requires adds nothing", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, add: { count: 0 } } } }\n", "a whole number other than 0"},
+		{"requires adds a field of another type", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, add: { count: \"{name}\" } } } }\n", "Thing.name is a string, but Thing.count is a int"},
+		{"requires patches a constant", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, patch: { name: x } } } }\n", "A constant goes in set"},
+		{"requires changes a field twice", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, set: { count: 1 }, add: { count: 1 } } } }\n", "count is changed more than once"},
+		{"requires adds to a key field", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, patch: { thingId: \"{name}\" } } } }\n", "part of Thing's primary key"},
+		{"requires adds and consumes", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, add: { count: 1 }, consume: true } } }\n", "exclusive with consume"},
 		{"requires unknown counter value", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, when: { m: 0 } } } }\n", "m is not a value of counter C"},
 	}
 	for _, c := range cases {

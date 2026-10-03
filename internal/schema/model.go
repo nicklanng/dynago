@@ -555,7 +555,7 @@ func (ix *Index) Members(w *Write) (before, after Membership) {
 					continue
 				}
 				switch {
-				case s.Source != nil:
+				case !s.Fixes():
 					is = Maybe
 				case p.Matches(s.Value):
 					is = Yes
@@ -765,12 +765,20 @@ const (
 )
 
 // SetConst is a field set by a write to a constant Value, or, in a write's `requires`, to the
-// writing entity's Source field.
+// writing entity's Source field. A requirement can also add to the field (Add), or set it only
+// when the writer's field has a value (IfSet).
 type SetConst struct {
 	Field  *Field
 	Value  any
 	Source *Field
+	// Add adds the int Value (or Source) to the field instead of replacing it.
+	Add bool
+	// IfSet leaves the field as it is when Source holds its zero value.
+	IfSet bool
 }
+
+// Fixes reports whether the change gives the field a constant, known without reading anything.
+func (s SetConst) Fixes() bool { return s.Source == nil && !s.Add }
 
 // Write is a declared write.
 type Write struct {

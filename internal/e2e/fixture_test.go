@@ -177,3 +177,67 @@ func TestPredicatesNotAndIn(t *testing.T) {
 		t.Fatalf("a refused dispute changed the report: %+v, %v", d, err)
 	}
 }
+
+// A requirement can add to a number on its item and set a field only when the writer has a value
+// for it. Filing a damage report counts on the parcel, which is read first because the count is
+// listed in a copy; disputing one changes nothing derived, so its addition is an atomic ADD on an
+// update made without reading the parcel. Either way, concurrent writes all count.
+func TestRequiresAddAndPatch(t *testing.T) {
+	t.Parallel()
+	db, n := testdb.CountingDB(t)
+	st := fixture.New(db, testdb.Table(t, db, fixture.TableSpec))
+	pk := fixture.ParcelKey{DepotID: "d1", ParcelID: "p1"}
+	must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d1", ParcelID: "p1"}))
+	parcel := func() *fixture.Parcel {
+		t.Helper()
+		p, err := st.Parcels.Get(ctx, pk)
+		must(t, err)
+		return p
+	}
+	file := func(id string, fragile bool) error {
+		return st.Damages.File(ctx, &fixture.Damage{DepotID: "d1", ParcelID: "p1", DamageID: id, Detail: "dented", Fragile: fragile})
+	}
+
+	must(t, file("a", false))
+	if p := parcel(); p.Damages != 1 || p.Fragile {
+		t.Fatalf("after one report: %+v", p)
+	}
+	must(t, file("b", true))
+	must(t, file("c", false)) // says nothing about fragility: the mark stays
+	if p := parcel(); p.Damages != 3 || !p.Fragile {
+		t.Fatalf("after three reports, one of a fragile parcel: %+v", p)
+	}
+	// The copy that lists the count is kept in the same transaction.
+	list, _, err := st.Parcels.OnSite(ctx, fixture.ParcelOnSiteQuery{DepotID: "d1"}, dynago.Page{})
+	must(t, err)
+	if len(list) != 1 || list[0].Damages != 3 {
+		t.Fatalf("the on-site list shows %+v, want one parcel with 3 damages", list)
+	}
+
+	dispute := func(id, detail string) error {
+		return st.Damages.Dispute(ctx, fixture.DamageKey{DepotID: "d1", ParcelID: "p1", DamageID: id}, fixture.DamageDispute{Detail: detail})
+	}
+	reads := n.Reads()
+	must(t, dispute("a", "was dented on arrival"))
+	if r := n.Reads() - reads; r != 0 {
+		t.Fatalf("a dispute made %d reads, want none: its changes are known from the call", r)
+	}
+	must(t, dispute("b", "")) // no detail: the last one given stays
+	if p := parcel(); p.Disputes != 2 || p.LastDispute != "was dented on arrival" || p.Note != "disputed" || p.Damages != 3 {
+		t.Fatalf("after two disputes: %+v", p)
+	}
+
+	// Concurrent writes: every addition counts, whichever path makes it.
+	const each = 6
+	errs := make(chan error, 2*each)
+	for i := range each {
+		go func() { errs <- file(fmt.Sprint("x", i), false) }()
+		go func() { errs <- dispute("c", fmt.Sprint("again ", i)) }()
+	}
+	for range 2 * each {
+		must(t, <-errs)
+	}
+	if p := parcel(); p.Damages != 3+each || p.Disputes != 2+each {
+		t.Fatalf("after %d concurrent reports and disputes: %d damages and %d disputes, want %d and %d", each, p.Damages, p.Disputes, 3+each, 2+each)
+	}
+}

@@ -47,8 +47,8 @@ What the generated code enforces on every write, so no bug or race elsewhere can
 - **Account**
   - HandOver requires the Account to exist with status = "pending", and sets its status to "active", in one transaction. *(Account.HandOver)*
 - **Damage**
-  - File requires the Parcel to exist with state in ["received", "shelved", "returned"], in one transaction. *(Damage.File)*
-  - Dispute requires the Parcel to exist with state != "lost", and sets its note to "disputed", in one transaction. *(Damage.Dispute)*
+  - File requires the Parcel to exist with state in ["received", "shelved", "returned"], and sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages, in one transaction. *(Damage.File)*
+  - Dispute requires the Parcel to exist with state != "lost", and sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes, in one transaction. *(Damage.Dispute)*
 
 ### Lifecycles
 
@@ -124,8 +124,8 @@ Every write the code can make, and everything each changes. Each is atomic: all 
 | `Parcel.SendOut` | Sets `state` = "out" | the Parcel exists; state in ["received", "shelved"] | Parcel<br>copy OnSite (removed)<br>counter DepotParcels | yes | transaction, 3 items | 6 | — |
 | `Parcel.Lose` | Sets `state` = "lost" | the Parcel exists; state != "lost" | Parcel<br>copy OnSite (removed)<br>GSI Known entry (removed)<br>counter DepotParcels | yes | transaction, 3 items | 7 | — |
 | `Parcel.Annotate` | Sets `note` | the Parcel exists; state != "lost" | Parcel | no | single item | 1 | — |
-| `Damage.File` | Creates a Damage | no Damage at the key; the Parcel exists with state in ["received", "shelved", "returned"] | Damage<br>check Parcel | no | transaction, 2 items | 4 | — |
-| `Damage.Dispute` | Sets `detail`, sets the Parcel's note to "disputed" | the Damage exists; the Parcel exists with state != "lost" | Damage<br>Parcel (sets its note to "disputed") | no (read-free) | transaction, 2 items | 4 | — |
+| `Damage.File` | Creates a Damage, sets the Parcel's fragile to Damage.fragile (if that has a value), and adds 1 to its damages | no Damage at the key; the Parcel exists with state in ["received", "shelved", "returned"] | Damage<br>Parcel (sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages)<br>Parcel's copy OnSite | no | transaction, 3 items | 6 | — |
+| `Damage.Dispute` | Sets `detail`, sets the Parcel's note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes | the Damage exists; the Parcel exists with state != "lost" | Damage<br>Parcel (sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes) | no (read-free) | transaction, 2 items | 4 | — |
 
 ## Storage and partitions
 
@@ -143,7 +143,7 @@ A GSI is maintained by DynamoDB a moment after each write: writes stay cheap, an
 
 | Index | Kind | Keys | Projection | Read by | Why this kind | The other kind |
 |---|---|---|---|---|---|---|
-| `Parcel.OnSite` | copy | `D#{depotId}#ONSITE` / `P#{parcelId}`; only when `state in ["received", "shelved", "returned"]` | `state` plus key fields | OnSite | chosen: OnSite needs immediate freshness | As a GSI: Parcel.Receive 7 → 6 WRU (3 → 2 items); Parcel.Shelve 6 → 5 WRU (3 → 2 items); Parcel.SendOut 6 → 5 WRU (3 → 2 items); Parcel.Lose 7 → 6 WRU (3 → 2 items); OnSite would lose immediate freshness. |
+| `Parcel.OnSite` | copy | `D#{depotId}#ONSITE` / `P#{parcelId}`; only when `state in ["received", "shelved", "returned"]` | `state`, `damages` plus key fields | OnSite | chosen: OnSite needs immediate freshness | As a GSI: Parcel.Receive 7 → 6 WRU (3 → 2 items); Parcel.Shelve 6 → 5 WRU (3 → 2 items); Parcel.SendOut 6 → 5 WRU (3 → 2 items); Parcel.Lose 7 → 6 WRU (3 → 2 items); Damage.File 6 → 5 WRU (3 → 2 items); OnSite would lose immediate freshness. |
 | `Parcel.Known` | GSI `Known` | `KNOWN#{depotId}` / `P#{parcelId}`; only when `state != "lost"` | key fields only | Known | chosen: no read through it needs immediate freshness | As a copy: Parcel.Receive 7 → 8 WRU (3 → 4 items); Parcel.Lose 7 → 8 WRU (3 → 4 items); reads could see writes immediately. |
 
 ### Partition map
@@ -207,8 +207,8 @@ Unknown counts: nothing declares how many items share a value of `tenantId` in `
 | Entity | Expected items | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
 |---|---|---|---|---|---|
 | Account | not declared | 277 B / 543 B | 0.00 GB | $0.00 | $0.00 |
-| Parcel | not declared | 302 B / 612 B | 0.00 GB | $0.00 | $0.00 |
-| Damage | not declared | 278 B / 588 B | 0.00 GB | $0.00 | $0.00 |
+| Parcel | not declared | 372 B / 732 B | 0.00 GB | $0.00 | $0.00 |
+| Damage | not declared | 286 B / 596 B | 0.00 GB | $0.00 | $0.00 |
 
 Estimated total: **$0.00/month** for the declared volumes and rates.
 
@@ -349,6 +349,10 @@ Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB
 | `parcelId` | string | `parcelId` | 20 / 64 B | key |
 | `state` | enum: received, shelved, out, returned, lost | `state` | 8 / 8 B |  |
 | `note` | string | `note` | 20 / 64 B |  |
+| `fragile` | bool | `fragile` | 1 / 1 B |  |
+| `damages` | int | `damages` | 8 / 11 B | How many damage reports name the parcel. Listed with the parcels on site. |
+| `disputes` | int | `disputes` | 8 / 11 B |  |
+| `lastDispute` | string | `lastDispute` | 20 / 64 B |  |
 
 #### Stored items
 
@@ -356,14 +360,14 @@ Every item that exists because of a Parcel, and what keeps it up to date.
 
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
-| **Parcel** | `D#{depotId}` | `PARCEL#{parcelId}` | `D#{depotId}`<br>`PARCEL#{parcelId}` | 302 B / 612 B | the writes below |
-| Copy `OnSite` | `D#{depotId}#ONSITE` | `P#{parcelId}` | `D#{depotId}#ONSITE`<br>`P#{parcelId}` | 211 B / 387 B | the writes below, in the same transaction as the item. Only when `state in ["received", "shelved", "returned"]`. |
+| **Parcel** | `D#{depotId}` | `PARCEL#{parcelId}` | `D#{depotId}`<br>`PARCEL#{parcelId}` | 372 B / 732 B | the writes below |
+| Copy `OnSite` | `D#{depotId}#ONSITE` | `P#{parcelId}` | `D#{depotId}#ONSITE`<br>`P#{parcelId}` | 226 B / 405 B | the writes below, in the same transaction as the item. Only when `state in ["received", "shelved", "returned"]`. |
 | GSI `Known` entry | `KNOWN#{depotId}` | `P#{parcelId}` | `KNOWN#{depotId}`<br>`P#{parcelId}` | 182 B / 446 B | DynamoDB, from the item's `KnownPK`/`KnownSK` attributes (eventually consistent). Sparse: absent when a key field is empty. Only when `state != "lost"`. |
 | Counter `DepotParcels` | `D#{depotId}` | `COUNTS` | `D#{depotId}`<br>`COUNTS` | ~149 B | the writes below, with atomic ADDs in the same transaction. |
 
 #### Indexes
 
-- **OnSite** (copy items written in the same transaction as the entity, readable strongly consistently; chosen because OnSite needs immediate freshness). The parcels physically in the depot. Projection: `state` plus key fields.
+- **OnSite** (copy items written in the same transaction as the entity, readable strongly consistently; chosen because OnSite needs immediate freshness). The parcels physically in the depot. Projection: `state`, `damages` plus key fields.
 - **Known** (global secondary index, maintained by DynamoDB, eventually consistent; chosen because no read through it needs immediate freshness). Every parcel that isn't lost. Projection: key fields only.
 
 #### Counters
@@ -401,7 +405,7 @@ flowchart LR
   w_File(["File"])
   w_File --> item_Damage
   other_Parcel["Parcel item"]
-  w_File -. checks .-> other_Parcel
+  w_File -. checks and changes .-> other_Parcel
   w_Dispute(["Dispute"])
   w_Dispute --> item_Damage
   other_Parcel["Parcel item"]
@@ -420,6 +424,7 @@ Writes on the left, reads on the right. Dotted arrows are maintained by DynamoDB
 | `parcelId` | string | `parcelId` | 20 / 64 B | key |
 | `damageId` | string | `damageId` | 20 / 64 B | key |
 | `detail` | string | `detail` | 20 / 64 B |  |
+| `fragile` | bool | `fragile` | 1 / 1 B |  |
 
 #### Stored items
 
@@ -427,7 +432,7 @@ Every item that exists because of a Damage, and what keeps it up to date.
 
 | Item | Partition key | Sort key | Example | Size p50/p99 | Maintained by |
 |---|---|---|---|---|---|
-| **Damage** | `D#{depotId}` | `DAMAGE#{parcelId}#{damageId}` | `D#{depotId}`<br>`DAMAGE#{parcelId}#{damageId}` | 278 B / 588 B | the writes below |
+| **Damage** | `D#{depotId}` | `DAMAGE#{parcelId}#{damageId}` | `D#{depotId}`<br>`DAMAGE#{parcelId}#{damageId}` | 286 B / 596 B | the writes below |
 
 #### Access patterns
 
@@ -439,8 +444,8 @@ Every item that exists because of a Damage, and what keeps it up to date.
 
 | Method | Does | Items written | Reads first | Atomic | Version check | WRU per call p50/p99 | Fails with |
 |---|---|---|---|---|---|---|---|
-| `File` | create (fails if it exists); requires the Parcel to exist with state in ["received", "shelved", "returned"] | Damage<br>check Parcel | no | transaction (2 items) | — | 4 | `ErrDamageExists`<br>`ErrDamageFileRequiresParcel` |
-| `Dispute` | set `detail`; requires the Parcel to exist with state != "lost" and sets its note to "disputed" | Damage<br>Parcel (sets its note to "disputed") | no: read-free (reads only if the item is not in the assumed state) | transaction (2 items) | optional | 4 | `ErrDamageNotFound`<br>`ErrDamageDisputeRequiresParcel`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
+| `File` | create (fails if it exists); requires the Parcel to exist with state in ["received", "shelved", "returned"] and sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages | Damage<br>Parcel (sets its fragile to Damage.fragile (if that has a value), and adds 1 to its damages)<br>Parcel's copy OnSite | no | transaction (3 items) | — | 6 | `ErrDamageExists`<br>`ErrDamageFileRequiresParcel` |
+| `Dispute` | set `detail`; requires the Parcel to exist with state != "lost" and sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes | Damage<br>Parcel (sets its note to "disputed" and lastDispute to Damage.detail (if that has a value), and adds 1 to its disputes) | no: read-free (reads only if the item is not in the assumed state) | transaction (2 items) | optional | 4 | `ErrDamageNotFound`<br>`ErrDamageDisputeRequiresParcel`<br>`dynago.ErrVersionMismatch` (with a version)<br>`dynago.ErrConflict` (after retries) |
 
 ## How to read this
 

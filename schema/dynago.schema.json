@@ -1037,6 +1037,40 @@
           "$ref": "#/$defs/predicates",
           "description": "Changes the required entity in the same transaction, maintaining its counters, indexes, claims and copies. Values are constants or \"{field}\" of this entity."
         },
+        "add": {
+          "type": "object",
+          "description": "Adds to int fields of the required entity in the same transaction: a whole number (negative to subtract) or \"{field}\", an int field of this entity.",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/camelName"
+          },
+          "additionalProperties": {
+            "oneOf": [
+              {
+                "type": "integer",
+                "not": {
+                  "const": 0
+                }
+              },
+              {
+                "type": "string",
+                "pattern": "^\\{[a-z][A-Za-z0-9]*\\}$"
+              }
+            ]
+          }
+        },
+        "patch": {
+          "type": "object",
+          "description": "Sets fields of the required entity from this entity's fields (\"{field}\"), each only when that field has a value: an empty one leaves the required entity's field as it is.",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/camelName"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^\\{[a-z][A-Za-z0-9]*\\}$"
+          }
+        },
         "optional": {
           "type": "boolean",
           "default": false,
