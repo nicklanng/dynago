@@ -69,6 +69,11 @@ func (o Op) run(ctx context.Context) error {
 // transaction), several run as one TransactWriteItems. A failed condition is reported as the
 // error registered for the op that failed.
 func Run(ctx context.Context, db *dynamo.DB, ops []Op) error {
+	for _, op := range ops {
+		if err := op.key.Valid(); err != nil {
+			return err
+		}
+	}
 	switch {
 	case len(ops) == 0:
 		return nil
@@ -284,6 +289,9 @@ type Guard struct {
 // index keys, so no read is needed. Besides the Guard's errors it returns precondition if a Cond
 // fails.
 func UpdateFields(ctx context.Context, t dynamo.Table, key Key, sets []Set, when []Cond, g Guard, precondition error) (int64, error) {
+	if err := key.Valid(); err != nil {
+		return 0, err
+	}
 	u := t.Update(AttrPK, key.PK).Range(AttrSK, key.SK)
 	SetFields(u, sets)
 	now := Now()
@@ -461,6 +469,9 @@ func CondUpdate(u *dynamo.Update, c Cond) {
 // DeleteIfExists deletes an item that has no derived items, returning the Guard's errors if it is
 // absent, expired or at another revision.
 func DeleteIfExists(ctx context.Context, t dynamo.Table, key Key, g Guard) error {
+	if err := key.Valid(); err != nil {
+		return err
+	}
 	now := Now()
 	d := t.Delete(AttrPK, key.PK).Range(AttrSK, key.SK).If("attribute_exists($)", AttrPK)
 	if g.TTLAttr != "" {

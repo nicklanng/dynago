@@ -18,6 +18,9 @@ import (
 // GetOne reads one item into out. It reports found=false rather than an error when the item
 // does not exist.
 func GetOne(ctx context.Context, t dynamo.Table, key Key, consistent bool, out any) (found bool, err error) {
+	if err := key.Valid(); err != nil {
+		return false, err
+	}
 	err = t.Get(AttrPK, key.PK).Range(AttrSK, dynamo.Equal, key.SK).Consistent(consistent).One(ctx, out)
 	if errors.Is(err, dynamo.ErrNotFound) {
 		return false, nil
@@ -33,6 +36,9 @@ func GetMany(ctx context.Context, t dynamo.Table, keys []Key, consistent bool, o
 	}
 	ks := make([]dynamo.Keyed, len(keys))
 	for i, k := range keys {
+		if err := k.Valid(); err != nil {
+			return err
+		}
 		ks[i] = dynamo.Keys{k.PK, k.SK}
 	}
 	err := t.Batch(AttrPK, AttrSK).Get(ks...).Consistent(consistent).All(ctx, out)
@@ -71,6 +77,9 @@ type QuerySpec struct {
 // Query runs exactly one Query request for one page and appends the items to out, which must be
 // a pointer to a slice. It returns the cursor for the next page, or "" when there are no more.
 func Query(ctx context.Context, t dynamo.Table, spec QuerySpec, page Page, out any) (string, error) {
+	if err := (Key{PK: spec.PK}).Valid(); err != nil {
+		return "", err
+	}
 	q := t.Get(spec.PKAttr, spec.PK)
 	if spec.Index != "" {
 		q.Index(spec.Index)

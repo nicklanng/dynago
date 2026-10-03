@@ -92,6 +92,33 @@ type Key struct {
 	SK string
 }
 
+// DynamoDB's limits on key values, in bytes of UTF-8.
+const (
+	MaxPartitionKey = 2048
+	MaxSortKey      = 1024
+)
+
+// Valid returns ErrInvalidKey if DynamoDB would refuse the key for its length. Templates are
+// short, so this only happens when a field's value is far longer than a key part should be.
+func (k Key) Valid() error {
+	switch {
+	case len(k.PK) > MaxPartitionKey:
+		return fmt.Errorf("%w: the partition key is %d bytes, over DynamoDB's limit of %d: a field in it is too long (it starts %q)", ErrInvalidKey, len(k.PK), MaxPartitionKey, head(k.PK))
+	case len(k.SK) > MaxSortKey:
+		return fmt.Errorf("%w: the sort key is %d bytes, over DynamoDB's limit of %d: a field in it is too long (it starts %q)", ErrInvalidKey, len(k.SK), MaxSortKey, head(k.SK))
+	}
+	return nil
+}
+
+// head is the start of a key, enough to recognise which item it belongs to.
+func head(s string) string {
+	const n = 48
+	if len(s) <= n {
+		return s
+	}
+	return strings.ToValidUTF8(s[:n], "") + "…"
+}
+
 // Limit is a caller-supplied cap for a counter value declared with `limit: arg`. Build it with
 // Max or Unlimited: the zero Limit is "not given", which generated writes reject with
 // ErrLimitRequired, so a forgotten limit can never silently switch enforcement off.

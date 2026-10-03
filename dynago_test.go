@@ -291,3 +291,39 @@ func TestConflictKeys(t *testing.T) {
 		keys[k.SK] = true
 	}
 }
+
+// A key longer than DynamoDB allows is refused as an invalid key before any request is made,
+// by every read and write, rather than surfacing as the service's ValidationException.
+func TestOverlongKeysAreInvalid(t *testing.T) {
+	ctx := context.Background()
+	longPK := Key{PK: "USER#" + strings.Repeat("x", MaxPartitionKey), SK: "A"}
+	longSK := Key{PK: "USER#1", SK: "MSG#" + strings.Repeat("é", MaxSortKey/2)}
+	fits := Key{PK: strings.Repeat("x", MaxPartitionKey), SK: strings.Repeat("é", MaxSortKey/2)}
+	if err := fits.Valid(); err != nil {
+		t.Errorf("a key at the limits: %v", err)
+	}
+	for _, k := range []Key{longPK, longSK} {
+		if err := k.Valid(); !errors.Is(err, ErrInvalidKey) {
+			t.Errorf("Valid() = %v, want ErrInvalidKey", err)
+		}
+		var table dynamo.Table // never reached
+		if err := Run(ctx, nil, []Op{PutOp(k, nil, nil)}); !errors.Is(err, ErrInvalidKey) {
+			t.Errorf("Run = %v, want ErrInvalidKey", err)
+		}
+		if _, err := GetOne(ctx, table, k, true, nil); !errors.Is(err, ErrInvalidKey) {
+			t.Errorf("GetOne = %v, want ErrInvalidKey", err)
+		}
+		if err := GetMany(ctx, table, []Key{k}, true, nil); !errors.Is(err, ErrInvalidKey) {
+			t.Errorf("GetMany = %v, want ErrInvalidKey", err)
+		}
+		if _, err := UpdateFields(ctx, table, k, nil, nil, Guard{}, nil); !errors.Is(err, ErrInvalidKey) {
+			t.Errorf("UpdateFields = %v, want ErrInvalidKey", err)
+		}
+		if err := DeleteIfExists(ctx, table, k, Guard{}); !errors.Is(err, ErrInvalidKey) {
+			t.Errorf("DeleteIfExists = %v, want ErrInvalidKey", err)
+		}
+	}
+	if _, err := Query(ctx, dynamo.Table{}, QuerySpec{PK: longPK.PK}, Page{}, nil); !errors.Is(err, ErrInvalidKey) {
+		t.Errorf("Query = %v, want ErrInvalidKey", err)
+	}
+}

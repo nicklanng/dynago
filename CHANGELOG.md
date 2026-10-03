@@ -7,6 +7,24 @@ format, the generated code and the runtime API; the changelog says how to move.
 
 ## [Unreleased]
 
+### Added
+
+- The generated Terraform has an output `<table>_table_arns`: every declared table's ARN (the current
+  generation and the retained ones) under a name that doesn't change with the generation, so an IAM
+  policy written against it follows the table through a migration.
+
+### Fixed
+
+- A `volume.by` naming an entity further up the parent chain (a draft's spread `by: User`, where
+  drafts are counted per thread and threads per user) was ignored: the partitions keyed by that
+  entity were sized from the chain, whose largest value multiplies the most skewed step by the
+  typical others. The declared spread is now used. A `by` that names the volume's own `per` entity
+  is an error, since the volume's `typical` and `max` already say it.
+- A key longer than DynamoDB allows (2,048 bytes for a partition key, 1,024 for a sort key) is
+  refused with `dynago.ErrInvalidKey` by every read and write, before any request is made. It used
+  to come back as DynamoDB's `ValidationException`, which callers matching `ErrInvalidKey` for bad
+  input didn't catch. Index key attributes are not checked yet.
+
 ## [0.1.0] - 2026-09-30
 
 First release.

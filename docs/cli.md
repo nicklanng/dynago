@@ -21,7 +21,7 @@ configurable with [`output`](schema.md#output)):
 |---|---|
 | `<table>_dynago.go` | The typed store. See [Generated code](generated-code.md). |
 | `<table>.model.md` | The data model document: items, keys, indexes, access patterns, writes, costs, risks, diagrams. |
-| `<table>.tf.json` | Terraform (JSON syntax): a variable for the base name, an `aws_dynamodb_table` resource (`<base>-g<generation>`) with its GSIs, TTL, point-in-time recovery and deletion protection for the current table generation and each one in `retain`, and their ARNs. |
+| `<table>.tf.json` | Terraform (JSON syntax): a variable for the base name, an `aws_dynamodb_table` resource (`<base>-g<generation>`) with its GSIs, TTL, point-in-time recovery and deletion protection for the current table generation and each one in `retain`. Outputs: `<table>_table` (the current table's name), `<table>_g<n>_table_arn` per generation, and `<table>_table_arns` (all of them, under a name that doesn't change with the generation: write IAM policies against it, adding `/index/*` for the GSIs). |
 | `<table>.table.json` | The same keys and indexes as input for `aws dynamodb create-table --cli-input-json`, for local development. CreateTable can't set TTL or point-in-time recovery: enable TTL with `aws dynamodb update-time-to-live` (or `EnsureTable`). Production tables belong in the Terraform, which sets TTL, point-in-time recovery and deletion protection. |
 | `<table>.dynago.lock` | Each entity's storage shape per version, and each table generation. See [Schema changes](guides/schema-changes.md). |
 | `<migrate_cmd>/main.go` | With `output.migrate_cmd` set: the migration job's main package. See [Migrations](guides/migrations.md). |

@@ -74,7 +74,7 @@ And, from the runtime directly:
 
 | Error | When | Retried by the generated code? |
 |---|---|---|
-| `dynago.ErrInvalidKey` | A key field is empty, contains a separator character of its template, or the entity passed with `From` is a different item. | no |
+| `dynago.ErrInvalidKey` | A key field is empty, contains a separator character of its template, or makes the key longer than DynamoDB allows (2,048 bytes for a partition key, 1,024 for a sort key); or the entity passed with `From` is a different item. | no |
 | `dynago.ErrFieldRequired` | A write left a `required: true` field at its zero value. | no |
 | `dynago.ErrLimitRequired` | A write that takes a `limit: arg` value was not given one. Pass `dynago.Max(n)`, or `dynago.Unlimited()` deliberately. | no |
 | `dynago.ErrInvalidCursor` | A page cursor is malformed, came from another query, partition or range, from before a change to how the query is keyed, or fails its signature. | no |

@@ -197,6 +197,19 @@ func keyVia(e, target *Entity, via string) ([]RequireKey, string) {
 	return nil, fmt.Sprintf("%s holds %s's key more than one way (%s); say which with via", e.Name, target.Name, ways(choices))
 }
 
+// sameSources reports whether two ways of holding a key use the same fields.
+func sameSources(a, b []RequireKey) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Source != b[i].Source || a[i].Target != b[i].Target {
+			return false
+		}
+	}
+	return true
+}
+
 // distinct returns the names of key's source fields that not every choice uses.
 func distinct(key []RequireKey, choices [][]RequireKey) []string {
 	var out []string
@@ -405,6 +418,10 @@ func (r *resolver) volumes(m *Model) {
 			key, why := keyVia(e, to, b.Value.Via)
 			if why != "" {
 				r.errorf("%s: %s", bw, why)
+				continue
+			}
+			if to == v.Per.To && sameSources(key, v.Per.Key) {
+				r.errorf("%s: the volume already counts per %s: its typical and max say how many each %s has", bw, to.Name, to.Name)
 				continue
 			}
 			if b.Value.Typical == nil {
