@@ -277,6 +277,7 @@ Assumptions:
 - Capacity follows DynamoDB rules: 1 WRU per started 1 KB written, 1 RRU per started 4 KB read strongly (half for eventually consistent); transactions cost double, and a condition check on another item is billed as a transactional write of that item.
 - GSI and copy writes are counted as one index write per entry; an index key change is a delete plus a put.
 - Prices: $0.625 per million WRU, $0.125 per million RRU, $0.25 per GB-month (on-demand).
+- A Query is costed at a page of its items, or at what its partition holds when the volumes say that is less: a page larger than the partition reads the partition.
 - Monthly figures use each access pattern's and write's declared average rate (rate:, per second); patterns without a rate are not costed.
 - Storage counts each entity's items, index entries and claims at its declared volume, plus 100 bytes of overhead per item. A scan reads the base table's items, copies and claims, without GSI entries or overhead; counter items aren't counted.
 

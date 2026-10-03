@@ -441,6 +441,50 @@ func TestSparseIndexIsSizedByItsShare(t *testing.T) {
 	}
 }
 
+// A Query reads what its partition holds, however large its page: one sized to return a whole
+// partition in a call is costed at the partition, not at a page that is never full. At worst the
+// page is what bounds it.
+func TestQueryCostIsWhatThePartitionHolds(t *testing.T) {
+	src := strings.Replace(base, "    writes:\n      Add: create\n    volume: { typical: 10, max: 1000 }\n", `    access:
+      List: { query: key, page: 500, max_page: 1000, rate: 4 }
+      Whole: { query: partition, of: [Org, Thing], page: 500, max_page: 1000, consistent: true }
+    writes:
+      Add: create
+    volume: { typical: 10, max: 1000 }
+`, 1)
+	m := parse(t, src)
+	full := cost.Analyze(m, cost.DefaultPrices)
+	r := Analyze(m, cost.DefaultPrices, nil)
+	read := func(rep *cost.Report, name string) cost.ReadCost {
+		t.Helper()
+		for _, rc := range rep.Entity(m.Entity("Thing")).Reads {
+			if rc.Access.Name == name {
+				return rc
+			}
+		}
+		t.Fatalf("no read %s", name)
+		return cost.ReadCost{}
+	}
+	// Ten things of about 230 bytes are one 4 KB unit, read eventually: half an RRU, where a full
+	// page of 500 would be many. The largest org's thousand things fill the page.
+	was, now := read(full, "List"), read(r.Cost, "List")
+	if now.RRU.P50 != 0.5 || was.RRU.P50 < 10 || now.RRU.P99 != was.RRU.P99 {
+		t.Errorf("List: %v RRU (a full page: %v), want 0.5 typically and the page at worst", now.RRU, was.RRU)
+	}
+	if now.Monthly >= was.Monthly/10 || r.Cost.MonthlyUSD >= full.MonthlyUSD {
+		t.Errorf("the monthly cost should follow: $%.2f a month (a full page: $%.2f); total $%.2f (was $%.2f)", now.Monthly, was.Monthly, r.Cost.MonthlyUSD, full.MonthlyUSD)
+	}
+	// A partition read is everything under the key: the org and its ten things, one unit.
+	if whole := read(r.Cost, "Whole"); whole.RRU.P50 != 1 {
+		t.Errorf("Whole: %v RRU, want 1 typically", whole.RRU)
+	}
+	// Without volumes nothing says the partition is smaller than a page.
+	bare := parse(t, strings.Replace(strings.Replace(src, "    volume: { typical: 10, max: 1000 }\n", "", 1), "    volume: 100\n", "", 1))
+	if got, want := Analyze(bare, cost.DefaultPrices, nil).Cost.Entity(bare.Entity("Thing")).Reads[0].RRU, cost.Analyze(bare, cost.DefaultPrices).Entity(bare.Entity("Thing")).Reads[0].RRU; got != want {
+		t.Errorf("without volumes: %v RRU, want the full page's %v", got, want)
+	}
+}
+
 // A busy partition key: every Thing write lands on its org's partition, and the counter keyed by
 // the org takes every write of the org's things.
 func TestHotPartition(t *testing.T) {

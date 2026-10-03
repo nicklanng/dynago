@@ -551,6 +551,75 @@ func (a *analyzer) setsOn(e *schema.Entity) []schema.SetConst {
 	return out
 }
 
+// limitReads lowers each query's estimate to what its partition holds. The cost report prices a
+// query as a full page of its items; a page larger than the partition reads the partition, so a
+// read sized to return a whole conversation in one call costs what the conversation holds.
+func (a *analyzer) limitReads() {
+	for _, er := range a.r.Cost.Entities {
+		for i := range er.Reads {
+			rc := &er.Reads[i]
+			a.r.Cost.Reprice(rc, a.limited(*rc).RRU)
+		}
+	}
+}
+
+// limited returns a read's cost with its capacity capped at its partition's contents: typically
+// at the typical partition, at worst at the largest. Unknown volumes leave the estimate as it is.
+func (a *analyzer) limited(rc cost.ReadCost) cost.ReadCost {
+	ac := rc.Access
+	if ac.Kind != schema.AccessQuery && !ac.All {
+		return rc
+	}
+	holds := a.readable(ac)
+	if len(holds) == 0 {
+		return rc
+	}
+	typical, largest := Estimate{Known: true}, Estimate{Known: true}
+	for _, mb := range holds {
+		typical.Typical += mb.Count.Typical * float64(mb.Size.P50)
+		typical.Known = typical.Known && mb.Count.Known
+		largest.Typical += mb.Count.Max * float64(mb.Size.P99)
+		largest.Known = largest.Known && mb.Count.MaxKnown
+	}
+	if typical.Known {
+		rc.RRU.P50 = math.Min(rc.RRU.P50, cost.ReadUnits(typical.Typical, ac.Consistent))
+	}
+	if largest.Known {
+		rc.RRU.P99 = math.Min(rc.RRU.P99, cost.ReadUnits(largest.Typical, ac.Consistent))
+	}
+	rc.RRU.P99 = math.Max(rc.RRU.P99, rc.RRU.P50)
+	return rc
+}
+
+// readable returns the families of items one call of a query can read: its entity's items or its
+// index's entries under one partition key; every family of the partition, for a partition read;
+// a counter's items, for a read of all of them.
+func (a *analyzer) readable(ac *schema.Access) []*Member {
+	e := ac.Entity
+	switch {
+	case ac.All:
+		if mb := a.r.MemberOf(cost.Target{Kind: cost.TargetCounter, Entity: ac.Counter.Entity, Counter: ac.Counter}); mb != nil {
+			return []*Member{mb}
+		}
+	case ac.Of != nil:
+		if mb := a.r.MemberOf(cost.Target{Kind: cost.TargetItem, Entity: e}); mb != nil {
+			return mb.Partition.Members
+		}
+	case ac.Index == nil:
+		if mb := a.r.MemberOf(cost.Target{Kind: cost.TargetItem, Entity: e}); mb != nil {
+			return []*Member{mb}
+		}
+	default:
+		// Whichever strategy the index has: comparing designs asks about the other one.
+		for _, kind := range []cost.TargetKind{cost.TargetGSI, cost.TargetCopy} {
+			if mb := a.r.MemberOf(cost.Target{Kind: kind, Entity: e, Index: ac.Index}); mb != nil {
+				return []*Member{mb}
+			}
+		}
+	}
+	return nil
+}
+
 // share is the fraction of an entity's traffic the busiest partition of a member takes: its
 // largest weight over the entity's items.
 func share(mb *Member) (float64, bool) {

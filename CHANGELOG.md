@@ -68,6 +68,11 @@ format, the generated code and the runtime API; the changelog says how to move.
 
 ### Fixed
 
+- A Query was costed as a full page of its items, whatever its partition holds. A read sized to
+  return a whole partition in one call (`page: 300` over a conversation of three messages) was
+  priced at sixty times what it reads, and a smaller `page` looked cheaper. The estimate is now
+  the lesser of a page and the partition's contents, typically and at worst, wherever the volumes
+  say what the partition holds. Estimated read costs of existing schemas can go down.
 - A sparse index (one with a `where`) was sized, and its writes priced, as if every item of the
   entity were in it, and reported as fact: it could be the model document's largest partition
   while holding a sliver of the items. Now a write's `when` and `set` decide what it does to the
