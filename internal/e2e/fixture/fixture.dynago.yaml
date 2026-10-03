@@ -86,8 +86,16 @@ entities:
         values:
           onSite: { count: true, where: { state: { in: [received, shelved, returned] } } }
           known: { count: true, where: { state: { not: lost } } }
+      StateCounts:
+        doc: One counter item for each state a depot's parcels are in, read together.
+        pk: "D#{depotId}"
+        sk: "STATE#{state}"
+        values:
+          parcels: count
     access:
       Get: get
+      GetSeveral: { get: key, batch: 10, freshness: immediate }
+      States: { counter: StateCounts, all: true, freshness: immediate }
       OnSite: { query: OnSite, freshness: immediate }
       Known: { query: Known }
       Counts: { counter: DepotParcels }
@@ -112,8 +120,16 @@ entities:
     key:
       pk: "D#{depotId}"
       sk: "DAMAGE#{parcelId}#{damageId}"
+    counters:
+      ParcelDamages:
+        doc: One counter item for each parcel with damage reports.
+        pk: "D#{depotId}"
+        sk: "DAMAGED#{parcelId}"
+        values:
+          reports: count
     access:
       Get: get
+      Damaged: { counter: ParcelDamages, all: true, page: 2, freshness: immediate }
     writes:
       File:
         create: true

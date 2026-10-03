@@ -327,3 +327,28 @@ func TestOverlongKeysAreInvalid(t *testing.T) {
 		t.Errorf("Query = %v, want ErrInvalidKey", err)
 	}
 }
+
+// A rendered key is read back into its placeholder values: the first occurrence of the literal
+// after a value ends it, which is exact because the value can't contain that literal's first
+// character.
+func TestSplitKey(t *testing.T) {
+	for _, c := range []struct {
+		key      string
+		literals []string
+		want     []string
+	}{
+		{"COUNTS#LABEL#work", []string{"COUNTS#LABEL#", ""}, []string{"work"}},
+		{"COUNTS#LABEL#", []string{"COUNTS#LABEL#", ""}, []string{""}},
+		{"C#a#b/c#d", []string{"C#", "#", ""}, []string{"a", "b/c#d"}},
+		{"C#a#K#b#END", []string{"C#", "#K#", "#END"}, []string{"a", "b"}},
+		{"a|b", []string{"", "|", ""}, []string{"a", "b"}},
+		{"OTHER#x", []string{"COUNTS#", ""}, nil},
+		{"C#a", []string{"C#", "#", ""}, nil},
+		{"C#a#K#b", []string{"C#", "#K#", "#END"}, nil},
+	} {
+		got, ok := SplitKey(c.key, c.literals...)
+		if ok != (c.want != nil) || strings.Join(got, "\x00") != strings.Join(c.want, "\x00") {
+			t.Errorf("SplitKey(%q, %q) = %q, %v; want %q", c.key, c.literals, got, ok, c.want)
+		}
+	}
+}

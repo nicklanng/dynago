@@ -34,6 +34,9 @@ var awkward = []struct {
 		"    counters:\n      Moods: { pk: \"M#{tenantId}\", sk: \"MOODS\", values: { happy: { count: true, where: { mood: { in: [calm, glad] }, rank: { not: 0 } } } } }\n" +
 		"    access:\n      Get: get\n      Live: { query: Live }\n      Kept: { query: Kept }\n", ""},
 	{"not and in as preconditions", "      W: { update: [name], when: { name: { not: \"x && y\" }, note: { in: [\"\", \"50% || 60%\"] } } }\n", ""},
+	{"batch get of an expiring entity, and counters read together", "      until: time\n      mood: { type: enum, values: [calm, cross] }\n    ttl: until\n" +
+		"    counters:\n      Moods: { pk: \"M#{tenantId}\", sk: \"MOOD#{mood}#N#{name}#END\", values: { key: count, things: count } }\n" +
+		"    access:\n      Several: { get: key, batch: 25 }\n      Moods: { counter: Moods, all: true, page: 10 }\n      Mood: { counter: Moods }\n", ""},
 	{"range query key field named from", "      from: string\n    indexes:\n      ByFrom: { pk: \"F#{from}\", sk: \"AT#{at}\", project: keys }\n    access:\n      L: { query: ByFrom, range: at }\n", "collides with the range bound"},
 }
 

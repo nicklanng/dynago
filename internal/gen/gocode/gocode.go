@@ -290,6 +290,7 @@ func (g *gen) entity(e *schema.Entity) {
 
 	g.views(e)
 	g.counters(e)
+	g.counterEntries(e)
 	g.limits(e)
 	if e.HasDerived() {
 		g.derived(e)
@@ -625,6 +626,14 @@ func (g *gen) derived(e *schema.Entity) {
 
 func (g *gen) access(a *schema.Access) {
 	e := a.Entity
+	switch {
+	case a.Kind == schema.AccessGet && a.Batch > 0:
+		g.getBatch(a)
+		return
+	case a.Kind == schema.AccessCounter && a.All:
+		g.counterAll(a)
+		return
+	}
 	switch a.Kind {
 	case schema.AccessGet:
 		g.docComment(a.GoName, a.Doc, fmt.Sprintf("reads %s %s by primary key with one %s GetItem.", article(e.Name), e.Name, consistency(a.Consistent)))
@@ -649,6 +658,152 @@ func (g *gen) access(a *schema.Access) {
 	case schema.AccessScan:
 		g.scan(a)
 	}
+}
+
+// getBatch emits a read of several items by their keys.
+func (g *gen) getBatch(a *schema.Access) {
+	e := a.Entity
+	lo := lowerFirst(e.GoName)
+	gone := "A key with no item is left out"
+	if e.TTL != nil {
+		gone = "A key with no item, or an expired one, is left out"
+	}
+	g.docComment(a.GoName, a.Doc, fmt.Sprintf("reads the %s with the given keys, with one %s BatchGetItem per 100 keys. %s, so the result can be shorter than keys; the others come back in the order of keys, and a key given twice is returned once.",
+		schema.Plural(e.Name), consistency(a.Consistent), gone))
+	g.p("func (s *%sStore) %s(ctx context.Context, keys []%sKey) ([]%s, error) {", e.GoName, a.GoName, e.GoName, e.GoName)
+	g.p("ks := make([]dynago.Key, len(keys))")
+	g.p("for i, k := range keys {")
+	g.p("key, err := k.dynamoKey()")
+	g.p("if err != nil {")
+	g.p("return nil, err")
+	g.p("}")
+	g.p("ks[i] = key")
+	g.p("}")
+	g.p("raws, err := dynago.GetBatch(ctx, s.t, ks, %t)", a.Consistent)
+	g.p("if err != nil {")
+	g.p("return nil, err")
+	g.p("}")
+	if e.TTL == nil {
+		g.p("return %sDecodeAll(raws)", lo)
+		g.p("}")
+		g.p("")
+		return
+	}
+	g.p("out := make([]%s, 0, len(raws))", e.GoName)
+	g.p("now := dynago.Now()")
+	g.p("for _, raw := range raws {")
+	g.p("it, err := %sDecode(raw)", lo)
+	g.p("if err != nil {")
+	g.p("return nil, err")
+	g.p("}")
+	g.p("// DynamoDB deletes expired items lazily, often hours later: treat them as gone.")
+	g.p("if !dynago.Expired(it.TTL, now) {")
+	g.p("out = append(out, it.%s)", e.GoName)
+	g.p("}")
+	g.p("}")
+	g.p("return out, nil")
+	g.p("}")
+	g.p("")
+}
+
+// counterEntries emits, once per counter read with all, the type pairing a counter item with the
+// key that identifies it.
+func (g *gen) counterEntries(e *schema.Entity) {
+	for _, c := range e.Counters {
+		used := false
+		for _, oe := range g.m.Entities {
+			for _, a := range oe.Access {
+				used = used || (a.Counter == c && a.All)
+			}
+		}
+		if !used {
+			continue
+		}
+		g.p("// %sEntry is one %s counter item, with the key that identifies it.", c.GoName, c.Name)
+		g.p("type %sEntry struct {", c.GoName)
+		g.p("Key %sKey", c.GoName)
+		g.p("%s", c.GoName)
+		g.p("}")
+		g.p("")
+	}
+}
+
+// counterAll emits a read of every item of a counter in one partition: a Query of the counter's
+// sort key prefix, with each item's key read back from its sort key.
+func (g *gen) counterAll(a *schema.Access) {
+	c := a.Counter
+	e := c.Entity // the counter's fields belong to the entity it counts
+	qt := a.Entity.GoName + a.GoName + "Query"
+	prefix := c.SK.LiteralPrefix()
+	g.p("// %s selects the partition for %s.%s.", qt, a.Entity.Name, a.Name)
+	g.p("type %s struct {", qt)
+	for _, f := range c.PK.Fields {
+		g.p("%s %s", f.GoName, goType(e, f))
+	}
+	g.p("}")
+	g.p("")
+	g.docComment(a.GoName, a.Doc, fmt.Sprintf("returns one page of the %s counters of a partition, one for each %s something has counted, in key order, with exactly one %s Query (default %d, max %d items). It returns the cursor for the next page, or \"\" at the end.",
+		c.Name, fieldList(c.ItemFields()), consistency(a.Consistent), a.Page, a.MaxPage))
+	g.p("func (s *%sStore) %s(ctx context.Context, q %s, page dynago.Page) ([]%sEntry, string, error) {", a.Entity.GoName, a.GoName, qt, c.GoName)
+	g.presenceGuard(c.PK.Fields, "q", fmt.Sprintf("return nil, \"\", fmt.Errorf(\"%%w: %s needs %s\", dynago.ErrInvalidKey)", a.Name, fieldList(c.PK.Fields)))
+	g.keyPartChecks(c.PK.Fields, func(f *schema.Field) string { return "q." + f.GoName }, "return nil, \"\", err")
+	g.p("pk := %s", tmplExpr(e, c.PK, "q"))
+	sum := sha256.Sum256([]byte(strings.Join([]string{c.Name, c.PK.Raw, c.SK.Raw}, "\x00")))
+	spec := []string{
+		fmt.Sprintf("Scope: %q + pk", fmt.Sprintf("%s.%s#%s\x00", a.Entity.Name, a.Name, hex.EncodeToString(sum[:4]))),
+		"PK: pk", `PKAttr: "PK"`, `SKAttr: "SK"`,
+		fmt.Sprintf("Prefix: %q", prefix),
+		fmt.Sprintf("PageSize: %d", a.Page),
+		fmt.Sprintf("MaxPage: %d", a.MaxPage),
+	}
+	if a.Consistent {
+		spec = append(spec, "Consistent: true")
+	}
+	g.p("var rows []struct {")
+	g.p("SK string `dynamo:\"SK\"`")
+	g.p("%s", c.GoName)
+	g.p("}")
+	g.p("next, err := dynago.Query(ctx, s.t, dynago.QuerySpec{%s}, page, &rows)", strings.Join(spec, ", "))
+	g.p("if err != nil {")
+	g.p("return nil, \"\", err")
+	g.p("}")
+	// The literal parts of the sort key, around its placeholders.
+	var literals []string
+	var placeholders []string
+	lit := ""
+	for _, sg := range c.SK.Segments {
+		if sg.IsField() {
+			literals = append(literals, strconv.Quote(lit))
+			placeholders = append(placeholders, sg.Field)
+			lit = ""
+			continue
+		}
+		lit += sg.Literal
+	}
+	literals = append(literals, strconv.Quote(lit))
+	var kv []string
+	for _, f := range c.PK.Fields {
+		kv = append(kv, fmt.Sprintf("%s: q.%s", f.GoName, f.GoName))
+	}
+	for _, f := range c.ItemFields() {
+		v := fmt.Sprintf("parts[%d]", slices.Index(placeholders, f.Name))
+		if f.Type == schema.TypeEnum {
+			v = goType(e, f) + "(" + v + ")"
+		}
+		kv = append(kv, fmt.Sprintf("%s: %s", f.GoName, v))
+	}
+	g.p("out := make([]%sEntry, 0, len(rows))", c.GoName)
+	g.p("for _, row := range rows {")
+	g.p("// A counter item stores no fields: its sort key says which one it is.")
+	g.p("parts, ok := dynago.SplitKey(row.SK, %s)", strings.Join(literals, ", "))
+	g.p("if !ok {")
+	g.p("return nil, \"\", fmt.Errorf(\"dynago: %s item with sort key %%q, which doesn't fit %s\", row.SK)", c.Name, strings.ReplaceAll(c.SK.Raw, "%", "%%"))
+	g.p("}")
+	g.p("out = append(out, %sEntry{Key: %sKey{%s}, %s: row.%s})", c.GoName, c.GoName, strings.Join(kv, ", "), c.GoName, c.GoName)
+	g.p("}")
+	g.p("return out, next, nil")
+	g.p("}")
+	g.p("")
 }
 
 func (g *gen) scan(a *schema.Access) {

@@ -174,6 +174,14 @@ func TestValidationErrors(t *testing.T) {
 		{"requires changes a field twice", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, set: { count: 1 }, add: { count: 1 } } } }\n", "count is changed more than once"},
 		{"requires adds to a key field", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, patch: { thingId: \"{name}\" } } } }\n", "part of Thing's primary key"},
 		{"requires adds and consumes", "    writes:\n      W: { create: true, requires: { Thing: { key: { tenantId: tenantId, thingId: name }, add: { count: 1 }, consume: true } } }\n", "exclusive with consume"},
+		{"batch on a query", "    access:\n      L: { query: key, batch: 5 }\n", "batch applies to get: key"},
+		{"batch without a number", "    access:\n      G: { get: key, batch: true }\n", "the typical number of keys a call reads"},
+		{"all on a get", "    access:\n      G: { get: key, all: true }\n", "all applies to a counter read"},
+		{"all of a counter with one item", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    access:\n      A: { counter: C, all: true }\n", "has one item per partition key"},
+		{"all of a sharded counter", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{name}\", shards: 2, values: { n: count } }\n    access:\n      A: { counter: C, all: true }\n", "is sharded"},
+		{"all of a counter keyed by a time", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{at}\", values: { n: count } }\n    access:\n      A: { counter: C, all: true }\n", "needs string or enum fields"},
+		{"all of a counter keyed by a lowered name", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{name|lower}\", values: { n: count } }\n    access:\n      A: { counter: C, all: true }\n", "can't be read back"},
+		{"all with a range", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{name}\", values: { n: count } }\n    access:\n      A: { counter: C, all: true, order: desc }\n", "takes page and max_page"},
 		{"requires unknown counter value", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, when: { m: 0 } } } }\n", "m is not a value of counter C"},
 	}
 	for _, c := range cases {

@@ -873,6 +873,14 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 		a.Page, a.MaxPage = r.pageSize(where, raw)
 	case raw.Get != nil && raw.Get.Key:
 		a.Kind = AccessGet
+		if raw.Batch != nil {
+			n, ok := raw.Batch.(int)
+			if !ok || n < 1 {
+				r.errorf("%s: batch is the typical number of keys a call reads (batch: 40), which the estimates use", where)
+			} else {
+				a.Batch = n
+			}
+		}
 	case raw.Get != nil:
 		a.Kind = AccessGetUnique
 		for _, u := range e.Uniques {
@@ -961,10 +969,23 @@ func (r *resolver) access(e *Entity, name string, raw RawAccess) *Access {
 			}
 		}
 	}
+	if raw.Batch != nil && a.Kind != AccessGet {
+		r.errorf("%s: batch applies to get: key (a read of several items by their keys)", where)
+	}
+	if raw.All {
+		if a.Kind != AccessCounter {
+			r.errorf("%s: all applies to a counter read: every item of the counter in one partition", where)
+		} else {
+			a.All = true
+			a.Page, a.MaxPage = r.pageSize(where, raw)
+		}
+	}
 	switch {
 	case a.Kind == AccessScan && (raw.Order != "" || raw.Range != "" || raw.Project.Set):
 		r.errorf("%s: order, range and project apply to queries; a scan takes page and max_page", where)
-	case a.Kind != AccessQuery && a.Kind != AccessScan && (raw.Order != "" || raw.Page != 0 || raw.MaxPage != 0 || raw.Range != "" || raw.Project.Set):
+	case a.All && (raw.Order != "" || raw.Range != "" || raw.Project.Set):
+		r.errorf("%s: order, range and project apply to queries; a read of all of a counter's items takes page and max_page", where)
+	case a.Kind != AccessQuery && a.Kind != AccessScan && !a.All && (raw.Order != "" || raw.Page != 0 || raw.MaxPage != 0 || raw.Range != "" || raw.Project.Set):
 		r.errorf("%s: order, page, max_page, range and project only apply to queries", where)
 	}
 	switch a.Freshness {
@@ -1141,6 +1162,7 @@ func (r *resolver) crossRefs(m *Model) {
 		}
 		return nil, nil
 	}
+	entries := map[*Counter]bool{}
 	for _, e := range m.Entities {
 		for _, f := range e.Fields {
 			if f.copyOfRaw != "" {
@@ -1162,6 +1184,10 @@ func (r *resolver) crossRefs(m *Model) {
 			a.Counter = counters[a.counterRaw]
 			if a.Counter == nil {
 				r.errorf("entity %s access %s: %s is not a counter of this table", e.Name, a.Name, a.counterRaw)
+				continue
+			}
+			if a.All {
+				r.counterAll(e, a, entries)
 			}
 		}
 		for _, w := range e.Writes {
@@ -1173,6 +1199,46 @@ func (r *resolver) crossRefs(m *Model) {
 			r.sameItemTwice(w)
 			r.planWrite(w)
 		}
+	}
+}
+
+// counterAll checks a read of every item of a counter in one partition: the items must be several
+// (the sort key has fields of its own), on one partition key (not sharded), and their keys must
+// be readable back from the sort key, since a counter item stores nothing else to say which it is.
+func (r *resolver) counterAll(e *Entity, a *Access, entries map[*Counter]bool) {
+	c := a.Counter
+	where := fmt.Sprintf("entity %s access %s", e.Name, a.Name)
+	own := c.ItemFields()
+	switch {
+	case c.Shards > 1:
+		r.errorf("%s: %s is sharded: its items are spread over %d partition keys, which one Query can't read", where, c.Name, c.Shards)
+		return
+	case len(own) == 0:
+		r.errorf("%s: %s has one item per partition key (its sort key %q has no field of its own); read it with counter alone", where, c.Name, c.SK.Raw)
+		return
+	}
+	segs := c.SK.Segments
+	for i, sg := range segs {
+		if !sg.IsField() {
+			continue
+		}
+		f := c.Entity.Field(sg.Field)
+		switch {
+		case sg.Transform != "":
+			r.errorf("%s: %s's sort key holds {%s|%s}, which can't be read back into %s; a counter read with all needs its sort key fields as they are", where, c.Name, sg.Field, sg.Transform, sg.Field)
+			return
+		case f.Type != TypeString && f.Type != TypeEnum:
+			r.errorf("%s: %s's sort key holds %s, a %s; a counter read with all needs string or enum fields there, to read each item's key back", where, c.Name, f.Name, f.Type)
+			return
+		case i+1 < len(segs) && segs[i+1].IsField():
+			r.errorf("%s: %s's sort key puts {%s} directly before {%s}, so the two can't be told apart when read back; put literal text between them", where, c.Name, sg.Field, segs[i+1].Field)
+			return
+		}
+	}
+	r.claimType(e.GoName+a.GoName+"Query", where)
+	if !entries[c] {
+		entries[c] = true
+		r.claimType(c.GoName+"Entry", "counter "+c.Name+" (read with all)")
 	}
 }
 

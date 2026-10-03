@@ -310,6 +310,12 @@ func counterValue(v *schema.CounterValue) string {
 }
 
 func servedBy(a *schema.Access) string {
+	switch {
+	case a.Batch > 0:
+		return "BatchGetItem"
+	case a.All:
+		return "Query of counter " + a.Counter.Name + "'s items"
+	}
 	switch a.Kind {
 	case schema.AccessGet:
 		return "GetItem"

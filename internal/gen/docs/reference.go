@@ -349,6 +349,12 @@ func ttlAttr(m *schema.Model) string {
 }
 
 func readsText(a *schema.Access) string {
+	switch {
+	case a.Batch > 0:
+		return fmt.Sprintf("items by key, %d a call typically", a.Batch)
+	case a.All:
+		return fmt.Sprintf("every item of counter `%s` in a partition, page %d (max %d)", a.Counter.Name, a.Page, a.MaxPage)
+	}
 	switch a.Kind {
 	case schema.AccessGet:
 		return "item by key"
@@ -381,6 +387,9 @@ func keyCondition(a *schema.Access) string {
 	case schema.AccessGetUnique:
 		return fmt.Sprintf("`PK = %s`", a.Unique.PK.Raw)
 	case schema.AccessCounter:
+		if a.All {
+			return fmt.Sprintf("`PK = %s`, `begins_with(SK, %q)`", a.Counter.PK.Raw, a.Counter.SK.LiteralPrefix())
+		}
 		return fmt.Sprintf("`PK = %s`, `SK = %s`", a.Counter.PK.Raw, a.Counter.SK.Raw)
 	case schema.AccessScan:
 		return fmt.Sprintf("none: a Scan, filtered to `_t = %s`", e.Name)

@@ -349,6 +349,12 @@ func ReadCostOf(a *schema.Access, er *EntityReport) ReadCost {
 	case schema.AccessGet:
 		rc.Requests = "GetItem"
 		rc.RRU = Units{rru(er.Item.P50, factor), rru(er.Item.P99, factor)}
+		if a.Batch > 0 {
+			// Each item of a batch is charged as a GetItem of it would be.
+			rc.Requests = fmt.Sprintf("BatchGetItem (%d keys)", a.Batch)
+			rc.RoundTrips = (a.Batch + 99) / 100
+			rc.RRU = Units{rc.RRU.P50 * float64(a.Batch), rc.RRU.P99 * float64(a.Batch)}
+		}
 		rc.Reads = []Target{{Kind: TargetItem, Entity: e}}
 	case schema.AccessGetUnique:
 		rc.Requests = "GetItem (claim) → GetItem"
@@ -373,6 +379,13 @@ func ReadCostOf(a *schema.Access, er *EntityReport) ReadCost {
 		rc.RRU = Units{rru(er.Item.P50*a.Page, factor), rru(er.Item.P99*a.Page, factor)}
 		rc.Reads = []Target{{Kind: TargetItem, Entity: e}}
 	case schema.AccessCounter:
+		if a.All {
+			size := CounterSize(a.Counter)
+			rc.Requests = "Query"
+			rc.RRU = Units{rru(size.P50*a.Page, factor), rru(size.P99*a.Page, factor)}
+			rc.Reads = []Target{{Kind: TargetCounter, Entity: a.Counter.Entity, Counter: a.Counter}}
+			break
+		}
 		if a.Counter.Shards > 1 {
 			rc.Requests = fmt.Sprintf("BatchGetItem (%d shards)", a.Counter.Shards)
 		} else {

@@ -745,12 +745,22 @@
                 }
               ]
             },
+            "batch": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "With get: key, the read takes several keys and returns the items that exist, with one BatchGetItem per 100 keys. The number is how many keys a call typically passes, which the estimates use."
+            },
             "query": {
               "type": "string",
               "description": "key (the entity's own partition) or an index name."
             },
             "counter": {
               "$ref": "#/$defs/pascalName"
+            },
+            "all": {
+              "type": "boolean",
+              "default": false,
+              "description": "With counter, reads every item of the counter in one partition (one for each value of its sort key's own fields) with one Query, a page at a time, instead of the one item a full key names."
             },
             "scan": {
               "const": true,

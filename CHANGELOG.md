@@ -20,6 +20,11 @@ format, the generated code and the runtime API; the changelog says how to move.
   regenerating, rename the uses of the affected names in your code; the compiler finds them.
   Stored attribute names don't change.
 
+- Reads of several items at once. `GetSeveral: { get: key, batch: 40 }` takes a slice of keys and
+  returns the items that exist, in the order asked, with one BatchGetItem per 100 keys.
+  `AllCounts: { counter: LabelCounts, all: true }` returns every item of a counter in one
+  partition (each label's counts for a user) with one Query, a page at a time, each with the key
+  its sort key holds. The runtime gained `dynago.GetBatch` and `dynago.SplitKey` for them.
 - A requirement can do more to its item than assign: `add: { messageCount: 1 }` adds to an int
   field (atomically, so concurrent writes all count), and `patch: { hasAttachments:
   "{hasAttachments}" }` sets a field from the writing entity's only when that has a value,

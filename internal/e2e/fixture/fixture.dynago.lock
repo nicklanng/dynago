@@ -110,7 +110,7 @@
         {
           "version": 1,
           "generation": 1,
-          "fingerprint": "141fb3454ab8b50f",
+          "fingerprint": "2a60b0223bd33295",
           "shape": {
             "fields": [
               {
@@ -140,7 +140,20 @@
               }
             ],
             "pk": "D#{depotId}",
-            "sk": "DAMAGE#{parcelId}#{damageId}"
+            "sk": "DAMAGE#{parcelId}#{damageId}",
+            "counters": [
+              {
+                "name": "ParcelDamages",
+                "pk": "D#{depotId}",
+                "sk": "DAMAGED#{parcelId}",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "reports"
+                  }
+                ]
+              }
+            ]
           }
         }
       ]
@@ -150,7 +163,7 @@
         {
           "version": 1,
           "generation": 1,
-          "fingerprint": "f77ccc26f0f449fc",
+          "fingerprint": "c31d8207e05c0886",
           "shape": {
             "fields": [
               {
@@ -247,6 +260,17 @@
                     "where": [
                       "state!=lost"
                     ]
+                  }
+                ]
+              },
+              {
+                "name": "StateCounts",
+                "pk": "D#{depotId}",
+                "sk": "STATE#{state}",
+                "shards": 1,
+                "values": [
+                  {
+                    "name": "parcels"
                   }
                 ]
               }

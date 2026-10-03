@@ -45,6 +45,12 @@ func answers(a *schema.Access) string {
 		return firstSentence(a.Doc)
 	}
 	e := a.Entity
+	switch {
+	case a.Batch > 0:
+		return fmt.Sprintf("Several %s, each by %s.", schema.Plural(e.Name), join(names(e.KeyFields())))
+	case a.All:
+		return fmt.Sprintf("Every %s count of a %s: one for each %s.", a.Counter.Name, join(names(a.Counter.PK.Fields)), join(names(a.Counter.ItemFields())))
+	}
 	switch a.Kind {
 	case schema.AccessGet:
 		return fmt.Sprintf("One %s, by %s.", e.Name, join(names(e.KeyFields())))
@@ -76,6 +82,12 @@ func answers(a *schema.Access) string {
 }
 
 func servedBy(a *schema.Access) string {
+	switch {
+	case a.Batch > 0:
+		return "BatchGetItem (one per 100 keys)"
+	case a.All:
+		return fmt.Sprintf("Query of counter %s's items", a.Counter.Name)
+	}
 	switch a.Kind {
 	case schema.AccessGet:
 		return "GetItem"
@@ -118,6 +130,12 @@ func freshnessText(a *schema.Access) string {
 // returns says how many items a read returns; for a query, how many are in its partition and how
 // many pages reading them all takes.
 func (d *doc) returns(a *schema.Access) string {
+	switch {
+	case a.Batch > 0:
+		return fmt.Sprintf("the ones that exist: %d keys a call typically", a.Batch)
+	case a.All:
+		return fmt.Sprintf("pages of %d counter items, a page at a time", a.Page)
+	}
 	switch a.Kind {
 	case schema.AccessGet, schema.AccessGetUnique:
 		return "one"

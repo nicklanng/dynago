@@ -45,7 +45,8 @@ For an entity `Loan`:
 | `LoanOverdue` | an index `Overdue` without `project: all` | What a query through the index returns: key fields plus projected fields. |
 | `LoanHistoryItem` | a `query: key` access `History` with `project` | What the projected query returns. |
 | `MemberLoans`, `MemberLoansKey` | a counter `MemberLoans` | The counter's values (`int64` fields) and the fields that address it. |
-| `Loan<Access>Query` | a `query` access pattern | Its partition key fields, plus `From, To *T` when it has a `range`. |
+| `MemberLoansEntry` | a `counter` access with `all` | One counter item of a partition: its values, and its `Key`. |
+| `Loan<Access>Query` | a `query` access pattern, or a `counter` access with `all` | Its partition key fields, plus `From, To *T` when it has a `range`. |
 | `Loan<Write>` | an update with `update:` or `patch:` fields | The values the caller supplies; `patch` fields are pointers. |
 | `Loan<Write>Limits` | a write that can grow a `limit: arg` counter value | One `dynago.Limit` per value, named `<Counter><Value>`. |
 
@@ -102,6 +103,17 @@ func (s *ToolStore) Get(ctx context.Context, k ToolKey) (*Tool, error)
 
 One GetItem (strongly consistent with `consistent: true`). Returns `ErrToolNotFound` if absent.
 The entity carries its version.
+
+### `get: key` with `batch`
+
+```go
+func (s *ParcelStore) GetSeveral(ctx context.Context, keys []ParcelKey) ([]Parcel, error)
+```
+
+One BatchGetItem per 100 keys (DynamoDB may return some keys unprocessed, which are fetched
+again). It returns the items that exist, in the order of `keys`: a key with no item, or an expired
+one, is left out, so match results to keys by `Key()`, not by position. A key given twice is read
+and returned once. Each entity carries its version, as from `Get`.
 
 ### `get: { unique: Name }`
 
@@ -175,6 +187,22 @@ One GetItem, or a BatchGetItem over all shards of a sharded counter, summed (Dyn
 some keys unprocessed, which are fetched again). A counter that
 nothing has written reads as zero. The method can live on any entity's store (here the library
 reads the member counts).
+
+### `counter` with `all`
+
+```go
+type StateCountsEntry struct {
+    Key StateCountsKey
+    StateCounts
+}
+
+func (s *ParcelStore) States(ctx context.Context, q ParcelStatesQuery, page dynago.Page) ([]StateCountsEntry, string, error)
+```
+
+One Query of the counter's items under one partition key: `q` holds the counter's partition key
+fields, and each entry is one counter item with the key its sort key holds. Pages and cursors work
+as for queries. Only items something has counted exist, and one whose counts have all returned to
+zero is still there, reading zero.
 
 ## Writes
 

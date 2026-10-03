@@ -651,6 +651,22 @@ type Counter struct {
 // KeyFields returns the fields that address the counter item.
 func (c *Counter) KeyFields() []*Field { return mergeFields(c.PK.Fields, c.SK.Fields) }
 
+// ItemFields returns the key fields that tell one partition's counter items apart: those in the
+// sort key and not in the partition key. A counter without any has one item per partition.
+func (c *Counter) ItemFields() []*Field {
+	var out []*Field
+	for _, f := range c.SK.Fields {
+		in := false
+		for _, pf := range c.PK.Fields {
+			in = in || pf == f
+		}
+		if !in {
+			out = append(out, f)
+		}
+	}
+	return mergeFields(out)
+}
+
 // CounterValue is one attribute of a counter.
 type CounterValue struct {
 	Name     string
@@ -699,13 +715,19 @@ const (
 
 // Access is a declared read.
 type Access struct {
-	Name       string
-	GoName     string
-	Entity     *Entity
-	Kind       AccessKind
-	Unique     *Unique
-	Index      *Index // nil for a query on the entity's own partition
-	Counter    *Counter
+	Name    string
+	GoName  string
+	Entity  *Entity
+	Kind    AccessKind
+	Unique  *Unique
+	Index   *Index // nil for a query on the entity's own partition
+	Counter *Counter
+	// Batch, on a get by key, makes the read take several keys in one BatchGetItem: the typical
+	// number of keys per call, which the estimates use. 0 for a read of one key.
+	Batch int
+	// All, on a counter read, returns every item of the counter in one partition (one per value
+	// of the sort key's own fields) with a Query, a page at a time.
+	All        bool
 	Desc       bool
 	Page       int
 	MaxPage    int

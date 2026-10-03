@@ -1,6 +1,7 @@
 package e2e_test
 
 import (
+	"errors"
 	"fmt"
 	"sort"
 	"testing"
@@ -239,5 +240,94 @@ func TestRequiresAddAndPatch(t *testing.T) {
 	}
 	if p := parcel(); p.Damages != 3+each || p.Disputes != 2+each {
 		t.Fatalf("after %d concurrent reports and disputes: %d damages and %d disputes, want %d and %d", each, p.Damages, p.Disputes, 3+each, 2+each)
+	}
+}
+
+// Several items are read by key in one BatchGetItem: those that exist, in the order asked for.
+// And every item of a counter in a partition is read with one Query, each with the key its sort
+// key holds, a page at a time.
+func TestBatchGetAndAllCounters(t *testing.T) {
+	t.Parallel()
+	db, n := testdb.CountingDB(t)
+	st := fixture.New(db, testdb.Table(t, db, fixture.TableSpec))
+	key := func(id string) fixture.ParcelKey { return fixture.ParcelKey{DepotID: "d1", ParcelID: id} }
+	for _, id := range []string{"p1", "p2", "p3", "p4"} {
+		must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d1", ParcelID: id, Note: "note " + id}))
+	}
+	must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d2", ParcelID: "p1"}))
+
+	reads, batches := n.Reads(), n.BatchGetItem.Load()
+	got, err := st.Parcels.GetSeveral(ctx, []fixture.ParcelKey{key("p3"), key("nope"), key("p1"), key("p3"), key("p4")})
+	must(t, err)
+	var ids []string
+	for _, p := range got {
+		ids = append(ids, p.ParcelID+"="+p.Note)
+	}
+	if fmt.Sprint(ids) != "[p3=note p3 p1=note p1 p4=note p4]" {
+		t.Fatalf("GetSeveral returned %v; want p3, p1 and p4, as asked, without the missing key or the repeat", ids)
+	}
+	if r, b := n.Reads()-reads, n.BatchGetItem.Load()-batches; r != 1 || b != 1 {
+		t.Fatalf("GetSeveral made %d reads, %d of them BatchGetItem; want one BatchGetItem", r, b)
+	}
+	// What it returns can be written back like any entity read from the store.
+	if got[0].Version() == "" {
+		t.Fatalf("an entity from GetSeveral has no version")
+	}
+	must(t, st.Parcels.Shelve(ctx, key("p3"), dynago.From(&got[0])))
+	if none, err := st.Parcels.GetSeveral(ctx, nil); err != nil || len(none) != 0 {
+		t.Fatalf("no keys: %v, %v", none, err)
+	}
+	if _, err := st.Parcels.GetSeveral(ctx, []fixture.ParcelKey{{DepotID: "d1"}}); !errors.Is(err, dynago.ErrInvalidKey) {
+		t.Fatalf("a key without a parcel id: %v", err)
+	}
+
+	// One counter item per state, read together. A state every parcel has left reads as zero.
+	must(t, st.Parcels.SendOut(ctx, key("p3")))
+	must(t, st.Parcels.Lose(ctx, key("p4")))
+	queries := n.Query.Load()
+	states, next, err := st.Parcels.States(ctx, fixture.ParcelStatesQuery{DepotID: "d1"}, dynago.Page{})
+	must(t, err)
+	byState := map[fixture.ParcelState]int64{}
+	for _, s := range states {
+		if s.Key.DepotID != "d1" {
+			t.Fatalf("a counter of another depot: %+v", s)
+		}
+		byState[s.Key.State] = s.Parcels
+	}
+	want := map[fixture.ParcelState]int64{fixture.ParcelStateReceived: 2, fixture.ParcelStateShelved: 0, fixture.ParcelStateOut: 1, fixture.ParcelStateLost: 1}
+	if next != "" || fmt.Sprint(byState) != fmt.Sprint(want) {
+		t.Fatalf("states %v (next %q), want %v", byState, next, want)
+	}
+	if q := n.Query.Load() - queries; q != 1 {
+		t.Fatalf("States made %d queries, want 1", q)
+	}
+
+	// Paged: three parcels with damage reports, two counter items to a page.
+	for _, id := range []string{"p1", "p1", "p2"} {
+		must(t, st.Damages.File(ctx, &fixture.Damage{DepotID: "d1", ParcelID: id, DamageID: fmt.Sprint("x", len(ids)), Detail: "dented"}))
+		ids = append(ids, id)
+	}
+	must(t, st.Damages.File(ctx, &fixture.Damage{DepotID: "d2", ParcelID: "p1", DamageID: "y", Detail: "dented"}))
+	var seen []string
+	page := dynago.Page{}
+	for calls := 0; ; calls++ {
+		if calls > 5 {
+			t.Fatal("the counters never ended")
+		}
+		entries, next, err := st.Damages.Damaged(ctx, fixture.DamageDamagedQuery{DepotID: "d1"}, page)
+		must(t, err)
+		if len(entries) > 2 {
+			t.Fatalf("a page of %d counters, over its size", len(entries))
+		}
+		for _, e := range entries {
+			seen = append(seen, fmt.Sprint(e.Key.ParcelID, ":", e.Reports))
+		}
+		if next == "" {
+			break
+		}
+		page.Cursor = next
+	}
+	if fmt.Sprint(seen) != "[p1:2 p2:1]" {
+		t.Fatalf("damaged parcels %v, want p1 with 2 reports and p2 with 1", seen)
 	}
 }
