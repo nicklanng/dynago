@@ -854,7 +854,18 @@ type Write struct {
 	VersionRequired bool
 	// Limits are counter values with caller-supplied limits this write can increase.
 	Limits []*CounterValue
+	// Batch makes an update take several keys and apply the same change to each, several items
+	// to a transaction: the typical number of keys per call, which the estimates use. 0 for a
+	// write of one item.
+	Batch int
 }
+
+// MaxTxItems is DynamoDB's limit on the items of one transaction.
+const MaxTxItems = 100
+
+// BatchSize is how many items of a batch write go in one transaction, given the most items a
+// write of one of them touches.
+func BatchSize(perItem int) int { return max(1, MaxTxItems/max(1, perItem)) }
 
 // Require is a condition on another item, checked in the same transaction as the write: an
 // entity (Target), which the write may also change (Sets) or delete (Consume), or a counter

@@ -29,6 +29,11 @@ format, the generated code and the runtime API; the changelog says how to move.
   `AllCounts: { counter: LabelCounts, all: true }` returns every item of a counter in one
   partition (each label's counts for a user) with one Query, a page at a time, each with the key
   its sort key holds. The runtime gained `dynago.GetBatch` and `dynago.SplitKey` for them.
+- Batch updates: `Archive: { set: { mailbox: archived }, batch: 50 }` generates a method taking a
+  slice of keys. The items are read together and written several to a transaction, and a counter
+  item they share is updated once per transaction, not once per item. Each transaction is atomic;
+  the method returns a `*dynago.BatchError` naming the items it could not write, and writes the
+  rest. The runtime gained `dynago.BatchWrite`.
 - Indexes and counters keyed by each element of a `string_set`, as unique constraints already
   were: `pk: "USER#{userId}#LABEL#{labelIds}"` gives a thread a copy in each of its labels' lists,
   and `sk: "COUNTS#LABEL#{labelIds}"` a count in each label's counter item, all maintained in the

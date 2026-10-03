@@ -1016,13 +1016,14 @@ func (k ParcelKey) dynamoKey() (dynago.Key, error) {
 
 // Errors returned by ParcelStore. Each wraps the matching dynago sentinel.
 var (
-	ErrParcelNotFound             = fmt.Errorf("%w: Parcel", dynago.ErrNotFound)
-	ErrParcelExists               = fmt.Errorf("%w: Parcel", dynago.ErrExists)
-	ErrParcelShelvePrecondition   = fmt.Errorf("%w: Parcel.Shelve requires state = \"received\"", dynago.ErrPrecondition)
-	ErrParcelSendOutPrecondition  = fmt.Errorf("%w: Parcel.SendOut requires state in [\"received\", \"shelved\"]", dynago.ErrPrecondition)
-	ErrParcelLosePrecondition     = fmt.Errorf("%w: Parcel.Lose requires state != \"lost\"", dynago.ErrPrecondition)
-	ErrParcelAnnotatePrecondition = fmt.Errorf("%w: Parcel.Annotate requires state != \"lost\"", dynago.ErrPrecondition)
-	ErrParcelArriveRequiresDepot  = fmt.Errorf("%w: Parcel.Arrive requires any Depot there is to have closed = false", dynago.ErrPrecondition)
+	ErrParcelNotFound                  = fmt.Errorf("%w: Parcel", dynago.ErrNotFound)
+	ErrParcelExists                    = fmt.Errorf("%w: Parcel", dynago.ErrExists)
+	ErrParcelShelvePrecondition        = fmt.Errorf("%w: Parcel.Shelve requires state = \"received\"", dynago.ErrPrecondition)
+	ErrParcelSendOutPrecondition       = fmt.Errorf("%w: Parcel.SendOut requires state in [\"received\", \"shelved\"]", dynago.ErrPrecondition)
+	ErrParcelLosePrecondition          = fmt.Errorf("%w: Parcel.Lose requires state != \"lost\"", dynago.ErrPrecondition)
+	ErrParcelAnnotatePrecondition      = fmt.Errorf("%w: Parcel.Annotate requires state != \"lost\"", dynago.ErrPrecondition)
+	ErrParcelShelveSeveralPrecondition = fmt.Errorf("%w: Parcel.ShelveSeveral requires state = \"received\"", dynago.ErrPrecondition)
+	ErrParcelArriveRequiresDepot       = fmt.Errorf("%w: Parcel.Arrive requires any Depot there is to have closed = false", dynago.ErrPrecondition)
 )
 
 const parcelVersion = 1
@@ -1858,6 +1859,83 @@ func (s *ParcelStore) Retag(ctx context.Context, k ParcelKey, v ParcelRetag, opt
 		}
 		o.Written(it.Rev + 1)
 		return nil
+	})
+}
+
+// ShelveSeveral updates state of several Parcels, the same way, each when state = "received". The
+// items are read with one consistent BatchGetItem and written up to 9 to a transaction, each
+// guarded by its revision; a counter item several of them change is updated once per transaction.
+// In the same transaction it maintains counter DepotParcels, counter TagCounts, counter
+// StateCounts, copy index OnSite, copy index ByTag. Each transaction is atomic; the batch is not.
+// It returns nil if every item was written, and otherwise a *dynago.BatchError naming those that
+// were not, by their place in keys, each with its error (ErrParcelNotFound,
+// ErrParcelShelveSeveralPrecondition, or what refused its transaction): the others were written. A
+// key given twice is written once.
+func (s *ParcelStore) ShelveSeveral(ctx context.Context, keys []ParcelKey) error {
+	ks := make([]dynago.Key, len(keys))
+	for i, k := range keys {
+		key, err := k.dynamoKey()
+		if err != nil {
+			return err
+		}
+		ks[i] = key
+	}
+	return dynago.BatchWrite(ctx, s.db, s.t, ks, 9, ErrParcelNotFound, func(key dynago.Key, raw dynamo.Item) (dynago.Op, dynago.Change, error) {
+		it, err := parcelDecode(raw)
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		before := &it.Parcel
+		if before.State != ParcelStateReceived {
+			return dynago.Op{}, dynago.Change{}, ErrParcelShelveSeveralPrecondition
+		}
+		after := before.clone()
+		after.State = ParcelStateShelved
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		return dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), dynago.Change{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}, nil
+	})
+}
+
+// ParcelAnnotateSeveral holds the new values for Parcel.AnnotateSeveral.
+type ParcelAnnotateSeveral struct {
+	Note string
+}
+
+// AnnotateSeveral updates note of several Parcels, the same way. The items are read with one
+// consistent BatchGetItem and written up to 100 to a transaction, each guarded by its revision; a
+// counter item several of them change is updated once per transaction. In the same transaction it
+// maintains counter DepotParcels, counter TagCounts, counter StateCounts, copy index OnSite, copy
+// index ByTag. Each transaction is atomic; the batch is not. It returns nil if every item was
+// written, and otherwise a *dynago.BatchError naming those that were not, by their place in keys,
+// each with its error (ErrParcelNotFound, or what refused its transaction): the others were
+// written. A key given twice is written once.
+func (s *ParcelStore) AnnotateSeveral(ctx context.Context, keys []ParcelKey, v ParcelAnnotateSeveral) error {
+	ks := make([]dynago.Key, len(keys))
+	for i, k := range keys {
+		key, err := k.dynamoKey()
+		if err != nil {
+			return err
+		}
+		ks[i] = key
+	}
+	return dynago.BatchWrite(ctx, s.db, s.t, ks, 100, ErrParcelNotFound, func(key dynago.Key, raw dynamo.Item) (dynago.Op, dynago.Change, error) {
+		it, err := parcelDecode(raw)
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		before := &it.Parcel
+		after := before.clone()
+		after.Note = v.Note
+		// Keep attributes this code doesn't know: a newer compatible version may have written them.
+		item, err := dynago.KeepUnknown(it.raw, parcelKnown, parcelToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))
+		if err != nil {
+			return dynago.Op{}, dynago.Change{}, err
+		}
+		return dynago.PutOp(key, s.t.Put(item).If("$ = ?", "_rev", it.Rev), dynago.ErrStale), dynago.Change{Owner: key, Before: parcelDerived(before, key), After: parcelDerived(&after, key)}, nil
 	})
 }
 

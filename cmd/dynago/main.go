@@ -409,6 +409,9 @@ func check(path string, o options, w io.Writer) error {
 			if wc.ReadFirst {
 				kind += " + read"
 			}
+			if wc.BatchSize > 0 {
+				kind = fmt.Sprintf("batch of %d, %d to a tx + read", wc.Write.Batch, wc.BatchSize)
+			}
 			monthly := ""
 			if wc.Monthly > 0 {
 				monthly = fmt.Sprintf("$%.2f/month", wc.Monthly)

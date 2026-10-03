@@ -143,7 +143,10 @@ type WriteCost struct {
 	Touches       []Touch
 	ReadFirst     bool
 	Transactional bool
-	MaxTxItems    int
+	// BatchSize is, for a batch write, how many of its items go in one transaction; the costs
+	// are then those of a call with the declared number of items. 0 for a write of one item.
+	BatchSize  int
+	MaxTxItems int
 	// TxBytes is the p99 size of everything the write's own request writes.
 	TxBytes int
 	WRU     Units
@@ -419,6 +422,14 @@ func ReadCostOf(m *schema.Model, a *schema.Access, er *EntityReport) ReadCost {
 // WriteCostOf estimates one call of a write of e (which may be a variant of w.Entity with other
 // indexes, for comparing designs). readFirst says whether the write reads the item first.
 func WriteCostOf(m *schema.Model, e *schema.Entity, w *schema.Write, readFirst bool, er *EntityReport) WriteCost {
+	if w.Batch > 0 {
+		// A call changes several items, each read and then written as a write of one would be.
+		one := *w
+		one.Batch = 0
+		wc := WriteCostOf(m, e, &one, true, er)
+		wc.Write = w
+		return batchCost(wc, w.Batch)
+	}
 	wc := WriteCost{Write: w, ReadFirst: readFirst}
 	// gsi holds index entries DynamoDB writes asynchronously, outside any transaction. own holds
 	// the items the write itself puts, updates, deletes or checks.
@@ -476,6 +487,44 @@ func WriteCostOf(m *schema.Model, e *schema.Entity, w *schema.Write, readFirst b
 		own = own.add(own) // transactions charge double for every item they write
 	}
 	wc.WRU = own.add(gsi)
+	return wc
+}
+
+// BatchItems is the most items a write of one item of a batch touches, which decides how many
+// items go in one transaction.
+func BatchItems(m *schema.Model, w *schema.Write) int {
+	one := *w
+	one.Batch = 0
+	return WriteCostOf(m, w.Entity, &one, true, EntitySizes(m, w.Entity)).MaxTxItems
+}
+
+// batchCost turns the cost of a write of one item into that of a batch call changing n items:
+// each is read and written, several to a transaction. It counts every item's derived writes in
+// full, although a counter item that several of a transaction's items change is updated once:
+// an upper bound.
+func batchCost(wc WriteCost, n int) WriteCost {
+	per := max(1, wc.MaxTxItems)
+	size := schema.BatchSize(per)
+	in := min(n, size) // items in one transaction
+	wc.BatchSize = size
+	wc.Transactional = in*per > 1
+	var own, gsi Units
+	for i := range wc.Touches {
+		t := &wc.Touches[i]
+		t.Units = Units{t.Units.P50 * float64(n), t.Units.P99 * float64(n)}
+		if t.Async {
+			gsi = gsi.add(t.Units)
+		} else {
+			own = own.add(t.Units)
+		}
+	}
+	if wc.Transactional {
+		own = own.add(own)
+	}
+	wc.WRU = own.add(gsi)
+	wc.RRU *= float64(n)
+	wc.MaxTxItems = in * per
+	wc.TxBytes *= in
 	return wc
 }
 

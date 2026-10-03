@@ -201,6 +201,11 @@ func TestValidationErrors(t *testing.T) {
 		{"range over a set", "    indexes:\n      ByTag: { pk: \"TAG#{tenantId}\", sk: \"T#{tags}#{tenantId}#{thingId}\", project: keys }\n    access:\n      L: { query: ByTag, range: tags }\n", "a range bounds a single value"},
 		{"requires a set-keyed counter", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C#{tags}\", values: { n: count } }\n    writes:\n      W: { update: [name], requires: { C: { key: { tenantId: tenantId, tags: name }, when: { n: 0 } } } }\n", "requiring one of them isn't supported"},
 		{"set in the primary key", "  Other:\n    fields: { tenantId: string, tags: string_set }\n    key: { pk: \"O#{tenantId}\", sk: \"OTHER#{tags}\" }\n", "cannot be part of a key"},
+		{"batch create", "    writes:\n      W: { create: true, batch: 10 }\n", "batch applies to updates"},
+		{"batch without a number", "    writes:\n      W: { update: [name], batch: true }\n", "the typical number of items a call changes"},
+		{"batch with requires", "    writes:\n      W: { update: [name], batch: 10, requires: { Thing: { key: { tenantId: tenantId, thingId: name } } } }\n", "a batch write can't have requires"},
+		{"batch that requires versions", "    writes:\n      W: { update: [name], batch: 10, versioned: required }\n", "takes keys, not versions"},
+		{"batch that grows a caller's limit", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: { count: true, where: { status: a }, limit: arg } } }\n    writes:\n      W: { set: { status: a }, batch: 10 }\n", "whose limit callers supply for one item at a time"},
 		{"requires unknown counter value", "    counters:\n      C: { pk: \"C#{tenantId}\", sk: \"C\", values: { n: count } }\n    writes:\n      W: { delete: true, requires: { C: { key: { tenantId: tenantId }, when: { m: 0 } } } }\n", "m is not a value of counter C"},
 	}
 	for _, c := range cases {

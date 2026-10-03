@@ -90,7 +90,7 @@ entities:
       damages: { type: int, doc: How many damage reports name the parcel. Listed with the parcels on site. }
       disputes: int
       lastDispute: string
-      tags: { type: string_set, doc: "Handling tags. A parcel is listed, and counted, under each of them." }
+      tags: { type: string_set, size: 20/60, doc: "Handling tags. A parcel is listed, and counted, under each of them." }
     key:
       pk: "D#{depotId}"
       sk: "PARCEL#{parcelId}"
@@ -163,6 +163,10 @@ entities:
       Lose: { set: { state: lost }, when: { state: { not: lost } } }
       Annotate: { update: [note], when: { state: { not: lost } } }
       Retag: { update: [tags] }
+      # Batch writes: the same change to several parcels, several to a transaction, with the
+      # depot's counter items updated once per transaction.
+      ShelveSeveral: { set: { state: shelved }, when: { state: received }, batch: 20 }
+      AnnotateSeveral: { update: [note], batch: 10 }
 
   # A damage report can only be filed against a parcel that is still on site. Filing one counts on
   # the parcel (add) and marks it fragile if the report says so (patch), leaving the mark alone

@@ -336,18 +336,20 @@ func (a *RawAccess) UnmarshalYAML(n *yaml.Node) error {
 
 // RawWrite declares a write. Short forms: `Create: create`, `Delete: delete`.
 type RawWrite struct {
-	Create     bool                `yaml:"create"`
-	Delete     bool                `yaml:"delete"`
-	Update     []string            `yaml:"update"`
-	Patch      []string            `yaml:"patch"`
-	Set        Ordered[any]        `yaml:"set"`
-	When       Ordered[any]        `yaml:"when"`
-	Requires   Ordered[RawRequire] `yaml:"requires"`
-	Versioned  string              `yaml:"versioned"`
-	Doc        string              `yaml:"doc"`
-	Rate       float64             `yaml:"rate"`
-	HotKeyRate float64             `yaml:"hot_key_rate"`
-	Accept     Ordered[string]     `yaml:"accept"`
+	Create   bool                `yaml:"create"`
+	Delete   bool                `yaml:"delete"`
+	Update   []string            `yaml:"update"`
+	Patch    []string            `yaml:"patch"`
+	Set      Ordered[any]        `yaml:"set"`
+	When     Ordered[any]        `yaml:"when"`
+	Requires Ordered[RawRequire] `yaml:"requires"`
+	// Batch makes an update take several keys: the typical number per call.
+	Batch      any             `yaml:"batch"`
+	Versioned  string          `yaml:"versioned"`
+	Doc        string          `yaml:"doc"`
+	Rate       float64         `yaml:"rate"`
+	HotKeyRate float64         `yaml:"hot_key_rate"`
+	Accept     Ordered[string] `yaml:"accept"`
 	isUpdate   bool
 }
 

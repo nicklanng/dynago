@@ -1185,6 +1185,21 @@ func (r *resolver) write(e *Entity, name string, raw RawWrite) *Write {
 			r.claimType(e.GoName+w.GoName, where)
 		}
 	}
+	if raw.Batch != nil {
+		n, ok := raw.Batch.(int)
+		switch {
+		case !ok || n < 1:
+			r.errorf("%s: batch is the typical number of items a call changes (batch: 50), which the estimates use", where)
+		case w.Kind != WriteUpdate:
+			r.errorf("%s: batch applies to updates: the same change to several items", where)
+		case len(raw.Requires) > 0:
+			r.errorf("%s: a batch write can't have requires: several of its items could require the same item, which a transaction may touch only once", where)
+		case w.VersionRequired:
+			r.errorf("%s: a batch write takes keys, not versions; versioned: required applies to a write of one item", where)
+		default:
+			w.Batch = n
+		}
+	}
 	w.rawRequires = raw.Requires
 	return w
 }
@@ -1744,6 +1759,14 @@ func (r *resolver) planWrite(w *Write) {
 				if v.LimitArg && CanGrow(w, v, false) {
 					w.Limits = append(w.Limits, v)
 				}
+			}
+		}
+		if w.Batch > 0 {
+			// Its items are read together, and each written under the revision read.
+			w.ReadFirst, w.Transition = true, false
+			if len(w.Limits) > 0 {
+				r.errorf("entity %s write %s: a batch write can't grow %s.%s, whose limit callers supply for one item at a time", e.Name, w.Name, w.Limits[0].Counter.Name, w.Limits[0].Name)
+				w.Limits = nil
 			}
 		}
 	}

@@ -210,8 +210,15 @@ func (d *doc) entity(e *schema.Entity) {
 			if wc.Transactional {
 				atomic = fmt.Sprintf("transaction (%d items)", wc.MaxTxItems)
 			}
+			units := unitsText(wc.WRU)
+			if w.Batch > 0 {
+				reads = "yes (one consistent BatchGetItem per transaction)"
+				version = "—"
+				atomic = fmt.Sprintf("each transaction, not the batch: up to %d %s to one", wc.BatchSize, schema.Plural(e.Name))
+				units += fmt.Sprintf(" for %d %s", w.Batch, schema.Plural(e.Name))
+			}
 			d.p("| `%s` | %s | %s | %s | %s | %s | %s | %s |", w.Name, escape(writeText(w)), strings.Join(wc.Items, "<br>"),
-				reads, atomic, version, unitsText(wc.WRU), strings.Join(writeErrors(w), "<br>"))
+				reads, atomic, version, units, strings.Join(writeErrors(w), "<br>"))
 		}
 		d.p("")
 		d.docList(func(yield func(name, doc string)) {
@@ -432,6 +439,11 @@ func consistencyText(a *schema.Access) string {
 }
 
 func writeText(w *schema.Write) string {
+	if w.Batch > 0 {
+		one := *w
+		one.Batch = 0
+		return "of each of several items: " + writeText(&one)
+	}
 	switch w.Kind {
 	case schema.WriteCreate:
 		text := "create (fails if it exists)"
@@ -528,7 +540,7 @@ func writeErrors(w *schema.Write) []string {
 			}
 		}
 	}
-	if w.Kind != schema.WriteCreate {
+	if w.Kind != schema.WriteCreate && w.Batch == 0 {
 		out = append(out, "`dynago.ErrVersionMismatch` (with a version)")
 	}
 	if w.VersionRequired {
@@ -536,6 +548,9 @@ func writeErrors(w *schema.Write) []string {
 	}
 	if w.ReadFirst {
 		out = append(out, "`dynago.ErrConflict` (after retries)")
+	}
+	if w.Batch > 0 {
+		out = append([]string{"`*dynago.BatchError`, holding for each item not written:"}, out...)
 	}
 	return out
 }

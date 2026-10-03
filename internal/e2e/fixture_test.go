@@ -565,3 +565,135 @@ func TestIndexAndCounterPerSetElement(t *testing.T) {
 		t.Fatalf("after tagging p2 a#b: %s, counts %s", a, got)
 	}
 }
+
+// A batch write makes the same change to several items, several to a transaction, with the
+// counter items they share updated once per transaction. Items that are missing or fail the
+// precondition are reported by their place in the keys, and don't keep the others from being
+// written.
+func TestBatchWrite(t *testing.T) {
+	t.Parallel()
+	db, n := testdb.CountingDB(t)
+	st := fixture.New(db, testdb.Table(t, db, fixture.TableSpec))
+	key := func(id string) fixture.ParcelKey { return fixture.ParcelKey{DepotID: "d1", ParcelID: id} }
+	var keys []fixture.ParcelKey
+	for i := range 25 {
+		id := fmt.Sprintf("p%02d", i)
+		var tags []string
+		if i%5 == 0 {
+			tags = []string{"fragile"}
+		}
+		must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d1", ParcelID: id, Tags: tags}))
+		keys = append(keys, key(id))
+	}
+	must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d1", ParcelID: "gone"}))
+	must(t, st.Parcels.SendOut(ctx, key("gone")))
+	states := func() string {
+		t.Helper()
+		entries, _, err := st.Parcels.States(ctx, fixture.ParcelStatesQuery{DepotID: "d1"}, dynago.Page{})
+		must(t, err)
+		var out []string
+		for _, e := range entries {
+			out = append(out, fmt.Sprint(e.Key.State, "=", e.Parcels))
+		}
+		return fmt.Sprint(out)
+	}
+
+	// 25 parcels to shelve, one that isn't there, one that is out, and one named twice.
+	keys = append(keys, key("nope"), key("gone"), key("p03"))
+	gets, txs := n.BatchGetItem.Load(), n.TransactWriteItems.Load()
+	err := st.Parcels.ShelveSeveral(ctx, keys)
+	var be *dynago.BatchError
+	if !errors.As(err, &be) || len(be.Failed) != 2 {
+		t.Fatalf("ShelveSeveral = %v, want two items not written", err)
+	}
+	if f := be.Failed[0]; f.Index != 25 || !errors.Is(f.Err, fixture.ErrParcelNotFound) {
+		t.Fatalf("the missing parcel: %+v", f)
+	}
+	if f := be.Failed[1]; f.Index != 26 || !errors.Is(f.Err, fixture.ErrParcelShelveSeveralPrecondition) {
+		t.Fatalf("the parcel that is out: %+v", f)
+	}
+	if !errors.Is(err, fixture.ErrParcelNotFound) || !errors.Is(err, dynago.ErrPrecondition) {
+		t.Fatalf("the batch error should match its items' errors: %v", err)
+	}
+	// 27 distinct keys, 9 to a transaction: three reads and three transactions, where 25 calls to
+	// Shelve would make 25 of each.
+	if g, x := n.BatchGetItem.Load()-gets, n.TransactWriteItems.Load()-txs; g != 3 || x != 3 {
+		t.Fatalf("ShelveSeveral made %d BatchGetItem and %d transactions, want 3 and 3", g, x)
+	}
+	if got := states(); got != "[out=1 received=0 shelved=25]" {
+		t.Fatalf("states after shelving: %s", got)
+	}
+	c, err := st.Parcels.Counts(ctx, fixture.DepotParcelsKey{DepotID: "d1"})
+	must(t, err)
+	tag, err := st.Parcels.TagCount(ctx, fixture.TagCountsKey{DepotID: "d1", TagsElem: "fragile"})
+	must(t, err)
+	if c != (fixture.DepotParcels{OnSite: 25, Known: 26}) || tag != (fixture.TagCounts{Parcels: 5, OnSite: 5}) {
+		t.Fatalf("counts after shelving: %+v, fragile %+v", c, tag)
+	}
+	list, _, err := st.Parcels.OnSite(ctx, fixture.ParcelOnSiteQuery{DepotID: "d1"}, dynago.Page{})
+	must(t, err)
+	for _, p := range list {
+		if p.State != fixture.ParcelStateShelved {
+			t.Fatalf("the on-site copy of %s still says %s", p.ParcelID, p.State)
+		}
+	}
+	// Shelving them again changes nothing, and says so for each.
+	err = st.Parcels.ShelveSeveral(ctx, keys[:25])
+	if !errors.As(err, &be) || len(be.Failed) != 25 || !errors.Is(err, fixture.ErrParcelShelveSeveralPrecondition) {
+		t.Fatalf("shelving shelved parcels: %v", err)
+	}
+
+	// A change nothing derived depends on: every item in one transaction.
+	txs = n.TransactWriteItems.Load()
+	must(t, st.Parcels.AnnotateSeveral(ctx, keys[:25], fixture.ParcelAnnotateSeveral{Note: "checked"}))
+	if x := n.TransactWriteItems.Load() - txs; x != 1 {
+		t.Fatalf("AnnotateSeveral made %d transactions, want 1", x)
+	}
+	if p, err := st.Parcels.Get(ctx, key("p24")); err != nil || p.Note != "checked" || p.State != fixture.ParcelStateShelved {
+		t.Fatalf("after annotating: %+v, %v", p, err)
+	}
+	must(t, st.Parcels.AnnotateSeveral(ctx, nil, fixture.ParcelAnnotateSeveral{Note: "nothing"}))
+
+	// Batches that overlap, running at once with single writes of the same parcels: each parcel
+	// is shelved by exactly one of them, and the counts agree.
+	var fresh []fixture.ParcelKey
+	for i := range 20 {
+		id := fmt.Sprintf("q%02d", i)
+		must(t, st.Parcels.Receive(ctx, &fixture.Parcel{DepotID: "d1", ParcelID: id}))
+		fresh = append(fresh, key(id))
+	}
+	errs := make(chan error, 3)
+	go func() { errs <- st.Parcels.ShelveSeveral(ctx, fresh[:14]) }()
+	go func() { errs <- st.Parcels.ShelveSeveral(ctx, fresh[6:]) }()
+	go func() {
+		for _, k := range fresh[8:12] {
+			if err := st.Parcels.Shelve(ctx, k); err != nil && !errors.Is(err, fixture.ErrParcelShelvePrecondition) {
+				errs <- err
+				return
+			}
+		}
+		errs <- nil
+	}()
+	for range 3 {
+		// A batch may find parcels another write shelved first; nothing else may go wrong.
+		err := <-errs
+		if errors.As(err, &be) && onlyPreconditions(be) {
+			continue
+		}
+		must(t, err)
+	}
+	if got := states(); got != "[out=1 received=0 shelved=45]" {
+		t.Fatalf("states after the concurrent batches: %s", got)
+	}
+}
+
+// onlyPreconditions reports whether every item a batch didn't write was refused by its
+// precondition: another write got there first.
+func onlyPreconditions(be *dynago.BatchError) bool {
+	for _, f := range be.Failed {
+		if !errors.Is(f.Err, dynago.ErrPrecondition) {
+			return false
+		}
+	}
+	return true
+}

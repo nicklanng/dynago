@@ -276,6 +276,41 @@ supplied, in which case it returns `dynago.ErrVersionMismatch`.
 `when` preconditions fail with `Err<Entity><Write>Precondition`, and a `required` field set to
 its zero value with `dynago.ErrFieldRequired`.
 
+### update with `batch`
+
+```go
+func (s *ParcelStore) ShelveSeveral(ctx context.Context, keys []ParcelKey) error
+func (s *ParcelStore) AnnotateSeveral(ctx context.Context, keys []ParcelKey, v ParcelAnnotateSeveral) error
+```
+
+The same change to several items. They are read with one consistent BatchGetItem per transaction
+and written several to a transaction, each as the read-first shape writes one: guarded by the
+revision read, with its derived items' changes. The generator fits as many items in a transaction
+as DynamoDB's 100-item limit allows, counting the most each one's change can touch. What the
+items of a transaction share is written once: fifty parcels of one depot moving between states
+update the depot's counter items once per transaction, where fifty single writes would update
+them fifty times, each a chance to conflict with the others.
+
+Each transaction is atomic; the batch is not. The method returns `nil` when every item was written.
+Otherwise it returns a `*dynago.BatchError`, and every item it doesn't name was written:
+
+```go
+var be *dynago.BatchError
+if errors.As(err, &be) {
+    for _, f := range be.Failed {
+        // keys[f.Index] was not written: f.Err is ErrParcelNotFound, the write's precondition
+        // error, or whatever refused it.
+    }
+}
+```
+
+An absent (or expired) item and one that fails the write's `when` are left out of their
+transaction, and the rest of it goes ahead. If an item changes between the read and the write, its
+transaction is read and built again, under the retry policy. A transaction refused for another
+reason (a unique value taken, a counter's limit) is split in two and each half tried again, down
+to single items, so the item at fault is the only one not written. A key given twice is written
+once. There are no write options: a batch doesn't take versions.
+
 ### requires
 
 A `requires` entry adds items to the write's transaction:

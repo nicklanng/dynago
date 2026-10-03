@@ -43,6 +43,7 @@ var awkward = []struct {
 		"    counters:\n      Labels: { pk: \"C#{tenantId}\", sk: \"LABEL#{labels}\", values: { key: count, open: { count: true, where: { open: true }, limit: 5 } } }\n" +
 		"      Spread: { pk: \"S#{labels}#T#{tenantId}\", sk: \"SPREAD\", shards: 3, values: { things: count } }\n" +
 		"    access:\n      Labelled: { query: ByLabel, range: at }\n      InOrder: { query: InOrder }\n      Label: { counter: Labels }\n      Labels: { counter: Labels, all: true }\n      Spread: { counter: Spread }\n", ""},
+	{"batch writes", "      W: { update: [name, note], patch: [at], when: { note: { not: locked } }, batch: 30 }\n      Clear: { set: { note: \"\" }, batch: 5 }\n      Solo: { update: [name] }\n", ""},
 	{"range query key field named from", "      from: string\n    indexes:\n      ByFrom: { pk: \"F#{from}\", sk: \"AT#{at}\", project: keys }\n    access:\n      L: { query: ByFrom, range: at }\n", "collides with the range bound"},
 }
 
@@ -89,6 +90,12 @@ var awkwardEntities = []struct {
 		"      Add: { create: true, requires: { Crate: { key: { tenantId: tenantId, crateId: crateId }, ensure: { label: \"{label}\", mood: calm }, add: { parts: 1 }, patch: { until: \"{seen}\" }, when: { mood: { not: cross } } } } }\n" +
 		"      Move: { update: [label], requires: { Crate: { key: { tenantId: tenantId, crateId: crateId }, ensure: { label: unlabelled } } } }\n" +
 		"      Drop: { delete: true, requires: { Crate: { key: { tenantId: tenantId, crateId: crateId }, ensure: { label: \"{label}\" }, set: { mood: cross } } } }\n", ""},
+	{"batch updates of an expiring entity with derived items", "  Crate:\n    fields:\n      tenantId: string\n      crateId: string\n      until: time\n      label: { type: string, required: true }\n      rank: int\n      tags: string_set\n" +
+		"    ttl: until\n    key: { pk: \"T#{tenantId}\", sk: \"CRATE#{crateId}\" }\n" +
+		"    indexes:\n      ByLabel: { strategy: copy, pk: \"L#{tenantId}\", sk: \"L#{label}#{crateId}\", project: [rank] }\n" +
+		"    unique:\n      Label: { fields: [tenantId, label] }\n" +
+		"    counters:\n      Ranks: { pk: \"T#{tenantId}\", sk: \"RANKS\", values: { total: { sum: rank, limit: 100 }, n: count } }\n" +
+		"    writes:\n      Make: create\n      Relabel: { update: [label, rank], patch: [until, tags], batch: 40 }\n      Zero: { set: { rank: 0 }, when: { rank: { not: 0 } }, batch: 3 }\n", ""},
 	{"entity named like another's store", "  ThingStore:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},
 	{"entities differing in initialism case", "  THING:\n    fields: { id: string }\n    key: { pk: \"U#{id}\", sk: \"U\" }\n", "collides"},
 	{"entity named Store", "  Store:\n    fields: { id: string }\n    key: { pk: \"S#{id}\", sk: \"S\" }\n", "collides"},

@@ -886,6 +886,11 @@
               "$ref": "#/$defs/conditions",
               "description": "Preconditions that must hold for the update."
             },
+            "batch": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Makes an update take several keys and apply the same change to each, several items to a transaction, with a counter item they share updated once per transaction. The number is how many items a call typically changes, which the estimates use. Not with requires."
+            },
             "versioned": {
               "enum": [
                 "optional",

@@ -350,6 +350,9 @@ func freshness(a *schema.Access) string {
 // does describes a write in the schema's terms: "create; sets status = \"available\"; requires …".
 func does(w *schema.Write) string {
 	parts := []string{string(w.Kind)}
+	if w.Batch > 0 {
+		parts[0] = "batch " + parts[0]
+	}
 	var sets []string
 	for _, f := range w.Args {
 		sets = append(sets, f.Name)

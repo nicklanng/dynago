@@ -14,6 +14,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/nicklanng/dynago/internal/cost"
 	"github.com/nicklanng/dynago/internal/gen/infra"
 	"github.com/nicklanng/dynago/internal/schema"
 )
@@ -1452,6 +1453,93 @@ func (g *gen) applyChanges(w *schema.Write) {
 	}
 }
 
+// updateBatch emits an update of several items: read together and written several to a
+// transaction, so that what they share (a counter item) is written once per transaction.
+func (g *gen) updateBatch(w *schema.Write, argType string, hasV bool) {
+	e := w.Entity
+	lo := lowerFirst(e.GoName)
+	size := schema.BatchSize(cost.BatchItems(g.m, w))
+	var desc strings.Builder
+	fmt.Fprintf(&desc, "updates %s of several %s, the same way", fieldList(w.Changed()), schema.Plural(e.Name))
+	if len(w.When) > 0 {
+		fmt.Fprintf(&desc, ", each when %s", predText(w.When))
+	}
+	fmt.Fprintf(&desc, ". The items are read with one consistent BatchGetItem and written up to %d to a transaction, each guarded by its revision", size)
+	if e.HasDerived() {
+		fmt.Fprintf(&desc, "; a counter item several of them change is updated once per transaction.%s", maintains(e))
+	} else {
+		desc.WriteString(".")
+	}
+	desc.WriteString(" Each transaction is atomic; the batch is not. It returns nil if every item was written, and otherwise a *dynago.BatchError naming those that were not, by their place in keys, each with its error")
+	fmt.Fprintf(&desc, " (Err%sNotFound", e.GoName)
+	if len(w.When) > 0 {
+		fmt.Fprintf(&desc, ", Err%s%sPrecondition", e.GoName, w.GoName)
+	}
+	desc.WriteString(", or what refused its transaction): the others were written. A key given twice is written once.")
+	g.docComment(w.GoName, w.Doc, desc.String())
+	vparam := ""
+	if hasV {
+		vparam = fmt.Sprintf(", v %s", argType)
+	}
+	g.p("func (s *%sStore) %s(ctx context.Context, keys []%sKey%s) error {", e.GoName, w.GoName, e.GoName, vparam)
+	g.requiredChecks(e, w.Args, "v", "return err")
+	for _, f := range w.Patch {
+		if f.Required {
+			g.p("if v.%s != nil && %s {", f.GoName, zeroCond(f, "*v."+f.GoName))
+			g.p("return fmt.Errorf(\"%%w: %s.%s\", dynago.ErrFieldRequired)", e.Name, f.Name)
+			g.p("}")
+		}
+	}
+	g.changedKeyPartChecks(w)
+	g.p("ks := make([]dynago.Key, len(keys))")
+	g.p("for i, k := range keys {")
+	g.p("key, err := k.dynamoKey()")
+	g.p("if err != nil {")
+	g.p("return err")
+	g.p("}")
+	g.p("ks[i] = key")
+	g.p("}")
+	if e.TTL != nil {
+		g.p("now := dynago.Now()")
+	}
+	g.p("return dynago.BatchWrite(ctx, s.db, s.t, ks, %d, Err%sNotFound, func(key dynago.Key, raw dynamo.Item) (dynago.Op, dynago.Change, error) {", size, e.GoName)
+	g.p("it, err := %sDecode(raw)", lo)
+	g.p("if err != nil {")
+	g.p("return dynago.Op{}, dynago.Change{}, err")
+	g.p("}")
+	if e.TTL != nil {
+		g.p("// DynamoDB deletes expired items lazily, often hours later: treat them as gone.")
+		g.p("if dynago.Expired(it.TTL, now) {")
+		g.p("return dynago.Op{}, dynago.Change{}, Err%sNotFound", e.GoName)
+		g.p("}")
+	}
+	g.p("before := &it.%s", e.GoName)
+	if len(w.When) > 0 {
+		g.p("if %s {", notWhereExpr(e, w.When, "before"))
+		g.p("return dynago.Op{}, dynago.Change{}, Err%s%sPrecondition", e.GoName, w.GoName)
+		g.p("}")
+	}
+	g.p("after := before.clone()")
+	g.applyChanges(w)
+	g.p("// Keep attributes this code doesn't know: a newer compatible version may have written them.")
+	g.p("item, err := dynago.KeepUnknown(it.raw, %sKnown, %sToItem(&after, key, it.Rev+1, dynago.FmtStamp(before.stamps.Created), dynago.NewStamp()))", lo, lo)
+	g.p("if err != nil {")
+	g.p("return dynago.Op{}, dynago.Change{}, err")
+	g.p("}")
+	change := "dynago.Change{}"
+	if e.HasDerived() {
+		lim := ""
+		if hasLimitArgs(e) {
+			lim = fmt.Sprintf(", %sLimits{}", lo)
+		}
+		change = fmt.Sprintf("dynago.Change{Owner: key, Before: %sDerived(before, key%s), After: %sDerived(&after, key%s)}", lo, lim, lo, lim)
+	}
+	g.p("return dynago.PutOp(key, s.t.Put(item).If(\"$ = ?\", \"_rev\", it.Rev), dynago.ErrStale), %s, nil", change)
+	g.p("})")
+	g.p("}")
+	g.p("")
+}
+
 func (g *gen) update(w *schema.Write) {
 	e := w.Entity
 	lo := lowerFirst(e.GoName)
@@ -1471,6 +1559,10 @@ func (g *gen) update(w *schema.Write) {
 		}
 		g.p("}")
 		g.p("")
+	}
+	if w.Batch > 0 {
+		g.updateBatch(w, argType, hasV)
+		return
 	}
 	param, conv := g.limitsArg(w)
 	slowPatch := patchFastPath(w)
@@ -1975,7 +2067,7 @@ func typeDoc(name, doc, fallback string) string {
 
 func hasVersionedWrites(e *schema.Entity) bool {
 	for _, w := range e.Writes {
-		if w.Kind != schema.WriteCreate {
+		if w.Kind != schema.WriteCreate && w.Batch == 0 {
 			return true
 		}
 	}
@@ -1987,7 +2079,7 @@ func (g *gen) versionHelpers(e *schema.Entity) {
 	lo := lowerFirst(e.GoName)
 	fast, slow := false, false
 	for _, w := range e.Writes {
-		if w.Kind == schema.WriteCreate {
+		if w.Kind == schema.WriteCreate || w.Batch > 0 {
 			continue
 		}
 		if w.ReadFirst {

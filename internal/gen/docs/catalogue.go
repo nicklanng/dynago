@@ -226,8 +226,14 @@ func (d *doc) writes() {
 			if wc.Transactional {
 				atomic = fmt.Sprintf("transaction, %d items", wc.MaxTxItems)
 			}
-			d.p("| `%s.%s` | %s | %s | %s | %s | %s | %s | %s |", w.Entity.Name, w.Name, escape(does(w)), escape(strings.Join(checks(w), "; ")),
-				strings.Join(wc.Items, "<br>"), reads, atomic, unitsText(wc.WRU), rateText(w.Rate))
+			what, units := does(w), unitsText(wc.WRU)
+			if w.Batch > 0 {
+				what = fmt.Sprintf("For each of several %s (%d a call): %s", schema.Plural(w.Entity.Name), w.Batch, strings.ToLower(what[:1])+what[1:])
+				reads = "yes, together"
+				atomic = fmt.Sprintf("each transaction, not the batch: up to %d %s to one", wc.BatchSize, schema.Plural(w.Entity.Name))
+			}
+			d.p("| `%s.%s` | %s | %s | %s | %s | %s | %s | %s |", w.Entity.Name, w.Name, escape(what), escape(strings.Join(checks(w), "; ")),
+				strings.Join(wc.Items, "<br>"), reads, atomic, units, rateText(w.Rate))
 		}
 	}
 	d.p("")
