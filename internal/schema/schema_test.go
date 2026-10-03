@@ -183,10 +183,18 @@ func TestValidationErrors(t *testing.T) {
 func TestGoName(t *testing.T) {
 	for in, want := range map[string]string{
 		"tenantId": "TenantID", "descriptionHtml": "DescriptionHTML", "in_person": "InPerson",
-		"url": "URL", "HTMLBody": "HTMLBody", "userIds": "UserIds", "a": "A",
+		"url": "URL", "HTMLBody": "HTMLBody", "a": "A",
+		// The plural of an initialism keeps its capitals, as its singular does.
+		"userIds": "UserIDs", "ids": "IDs", "imageUrls": "ImageURLs", "URLsSeen": "URLsSeen",
+		"sms": "SMS", "https": "HTTPS", "kids": "Kids", "is": "Is",
 	} {
 		if got := GoName(in); got != want {
 			t.Errorf("GoName(%q) = %q, want %q", in, got, want)
+		}
+	}
+	for in, want := range map[string]string{"Loan": "loan", "APIKey": "apiKey", "THING": "thing", "IDs": "ids", "URLsSeen": "urlsSeen", "IDsmith": "iDsmith"} {
+		if got := unexported(in); got != want {
+			t.Errorf("unexported(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

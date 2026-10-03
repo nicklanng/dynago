@@ -16,16 +16,22 @@ var (
 var initialisms = map[string]string{
 	"id": "ID", "url": "URL", "uri": "URI", "http": "HTTP", "html": "HTML", "api": "API",
 	"uid": "UID", "uuid": "UUID", "ulid": "ULID", "json": "JSON", "ttl": "TTL", "sku": "SKU",
-	"ip": "IP", "sql": "SQL", "css": "CSS", "xml": "XML", "sms": "SMS",
+	"ip": "IP", "sql": "SQL", "css": "CSS", "xml": "XML", "sms": "SMS", "https": "HTTPS",
 }
 
 // GoName converts a schema name (camelCase, snake_case or PascalCase) to an exported Go name,
-// upper-casing common initialisms: "libraryId" → "LibraryID", "on_loan" → "OnLoan".
+// upper-casing common initialisms and their plurals: "libraryId" → "LibraryID", "labelIds" →
+// "LabelIDs", "on_loan" → "OnLoan".
 func GoName(s string) string {
 	var b strings.Builder
 	for _, w := range words(s) {
-		if up, ok := initialisms[strings.ToLower(w)]; ok {
+		low := strings.ToLower(w)
+		if up, ok := initialisms[low]; ok {
 			b.WriteString(up)
+			continue
+		}
+		if up, ok := initialisms[strings.TrimSuffix(low, "s")]; ok {
+			b.WriteString(up + "s")
 			continue
 		}
 		r := []rune(w)
@@ -86,11 +92,17 @@ func unexported(s string) string {
 	for n < len(r) && unicode.IsUpper(r[n]) {
 		n++
 	}
-	if n > 1 && n < len(r) {
+	if n > 1 && n < len(r) && !pluralInitialism(r, n) {
 		n--
 	}
 	for i := 0; i < n; i++ {
 		r[i] = unicode.ToLower(r[i])
 	}
 	return string(r)
+}
+
+// pluralInitialism reports whether the n capitals starting r are an initialism in the plural
+// ("IDs", "URLsSeen"), whose last capital doesn't start the next word.
+func pluralInitialism(r []rune, n int) bool {
+	return r[n] == 's' && (n+1 == len(r) || unicode.IsUpper(r[n+1]))
 }

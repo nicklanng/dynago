@@ -2270,8 +2270,9 @@ func lowerFirst(s string) string {
 		n++
 	}
 	// Lower a leading acronym as a unit, keeping the capital that starts the next word:
-	// "Registration" → "registration", "URLMap" → "urlMap", "API" → "api".
-	if n > 1 && n < len(r) {
+	// "Registration" → "registration", "URLMap" → "urlMap", "API" → "api". A plural initialism
+	// is lowered whole: "IDs" → "ids".
+	if n > 1 && n < len(r) && (r[n] != 's' || (n+1 < len(r) && !unicode.IsUpper(r[n+1]))) {
 		n--
 	}
 	for i := 0; i < n; i++ {

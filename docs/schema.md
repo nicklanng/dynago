@@ -573,8 +573,8 @@ is listed with its reason in the model document and doesn't fail the build.
 
 Go names are built by splitting on case changes, `_` and `-`, capitalising each word, and
 upper-casing common initialisms (`id`, `url`, `uri`, `http`, `html`, `api`, `uid`, `uuid`, `ulid`,
-`json`, `ttl`, `sku`, `ip`, `sql`, `css`, `xml`, `sms`): `libraryId` → `LibraryID`,
-`manualUrl` → `ManualURL`, enum value `on_loan` → `OnLoan`.
+`json`, `ttl`, `sku`, `ip`, `sql`, `css`, `xml`, `sms`, `https`) and their plurals: `libraryId` →
+`LibraryID`, `manualUrl` → `ManualURL`, `labelIds` → `LabelIDs`, enum value `on_loan` → `OnLoan`.
 
 Generated type names must not collide (for example an entity `MemberLoans` and a counter
 `MemberLoans`); dynago reports collisions. [Generated code](generated-code.md) lists every name.

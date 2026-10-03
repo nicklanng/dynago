@@ -13,6 +13,13 @@ format, the generated code and the runtime API; the changelog says how to move.
   generation and the retained ones) under a name that doesn't change with the generation, so an IAM
   policy written against it follows the table through a migration.
 
+### Changed
+
+- Go names keep the capitals of an initialism in the plural: a field `labelIds` generates
+  `LabelIDs`, where it generated `LabelIds`, and likewise `imageUrls` → `ImageURLs`. After
+  regenerating, rename the uses of the affected names in your code; the compiler finds them.
+  Stored attribute names don't change.
+
 ### Fixed
 
 - A `volume.by` naming an entity further up the parent chain (a draft's spread `by: User`, where
