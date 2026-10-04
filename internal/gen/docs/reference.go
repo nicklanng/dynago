@@ -438,6 +438,18 @@ func consistencyText(a *schema.Access) string {
 	return "eventual"
 }
 
+// elemsText says what an add_to or remove_from does: "add elements to `tags`".
+func elemsText(el schema.SetElems) string {
+	what := "elements"
+	if !el.Arg {
+		what = value(el.Elem)
+	}
+	if el.Remove {
+		return fmt.Sprintf("remove %s from `%s`", what, el.Field.Name)
+	}
+	return fmt.Sprintf("add %s to `%s`", what, el.Field.Name)
+}
+
 func writeText(w *schema.Write) string {
 	if w.Batch > 0 {
 		one := *w
@@ -463,6 +475,9 @@ func writeText(w *schema.Write) string {
 	}
 	for _, s := range w.Sets {
 		parts = append(parts, fmt.Sprintf("set `%s` = %s", s.Field.Name, value(s.Value)))
+	}
+	for _, el := range w.Elems {
+		parts = append(parts, elemsText(el))
 	}
 	text := strings.Join(parts, ", ")
 	if len(w.When) > 0 {

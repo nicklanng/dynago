@@ -163,7 +163,7 @@
         {
           "version": 1,
           "generation": 1,
-          "fingerprint": "fe8c60c869038a0c",
+          "fingerprint": "36310b5d2d78c6ee",
           "shape": {
             "fields": [
               {
@@ -185,6 +185,11 @@
                 "name": "parcels",
                 "attr": "parcels",
                 "type": "int"
+              },
+              {
+                "name": "zones",
+                "attr": "zones",
+                "type": "string_set"
               }
             ],
             "pk": "D#{depotId}",
@@ -355,6 +360,36 @@
                 ]
               }
             ]
+          }
+        }
+      ]
+    },
+    "Tag": {
+      "versions": [
+        {
+          "version": 1,
+          "generation": 1,
+          "fingerprint": "ee8f2362d5138b54",
+          "shape": {
+            "fields": [
+              {
+                "name": "depotId",
+                "attr": "depotId",
+                "type": "string"
+              },
+              {
+                "name": "tag",
+                "attr": "tag",
+                "type": "string"
+              },
+              {
+                "name": "about",
+                "attr": "about",
+                "type": "string"
+              }
+            ],
+            "pk": "D#{depotId}",
+            "sk": "TAGDEF#{tag}"
           }
         }
       ]

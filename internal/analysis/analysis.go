@@ -126,6 +126,7 @@ func Analyze(m *schema.Model, prices cost.Prices, p *Policy) *Result {
 	}
 	a.assumptions()
 	a.partitions()
+	a.limitReads()
 	a.traffic()
 	a.readStats()
 	a.lifecycles()

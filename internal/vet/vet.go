@@ -49,7 +49,7 @@ var requestPackages = map[string]bool{
 // runtimeCalls are dynago's runtime functions that make requests for generated code.
 var runtimeCalls = map[string]bool{
 	"GetOne": true, "GetMany": true, "GetBatch": true, "BatchWrite": true, "Query": true, "Scan": true, "Run": true, "UpdateFields": true,
-	"DeleteIfExists": true, "CheckRequirement": true, "ConsumeRequirement": true, "CheckAbsent": true,
+	"DeleteIfExists": true, "CheckRequirement": true, "ConsumeRequirement": true, "ConsumeCounter": true, "CheckAbsent": true,
 	"CheckCounter": true, "PutOp": true, "CreateOp": true, "UpdateOp": true, "DeleteOp": true, "CheckOp": true,
 }
 

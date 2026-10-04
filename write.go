@@ -267,6 +267,10 @@ type Set struct {
 	// Add adds the number Value to the attribute (an absent one counts as 0) instead of replacing
 	// it: DynamoDB applies it atomically, so concurrent additions all count.
 	Add bool
+	// AddElems and RemoveElems change a string set by element: Value is a []string of elements
+	// to add to it, or to remove from it, whatever else it holds. Both are atomic and idempotent,
+	// and an empty Value changes nothing.
+	AddElems, RemoveElems bool
 }
 
 // Cond is a precondition on one attribute: that it equals Value; with Not, that it differs from
@@ -346,6 +350,15 @@ func SetFields(u *dynamo.Update, sets []Set) {
 		switch {
 		case s.Remove:
 			u.Remove(Path(s.Attr))
+		case s.AddElems || s.RemoveElems:
+			elems, _ := s.Value.([]string)
+			switch {
+			case len(elems) == 0: // DynamoDB refuses an empty set
+			case s.AddElems:
+				u.AddStringsToSet(Path(s.Attr), elems...)
+			default:
+				u.DeleteStringsFromSet(Path(s.Attr), elems...)
+			}
 		case s.Add:
 			u.Add(Path(s.Attr), s.Value)
 		case s.StringSet:
@@ -455,6 +468,17 @@ func CheckCounter(t dynamo.Table, key Key, values []Cond) *dynamo.ConditionCheck
 		c.If(expr, args...)
 	}
 	return c
+}
+
+// ConsumeCounter builds the deletion of a counter item whose values meet the conditions: a counter
+// that has returned to zero, removed with the thing it counted for. A missing item passes.
+func ConsumeCounter(t dynamo.Table, key Key, values []Cond) *dynamo.Delete {
+	d := t.Delete(AttrPK, key.PK).Range(AttrSK, key.SK)
+	for _, v := range values {
+		expr, args := v.expr()
+		d.If(expr, args...)
+	}
+	return d
 }
 
 // ReadIfNeeded runs a write that also changes other items. It first builds the changes assuming

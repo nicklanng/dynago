@@ -363,6 +363,13 @@ func does(w *schema.Write) string {
 	for _, st := range w.Sets {
 		sets = append(sets, st.Field.Name+" = "+schema.ValueText(st.Value))
 	}
+	for _, el := range w.Elems {
+		if el.Remove {
+			sets = append(sets, el.Field.Name+" less elements")
+		} else {
+			sets = append(sets, el.Field.Name+" plus elements")
+		}
+	}
 	if len(sets) > 0 {
 		parts = append(parts, "sets "+strings.Join(sets, ", "))
 	}

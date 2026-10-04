@@ -21,7 +21,7 @@ Table generation **3**: `toollibrary-g3`. It is filled from generation 2 (`tooll
 | Largest partition | `LIB#{libraryId}#CAT#{category}` (GSI ByCategory): 4 KB typical, 1 MB at most. |
 | Busiest partition at peak | `LIB#{libraryId}` (base table): 0.27% of a partition's capacity, risk **low**. |
 | Storage | 2.0 GB at the declared volumes |
-| Cost | $163.69/month at the declared volumes and rates |
+| Cost | $154.94/month at the declared volumes and rates |
 | Findings | 0 errors, 0 warnings, 2 notes open; 4 accepted |
 
 ## Domain
@@ -157,14 +157,14 @@ Every read the code can make. A read that isn't listed has no method, so a new w
 | `Library.List` | Every library, a page at a time, for the operators. | Query of GSI All | eventual | 2,000 items typically: 40 pages of 50 | 1.5 / 3.5 | 0.1/s |
 | `Member.Get` | A member's profile, which they see straight after editing it. | GetItem | immediate | one | 1 | 10/s |
 | `Member.GetByEmail` | Sign-in, which may come the moment after joining. | claim Email, then the item (2 GetItems) | immediate | one | 2 | 1/s |
-| `Member.Directory` | Members with a given libraryId, by name (ascending). | Query of GSI ByName | eventual | 20 items typically, 2,000 at most: 1–40 pages of 50 | 2 / 4 | 2/s |
+| `Member.Directory` | Members with a given libraryId, by name (ascending). | Query of GSI ByName | eventual | 20 items typically, 2,000 at most: 1–40 pages of 50 | 1 / 4 | 2/s |
 | `Tool.Get` | One Tool, by libraryId and toolId. | GetItem | eventual | one | 0.5 / 3 | 20/s |
-| `Tool.Catalogue` | Tools with a given libraryId and category, by name (ascending). | Query of GSI ByCategory | eventual | 12 items typically, 5,000 at most: 1–200 pages of 25 | 1 / 2.5 | 10/s |
+| `Tool.Catalogue` | Tools with a given libraryId and category, by name (ascending). | Query of GSI ByCategory | eventual | 12 items typically, 5,000 at most: 1–200 pages of 25 | 0.5 / 2.5 | 10/s |
 | `Tool.GetByBarcode` | The desk scanning a label, perhaps one just attached. | claim Barcode, then the item (2 GetItems) | immediate | one | 2 / 7 | 2/s |
 | `Loan.Get` | A loan as the steward checks it in, straight after any change. | GetItem | immediate | one | 1 | — |
 | `Loan.History` | A tool's loans, newest first, without the notes. | Query of the Loan's partition | eventual | 20 items typically, 500 at most: 1–25 pages of 20 | 1.5 / 5.5 | 1/s |
-| `Loan.MyLoans` | A member's current loans, soonest due first. | Query of copy ByMember | immediate | 1.2 items typically, 8 at most: 1 page of 50 | 5 / 10 | 5/s |
-| `Loan.Overdue` | Loans with a given libraryId, by dueAt (ascending). | Query of GSI Overdue | eventual | 24 items typically, 2,000 at most: 1–40 pages of 50 | 2.5 / 5 | 0.01/s |
+| `Loan.MyLoans` | A member's current loans, soonest due first. | Query of copy ByMember | immediate | 1.2 items typically, 8 at most: 1 page of 50 | 1 / 2 | 5/s |
+| `Loan.Overdue` | Loans with a given libraryId, by dueAt (ascending). | Query of GSI Overdue | eventual | 24 items typically, 2,000 at most: 1–40 pages of 50 | 1.5 / 5 | 0.01/s |
 | `Loan.ActiveLoans` | Shown beside the member's loans. | counter MemberLoans (GetItem) | eventual | the counts | 0.5 | — |
 | `Loan.Totals` | The LoanTotals counts for a libraryId. | counter LoanTotals (4 shards, one BatchGetItem) | eventual | the counts | 2 | — |
 | `Loan.Export` | Every Loan in the table. | Scan of the whole table, one page per call | eventual | 2,400,000 items typically, over 57,888 pages of 50 of the whole table | 4 / 13 | — |
@@ -308,13 +308,13 @@ Each row is every partition key value one key pattern renders: *Keys* is how man
 | `LIB#{libraryId}` | base table | 2,000 | Library: 1<br>Member: 20 / 2,000<br>counter MemberCounts: 1<br>counter ToolCounts: 1 | 9 KB / 870 KB | no | 2.67 WRU/s, 3.26 RRU/s | low (0.27%) |
 | `LIBRARIES` | GSI All | 1 | Library All entry: 2,000 | 420 KB / 420 KB | yes: Library never removed | 0 WRU/s, 0.75 RRU/s | low (0.03%) |
 | `UNIQUE#Library.Slug#{slug}` | base table | 2,000 | Library Slug claim: 1 | 230 B / 230 B | no | 0 WRU/s, 0.05 RRU/s | low (<0.01%) |
-| `LIB#{libraryId}#MEMBERS` | GSI ByName | 2,000 | Member ByName entry: 20 / 2,000 | 5 KB / 494 KB | no | 0 WRU/s, 1 RRU/s | low (0.03%) |
+| `LIB#{libraryId}#MEMBERS` | GSI ByName | 2,000 | Member ByName entry: 20 / 2,000 | 5 KB / 494 KB | no | 0 WRU/s, 0.5 RRU/s | low (0.02%) |
 | `UNIQUE#Member.Email#{libraryId}#{email\|lower}` | base table | 40,000 | Member Email claim: 1 | 230 B / 230 B | no | 0 WRU/s, <0.01 RRU/s | low (<0.01%) |
 | `LIB#{libraryId}#TOOL#{toolId}` | base table | 120,000 | Tool: 1<br>Loan: 20 / 500<br>Hold: 0 or 1 | 14 KB / 282 KB | yes: Loan never removed | 0.02 WRU/s, <0.01 RRU/s | low (<0.01%) |
-| `LIB#{libraryId}#CAT#{category}` | GSI ByCategory | 10,000 | Tool ByCategory entry: 12 / 5,000 | 4 KB / 1 MB | yes: Tool never removed | 0.83 WRU/s, 2.08 RRU/s | low (0.08%) |
+| `LIB#{libraryId}#CAT#{category}` | GSI ByCategory | 10,000 | Tool ByCategory entry: 12 / 5,000 | 4 KB / 1 MB | yes: Tool never removed | 0.83 WRU/s, 1.04 RRU/s | low (0.08%) |
 | `UNIQUE#Tool.Serial#{libraryId}#{serialNumber}` | base table | 120,000 | Tool Serial claim: 1 | 230 B / 230 B | no | no rates declared | — |
 | `UNIQUE#Tool.Barcode#{libraryId}#{barcodes}` | base table | 120,000 | Tool Barcode claim: 1 | 230 B / 230 B | no | 0 WRU/s, <0.01 RRU/s | low (<0.01%) |
-| `LIB#{libraryId}#MEMBER#{memberId}` | base table | 40,000 | Loan ByMember copy: 1.2 / 8<br>counter MemberLoans: 1 | 636 B / 3 KB | no | 0.01 WRU/s, 0.02 RRU/s | low (<0.01%) |
+| `LIB#{libraryId}#MEMBER#{memberId}` | base table | 40,000 | Loan ByMember copy: 1.2 / 8<br>counter MemberLoans: 1 | 636 B / 3 KB | no | 0.01 WRU/s, <0.01 RRU/s | low (<0.01%) |
 | `LIB#{libraryId}#DUE` | GSI Overdue | 2,000 | Loan Overdue entry: 24 / 2,000 | 8 KB / 699 KB | no | 0.83 WRU/s, <0.01 RRU/s | low (0.08%) |
 | `LIB#{libraryId}#LOANTOTALS#S{0..3}` | base table | 2,000 | counter LoanTotals: 1 | 148 B / 148 B | no | 0.21 WRU/s, 0 RRU/s | low (0.02%) |
 | `HOLDCODE#{codeHash}` | GSI ByCode | unknown | Hold ByCode entry: unknown | unknown / unknown | no | no rates declared | — |
@@ -346,12 +346,12 @@ Checked against the policy in `dynago.policy.yaml`: open findings of severity wa
 | Entity | Expected items | Item p50/p99 | Storage incl. indexes | Storage $/month | Throughput $/month at declared rates |
 |---|---|---|---|---|---|
 | Library | 2,000 | 298 B / 585 B | 0.00 GB | $0.00 | $14.47 |
-| Member | 40,000 | 445 B / 908 B | 0.05 GB | $0.01 | $5.18 |
-| Tool | 120,000 | 2.4 KB / 20.5 KB | 0.41 GB | $0.10 | $7.78 |
-| Loan | 2,400,000 | 571 B / 2.0 KB | 1.54 GB | $0.39 | $135.60 |
+| Member | 40,000 | 445 B / 908 B | 0.05 GB | $0.01 | $4.54 |
+| Tool | 120,000 | 2.4 KB / 20.5 KB | 0.41 GB | $0.10 | $6.16 |
+| Loan | 2,400,000 | 571 B / 2.0 KB | 1.54 GB | $0.39 | $129.12 |
 | Hold | 2,400 | 474 B / 706 B | 0.00 GB | $0.00 | $0.16 |
 
-Estimated total: **$163.69/month** for the declared volumes and rates.
+Estimated total: **$154.94/month** for the declared volumes and rates.
 
 Assumptions:
 
@@ -368,6 +368,7 @@ Assumptions:
 - Capacity follows DynamoDB rules: 1 WRU per started 1 KB written, 1 RRU per started 4 KB read strongly (half for eventually consistent); transactions cost double, and a condition check on another item is billed as a transactional write of that item.
 - GSI and copy writes are counted as one index write per entry; an index key change is a delete plus a put.
 - Prices: $0.625 per million WRU, $0.125 per million RRU, $0.25 per GB-month (on-demand).
+- A Query is costed at a page of its items, or at what its partition holds when the volumes say that is less: a page larger than the partition reads the partition.
 - Monthly figures use each access pattern's and write's declared average rate (rate:, per second); patterns without a rate are not costed.
 - Storage counts each entity's items, index entries and claims at its declared volume, plus 100 bytes of overhead per item. A scan reads the base table's items, copies and claims, without GSI entries or overhead; counter items aren't counted.
 
@@ -544,7 +545,7 @@ Every item that exists because of a Member, and what keeps it up to date.
 |---|---|---|---|---|---|
 | `Get` | item by key | `PK = LIB#{libraryId}`, `SK = MEMBER#{memberId}` | strong | GetItem | 1 |
 | `GetByEmail` | claim `Email`, then the item | `PK = UNIQUE#Member.Email#{libraryId}#{email\|lower}` | strong | GetItem (claim) → GetItem | 2 |
-| `Directory` | GSI `ByName`, page 50 (max 100) | `ByNamePK = LIB#{libraryId}#MEMBERS`, ascending | eventual (GSI) | Query | 2 / 4 |
+| `Directory` | GSI `ByName`, page 50 (max 100) | `ByNamePK = LIB#{libraryId}#MEMBERS`, ascending | eventual (GSI) | Query | 1 / 4 |
 
 - `Get`: A member's profile, which they see straight after editing it.
 - `GetByEmail`: Sign-in, which may come the moment after joining.
@@ -647,7 +648,7 @@ Every item that exists because of a Tool, and what keeps it up to date.
 | Method | Reads | Key condition | Consistency | Requests | RRU per call p50/p99 |
 |---|---|---|---|---|---|
 | `Get` | item by key | `PK = LIB#{libraryId}#TOOL#{toolId}`, `SK = TOOL` | eventual | GetItem | 0.5 / 3 |
-| `Catalogue` | GSI `ByCategory`, page 25 (max 100) | `ByCategoryPK = LIB#{libraryId}#CAT#{category}`, ascending | eventual (GSI) | Query | 1 / 2.5 |
+| `Catalogue` | GSI `ByCategory`, page 25 (max 100) | `ByCategoryPK = LIB#{libraryId}#CAT#{category}`, ascending | eventual (GSI) | Query | 0.5 / 2.5 |
 | `GetByBarcode` | claim `Barcode`, then the item | `PK = UNIQUE#Tool.Barcode#{libraryId}#{barcodes}` | strong | GetItem (claim) → GetItem | 2 / 7 |
 
 - `GetByBarcode`: The desk scanning a label, perhaps one just attached.
@@ -758,8 +759,8 @@ Every item that exists because of a Loan, and what keeps it up to date.
 |---|---|---|---|---|---|
 | `Get` | item by key | `PK = LIB#{libraryId}#TOOL#{toolId}`, `SK = LOAN#{loanId}` | strong | GetItem | 1 |
 | `History` | entity partition, only `libraryId`, `toolId`, `loanId`, `memberId`, `status`, `borrowedAt`, `dueAt`, `returnedAt`, page 20 (max 100) | `PK = LIB#{libraryId}#TOOL#{toolId}`, `begins_with(SK, "LOAN#")`, descending | eventual | Query | 1.5 / 5.5 |
-| `MyLoans` | copies `ByMember`, page 50 (max 100) | `PK = LIB#{libraryId}#MEMBER#{memberId}`, `begins_with(SK, "MYLOAN#")`, ascending | strong | Query | 5 / 10 |
-| `Overdue` | GSI `Overdue`, page 50 (max 100) | `OverduePK = LIB#{libraryId}#DUE`, `OverdueSK` between optional bounds on `dueAt`, ascending | eventual (GSI) | Query | 2.5 / 5 |
+| `MyLoans` | copies `ByMember`, page 50 (max 100) | `PK = LIB#{libraryId}#MEMBER#{memberId}`, `begins_with(SK, "MYLOAN#")`, ascending | strong | Query | 1 / 2 |
+| `Overdue` | GSI `Overdue`, page 50 (max 100) | `OverduePK = LIB#{libraryId}#DUE`, `OverdueSK` between optional bounds on `dueAt`, ascending | eventual (GSI) | Query | 1.5 / 5 |
 | `ActiveLoans` | counter `MemberLoans` | `PK = LIB#{libraryId}#MEMBER#{memberId}`, `SK = LOANS` | eventual | GetItem | 0.5 |
 | `Totals` | counter `LoanTotals` | `PK = LIB#{libraryId}#LOANTOTALS`, `SK = TOTALS` | eventual | BatchGetItem (4 shards) | 2 |
 | `Export` | the whole table, page 50 (max 100) | none: a Scan, filtered to `_t = Loan` | eventual | Scan (one page) | 4 / 13 |

@@ -836,7 +836,10 @@ type Write struct {
 	Kind   WriteKind
 	Args   []*Field
 	// Patch fields are optional arguments: nil leaves the field unchanged.
-	Patch       []*Field
+	Patch []*Field
+	// Elems are changes to string_set fields by element: elements added to, or removed from,
+	// whatever the set holds.
+	Elems       []SetElems
 	Sets        []SetConst
 	When        []*Pred
 	Requires    []*Require
@@ -882,7 +885,9 @@ type Require struct {
 	Sets        []SetConst
 	// Optional lets the write go ahead when the target is absent or expired.
 	Optional bool
-	Consume  bool
+	// Consume deletes the target in the write's transaction. For a counter, it deletes the counter
+	// item, which must read zero for every value.
+	Consume bool
 	// Ensure makes the write create the target when it is absent, with EnsureSets and then Sets
 	// applied to a new item; When and Sets apply to one that is there, as without it.
 	Ensure     bool
@@ -893,8 +898,11 @@ type Require struct {
 	ErrName string
 }
 
-// Writes reports whether the requirement changes its target, rather than only checking it.
-func (rq *Require) Writes() bool { return len(rq.Sets) > 0 || rq.Consume || rq.Ensure }
+// Writes reports whether the requirement changes an entity, rather than only checking it. (One
+// on a counter can delete the counter item, with Consume: that is not a change to an entity.)
+func (rq *Require) Writes() bool {
+	return rq.Target != nil && (len(rq.Sets) > 0 || rq.Consume || rq.Ensure)
+}
 
 // Sources returns the fields of the writing entity the requirement reads: its key and references.
 func (rq *Require) Sources() []*Field {
@@ -927,12 +935,43 @@ type RequireKey struct {
 	Source *Field
 }
 
+// SetElems is a change to a string_set field by element (add_to, remove_from): the elements are
+// added to, or removed from, whatever the set holds.
+type SetElems struct {
+	Field *Field
+	// Remove removes the elements; otherwise they are added.
+	Remove bool
+	// Arg is true when the caller gives the elements; otherwise Elem is the one constant element.
+	Arg  bool
+	Elem string
+}
+
+// ElemArgs returns the set fields whose elements the caller gives.
+func (w *Write) ElemArgs() []*Field {
+	var out []*Field
+	for _, el := range w.Elems {
+		if el.Arg {
+			out = append(out, el.Field)
+		}
+	}
+	return out
+}
+
+// OnlyElems reports whether the write changes nothing but elements of sets: an item that
+// already has the elements added, and lacks those removed, is left as it is.
+func (w *Write) OnlyElems() bool {
+	return len(w.Elems) > 0 && len(w.Args)+len(w.Patch)+len(w.Sets) == 0
+}
+
 // Changed returns every field the update writes.
 func (w *Write) Changed() []*Field {
 	out := append([]*Field{}, w.Args...)
 	out = append(out, w.Patch...)
 	for _, s := range w.Sets {
 		out = append(out, s.Field)
+	}
+	for _, el := range w.Elems {
+		out = append(out, el.Field)
 	}
 	return out
 }

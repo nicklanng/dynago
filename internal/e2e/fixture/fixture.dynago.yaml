@@ -60,6 +60,7 @@ entities:
       name: string
       closed: bool
       parcels: int
+      zones: { type: string_set, doc: "Floor zones. Nothing is keyed by them, so they change by element on one update, unread." }
     key:
       pk: "D#{depotId}"
       sk: "DEPOT"
@@ -77,6 +78,8 @@ entities:
     writes:
       Open: create
       Close: { set: { closed: true } }
+      AddZones: { add_to: { zones: arg } }
+      DropZones: { remove_from: { zones: arg }, when: { closed: false } }
 
   # A parcel moves through a depot's states. Its index, counter values and preconditions exclude a
   # state (not) or list several (in), rather than naming one.
@@ -90,7 +93,7 @@ entities:
       damages: { type: int, doc: How many damage reports name the parcel. Listed with the parcels on site. }
       disputes: int
       lastDispute: string
-      tags: { type: string_set, size: 20/60, doc: "Handling tags. A parcel is listed, and counted, under each of them." }
+      tags: { type: string_set, ref: Tag, size: 20/60, doc: "Handling tags, each a Tag of the depot. A parcel is listed, and counted, under each of them." }
     key:
       pk: "D#{depotId}"
       sk: "PARCEL#{parcelId}"
@@ -166,7 +169,37 @@ entities:
       # Batch writes: the same change to several parcels, several to a transaction, with the
       # depot's counter items updated once per transaction.
       ShelveSeveral: { set: { state: shelved }, when: { state: received }, batch: 20 }
+      # One element of a set that keys copies and counters: added or removed without replacing
+      # the set, to one parcel or to several.
+      Tag: { add_to: { tags: arg } }
+      Untag: { remove_from: { tags: arg } }
+      TagSeveral: { add_to: { tags: arg }, batch: 20 }
+      FlagSeveral: { add_to: { tags: flagged }, set: { note: flagged }, when: { state: { not: lost } }, batch: 10 }
       AnnotateSeveral: { update: [note], batch: 10 }
+
+  # A tag a depot defines for its parcels. Retiring one needs no parcel to carry it, and takes its
+  # counter item with it: a counter keyed by a set's elements is required by naming one element,
+  # and consume deletes an item that reads zero.
+  Tag:
+    fields:
+      depotId: string
+      tag: string
+      about: string
+    key:
+      pk: "D#{depotId}"
+      sk: "TAGDEF#{tag}"
+    access:
+      Get: get
+    writes:
+      Define: create
+      Describe:
+        update: [about]
+        requires:
+          TagCounts: { key: { depotId: depotId, tags: tag }, when: { onSite: 0 } }
+      Retire:
+        delete: true
+        requires:
+          TagCounts: { key: { depotId: depotId, tags: tag }, consume: true }
 
   # A damage report can only be filed against a parcel that is still on site. Filing one counts on
   # the parcel (add) and marks it fragile if the report says so (patch), leaving the mark alone

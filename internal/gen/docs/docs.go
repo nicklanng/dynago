@@ -279,7 +279,10 @@ func (d *doc) relationships() {
 	d.p("erDiagram")
 	for _, rel := range rels {
 		card := "||--o{"
-		if rel.OneToOne() {
+		switch {
+		case rel.Many():
+			card = "}o--o{"
+		case rel.OneToOne():
 			card = "||--o|"
 		}
 		d.p("  %s %s %s : \"%s\"", rel.To.Name, card, rel.From.Name, relLabel(rel))
@@ -333,9 +336,12 @@ func relText(rel *schema.Relation) string {
 	var parts []string
 	var keys []string
 	for _, k := range rel.Key {
-		if k.Source.Name == k.Target.Name {
+		switch {
+		case k.Source == rel.Set():
+			keys = append(keys, fmt.Sprintf("each element of `%s` (a %s's `%s`)", k.Source.Name, rel.To.Name, k.Target.Name))
+		case k.Source.Name == k.Target.Name:
 			keys = append(keys, "`"+k.Source.Name+"`")
-		} else {
+		default:
 			keys = append(keys, fmt.Sprintf("`%s` (%s's `%s`)", k.Source.Name, rel.To.Name, k.Target.Name))
 		}
 	}
